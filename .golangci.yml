@@ -1,0 +1,91 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+    - gocritic
+    - prealloc
+    - bodyclose
+    - errorlint
+    - exhaustive
+    - copyloopvar
+  disable:
+    - gosec  # Too many false positives for a build/package management tool
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: true
+
+  govet:
+    enable-all: true
+
+  revive:
+    rules:
+      - name: exported
+        disabled: false
+      - name: package-comments
+        disabled: true
+
+  gosec:
+    excludes-use-default: false
+    exclude-generated: true
+    excludes:
+      - G204 # Subprocess launched with variable - expected for build tools
+      - G304 # File path provided as taint input - expected for package management
+      - G306 # Expect WriteFile permissions to be 0600 or less - scripts need exec permission
+
+  gocritic:
+    enabled-checks:
+      - appendAssign
+      - assignOp
+      - captLocal
+      - dupImport
+      - elseif
+      - emptyStringTest
+      - hexLiteral
+      - indexAlloc
+      - initLoopVar
+      - methodExprCall
+      - nilValReturn
+      - rangeExprCopy
+      - rangeValCopy
+      - sloppyReassign
+      - stringXbytes
+      - typeAssertChain
+      - typeSwitchVar
+      - underef
+      - unlambda
+      - unnecessaryBlock
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+    - path: cmd/
+      linters:
+        - revive
+      text: "exported: exported function"
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true

@@ -1,0 +1,98 @@
+# Portage Engine Docker Compose Example
+# This demonstrates the full architecture:
+#   - Server (local): Receives requests and dispatches to builders
+#   - Builder 1 & 2 (remote): Build packages using Docker containers
+#   - Dashboard (local): Web UI for monitoring
+
+version: '3.8'
+
+services:
+  # Portage Engine Server (local control plane)
+  portage-server:
+    image: golang:1.21
+    container_name: portage-server
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:8080"
+    command: ["./bin/portage-server", "-config", "configs/server.yaml"]
+    environment:
+      - BUILDERS=http://builder1:9090,http://builder2:9090
+    networks:
+      - portage-net
+    depends_on:
+      - builder1
+      - builder2
+
+  # Builder Instance 1 (remote builder)
+  builder1:
+    image: golang:1.21
+    container_name: portage-builder1
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - builder1-work:/var/tmp/portage-builds
+      - builder1-artifacts:/var/tmp/portage-artifacts
+    ports:
+      - "9091:9090"
+    command: ["./bin/portage-builder", "-port", "9090"]
+    environment:
+      - WORKERS=2
+      - USE_DOCKER=true
+      - DOCKER_IMAGE=gentoo/stage3:latest
+      - BUILD_WORK_DIR=/var/tmp/portage-builds
+      - BUILD_ARTIFACT_DIR=/var/tmp/portage-artifacts
+      - GPG_ENABLED=false
+    networks:
+      - portage-net
+
+  # Builder Instance 2 (remote builder)
+  builder2:
+    image: golang:1.21
+    container_name: portage-builder2
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - builder2-work:/var/tmp/portage-builds
+      - builder2-artifacts:/var/tmp/portage-artifacts
+    ports:
+      - "9092:9090"
+    command: ["./bin/portage-builder", "-port", "9090"]
+    environment:
+      - WORKERS=2
+      - USE_DOCKER=true
+      - DOCKER_IMAGE=gentoo/stage3:latest
+      - BUILD_WORK_DIR=/var/tmp/portage-builds
+      - BUILD_ARTIFACT_DIR=/var/tmp/portage-artifacts
+      - GPG_ENABLED=false
+    networks:
+      - portage-net
+
+  # Dashboard (local web UI)
+  portage-dashboard:
+    image: golang:1.21
+    container_name: portage-dashboard
+    working_dir: /app
+    volumes:
+      - ./:/app
+    ports:
+      - "8081:8081"
+    command: ["./bin/portage-dashboard", "-config", "configs/dashboard.yaml"]
+    networks:
+      - portage-net
+    depends_on:
+      - portage-server
+
+networks:
+  portage-net:
+    driver: bridge
+
+volumes:
+  builder1-work:
+  builder1-artifacts:
+  builder2-work:
+  builder2-artifacts:
