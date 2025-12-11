@@ -21,6 +21,7 @@ var (
 	useFlags       = flag.String("use", "", "USE flags (comma-separated)")
 	keywords       = flag.String("keywords", "", "Keywords (comma-separated)")
 	configFile     = flag.String("config", "", "Portage configuration file (JSON)")
+	portageDir     = flag.String("portage-dir", "", "Read configuration from Portage directory (e.g., /etc/portage)")
 	arch           = flag.String("arch", "amd64", "Target architecture")
 	profile        = flag.String("profile", "default/linux/amd64/23.0", "Portage profile")
 	outputBundle   = flag.String("output", "", "Output configuration bundle path")
@@ -31,7 +32,7 @@ var (
 func main() {
 	flag.Parse()
 
-	if *packageName == "" && *configFile == "" {
+	if *packageName == "" && *configFile == "" && *portageDir == "" {
 		fmt.Println("Usage:")
 		flag.PrintDefaults()
 		fmt.Println("\nExamples:")
@@ -41,14 +42,27 @@ func main() {
 		fmt.Println("  # Build with custom configuration:")
 		fmt.Println("  portage-client -config=myconfig.json -package=dev-lang/python")
 		fmt.Println("")
-		fmt.Println("  # Generate configuration bundle:")
-		fmt.Println("  portage-client -config=myconfig.json -output=bundle.tar.gz")
+		fmt.Println("  # Build using system Portage configuration:")
+		fmt.Println("  portage-client -portage-dir=/etc/portage -package=dev-lang/python")
+		fmt.Println("")
+		fmt.Println("  # Generate configuration bundle from system:")
+		fmt.Println("  portage-client -portage-dir=/etc/portage -package=dev-lang/python -output=bundle.tar.gz")
 		os.Exit(1)
 	}
 
 	// Load or create configuration
 	var config *builder.PortageConfig
-	if *configFile != "" {
+	if *portageDir != "" {
+		// Read from system Portage directory
+		transfer := builder.NewConfigTransfer("")
+		var err error
+		config, err = transfer.ReadSystemPortageConfig(*portageDir)
+		if err != nil {
+			log.Fatalf("Failed to read Portage configuration from %s: %v", *portageDir, err)
+		}
+		log.Printf("Successfully loaded configuration from %s", *portageDir)
+		log.Printf("Found %d package.use entries, %d repos", len(config.PackageUse), len(config.Repos))
+	} else if *configFile != "" {
 		var err error
 		config, err = loadConfigFromFile(*configFile)
 		if err != nil {

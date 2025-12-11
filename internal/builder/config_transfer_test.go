@@ -268,6 +268,179 @@ func TestPackageSpec(t *testing.T) {
 	}
 }
 
+// TestReadSystemPortageConfig tests reading from /etc/portage directory.
+func TestReadSystemPortageConfig(t *testing.T) {
+	// Create a temporary portage directory structure
+	tmpDir, err := os.MkdirTemp("", "portage-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(tmpDir)
+	}()
+
+	// Create make.conf
+	makeConfContent := `# Test make.conf
+CFLAGS="-O2 -pipe"
+MAKEOPTS="-j8"
+USE="ssl threads -doc"
+PORTAGE_TMPDIR="/var/tmp"
+`
+	makeConfPath := filepath.Join(tmpDir, "make.conf")
+	if err := os.WriteFile(makeConfPath, []byte(makeConfContent), 0644); err != nil {
+		t.Fatalf("Failed to create make.conf: %v", err)
+	}
+
+	// Create package.use directory
+	packageUseDir := filepath.Join(tmpDir, "package.use")
+	if err := os.MkdirAll(packageUseDir, 0755); err != nil {
+		t.Fatalf("Failed to create package.use dir: %v", err)
+	}
+
+	packageUseContent := `# Python settings
+dev-lang/python ssl threads sqlite
+dev-lang/python:3.11 -test -doc
+
+# Vim settings
+app-editors/vim python vim-pager
+`
+	if err := os.WriteFile(filepath.Join(packageUseDir, "custom"), []byte(packageUseContent), 0644); err != nil {
+		t.Fatalf("Failed to create package.use file: %v", err)
+	}
+
+	// Create package.accept_keywords directory
+	keywordsDir := filepath.Join(tmpDir, "package.accept_keywords")
+	if err := os.MkdirAll(keywordsDir, 0755); err != nil {
+		t.Fatalf("Failed to create package.accept_keywords dir: %v", err)
+	}
+
+	keywordsContent := `# Testing packages
+dev-lang/rust ~amd64
+sys-devel/gcc ~amd64
+`
+	if err := os.WriteFile(filepath.Join(keywordsDir, "testing"), []byte(keywordsContent), 0644); err != nil {
+		t.Fatalf("Failed to create keywords file: %v", err)
+	}
+
+	// Create package.mask
+	maskContent := `# Masked packages
+>=dev-lang/python-3.12
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "package.mask"), []byte(maskContent), 0644); err != nil {
+		t.Fatalf("Failed to create package.mask: %v", err)
+	}
+
+	// Create package.unmask
+	unmaskContent := `# Unmasked packages
+=sys-kernel/gentoo-sources-6.6.0
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "package.unmask"), []byte(unmaskContent), 0644); err != nil {
+		t.Fatalf("Failed to create package.unmask: %v", err)
+	}
+
+	// Create repos.conf directory
+	reposDir := filepath.Join(tmpDir, "repos.conf")
+	if err := os.MkdirAll(reposDir, 0755); err != nil {
+		t.Fatalf("Failed to create repos.conf dir: %v", err)
+	}
+
+	reposContent := `[DEFAULT]
+main-repo = gentoo
+
+[gentoo]
+location = /var/db/repos/gentoo
+sync-type = git
+sync-uri = https://github.com/gentoo-mirror/gentoo.git
+priority = 100
+
+[guru]
+location = /var/db/repos/guru
+sync-type = git
+sync-uri = https://github.com/gentoo-mirror/guru.git
+priority = 50
+`
+	if err := os.WriteFile(filepath.Join(reposDir, "gentoo.conf"), []byte(reposContent), 0644); err != nil {
+		t.Fatalf("Failed to create repos conf: %v", err)
+	}
+
+	// Read the configuration
+	transfer := NewConfigTransfer("")
+	config, err := transfer.ReadSystemPortageConfig(tmpDir)
+	if err != nil {
+		t.Fatalf("Failed to read system portage config: %v", err)
+	}
+
+	// Verify make.conf
+	if config.MakeConf["MAKEOPTS"] != "-j8" {
+		t.Errorf("Expected MAKEOPTS=-j8, got %s", config.MakeConf["MAKEOPTS"])
+	}
+
+	if len(config.GlobalUse) != 3 {
+		t.Errorf("Expected 3 global USE flags, got %d", len(config.GlobalUse))
+	}
+
+	// Verify package.use
+	pythonUse, ok := config.PackageUse["dev-lang/python"]
+	if !ok {
+		t.Error("dev-lang/python not found in package.use")
+	} else {
+		if len(pythonUse) < 3 {
+			t.Errorf("Expected at least 3 USE flags for python, got %d", len(pythonUse))
+		}
+	}
+
+	// Verify package.accept_keywords
+	rustKeywords, ok := config.PackageKeywords["dev-lang/rust"]
+	if !ok {
+		t.Error("dev-lang/rust not found in package.accept_keywords")
+	} else {
+		if len(rustKeywords) == 0 || rustKeywords[0] != "~amd64" {
+			t.Errorf("Expected ~amd64 keyword for rust, got %v", rustKeywords)
+		}
+	}
+
+	// Verify package.mask
+	if len(config.PackageMask) == 0 {
+		t.Error("Expected package.mask entries")
+	}
+
+	// Verify package.unmask
+	if len(config.PackageUnmask) == 0 {
+		t.Error("Expected package.unmask entries")
+	}
+
+	// Verify repos
+	if len(config.Repos) < 2 {
+		t.Errorf("Expected at least 2 repos, got %d", len(config.Repos))
+	}
+
+	// Check gentoo repo
+	foundGentoo := false
+	for _, repo := range config.Repos {
+		if repo.Name == "gentoo" {
+			foundGentoo = true
+			if repo.SyncType != "git" {
+				t.Errorf("Expected sync-type=git for gentoo, got %s", repo.SyncType)
+			}
+			if repo.Priority != 100 {
+				t.Errorf("Expected priority=100 for gentoo, got %d", repo.Priority)
+			}
+		}
+	}
+	if !foundGentoo {
+		t.Error("gentoo repo not found")
+	}
+}
+
+// TestReadSystemPortageConfigNonExistent tests reading from non-existent directory.
+func TestReadSystemPortageConfigNonExistent(t *testing.T) {
+	transfer := NewConfigTransfer("")
+	_, err := transfer.ReadSystemPortageConfig("/nonexistent/portage")
+	if err == nil {
+		t.Error("Expected error for non-existent directory")
+	}
+}
+
 // contains checks if a string contains a substring.
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && findSubstring(s, substr))

@@ -83,6 +83,321 @@ func NewConfigTransfer(workDir string) *ConfigTransfer {
 	}
 }
 
+// ReadSystemPortageConfig reads Portage configuration from /etc/portage directory.
+// This captures the user's actual system configuration for maximum consistency.
+func (ct *ConfigTransfer) ReadSystemPortageConfig(portageDir string) (*PortageConfig, error) {
+	if portageDir == "" {
+		portageDir = "/etc/portage"
+	}
+
+	// Check if portage directory exists
+	if _, err := os.Stat(portageDir); os.IsNotExist(err) {
+		return nil, fmt.Errorf("portage directory not found: %s", portageDir)
+	}
+
+	config := &PortageConfig{
+		PackageUse:      make(map[string][]string),
+		PackageKeywords: make(map[string][]string),
+		PackageMask:     []string{},
+		PackageUnmask:   []string{},
+		MakeConf:        make(map[string]string),
+		Environment:     make(map[string]string),
+		GlobalUse:       []string{},
+		Repos:           []RepoConfig{},
+	}
+
+	// Read make.conf
+	if err := ct.readMakeConf(filepath.Join(portageDir, "make.conf"), config); err != nil {
+		// Try /etc/make.conf as fallback
+		_ = ct.readMakeConf("/etc/make.conf", config)
+	}
+
+	// Read package.use (can be file or directory)
+	_ = ct.readPackageUse(filepath.Join(portageDir, "package.use"), config)
+
+	// Read package.accept_keywords
+	_ = ct.readPackageKeywords(filepath.Join(portageDir, "package.accept_keywords"), config)
+
+	// Read package.mask
+	_ = ct.readPackageMask(filepath.Join(portageDir, "package.mask"), config)
+
+	// Read package.unmask
+	_ = ct.readPackageUnmask(filepath.Join(portageDir, "package.unmask"), config)
+
+	// Read repos.conf
+	_ = ct.readReposConf(filepath.Join(portageDir, "repos.conf"), config)
+
+	return config, nil
+}
+
+// readMakeConf reads make.conf file.
+func (ct *ConfigTransfer) readMakeConf(path string, config *PortageConfig) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// Skip comments and empty lines
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse VAR="value" or VAR=value
+		if strings.Contains(line, "=") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				value := strings.Trim(strings.TrimSpace(parts[1]), "\"'")
+				config.MakeConf[key] = value
+
+				// Extract global USE flags
+				if key == "USE" {
+					config.GlobalUse = strings.Fields(value)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// readPackageUse reads package.use file or directory.
+func (ct *ConfigTransfer) readPackageUse(path string, config *PortageConfig) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		// Read all files in directory
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				_ = ct.parsePackageUseFile(filepath.Join(path, entry.Name()), config)
+			}
+		}
+	} else {
+		// Read single file
+		return ct.parsePackageUseFile(path, config)
+	}
+
+	return nil
+}
+
+// parsePackageUseFile parses a package.use file.
+func (ct *ConfigTransfer) parsePackageUseFile(path string, config *PortageConfig) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// Skip comments and empty lines
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse: package-atom use-flags
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			pkgAtom := fields[0]
+			useFlags := fields[1:]
+			config.PackageUse[pkgAtom] = append(config.PackageUse[pkgAtom], useFlags...)
+		}
+	}
+
+	return nil
+}
+
+// readPackageKeywords reads package.accept_keywords file or directory.
+func (ct *ConfigTransfer) readPackageKeywords(path string, config *PortageConfig) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				_ = ct.parsePackageKeywordsFile(filepath.Join(path, entry.Name()), config)
+			}
+		}
+	} else {
+		return ct.parsePackageKeywordsFile(path, config)
+	}
+
+	return nil
+}
+
+// parsePackageKeywordsFile parses a package.accept_keywords file.
+func (ct *ConfigTransfer) parsePackageKeywordsFile(path string, config *PortageConfig) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			pkgAtom := fields[0]
+			keywords := fields[1:]
+			config.PackageKeywords[pkgAtom] = append(config.PackageKeywords[pkgAtom], keywords...)
+		}
+	}
+
+	return nil
+}
+
+// readPackageMask reads package.mask file or directory.
+func (ct *ConfigTransfer) readPackageMask(path string, config *PortageConfig) error {
+	return ct.readPackageList(path, &config.PackageMask)
+}
+
+// readPackageUnmask reads package.unmask file or directory.
+func (ct *ConfigTransfer) readPackageUnmask(path string, config *PortageConfig) error {
+	return ct.readPackageList(path, &config.PackageUnmask)
+}
+
+// readPackageList reads a list of package atoms from file or directory.
+func (ct *ConfigTransfer) readPackageList(path string, list *[]string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				_ = ct.parsePackageListFile(filepath.Join(path, entry.Name()), list)
+			}
+		}
+	} else {
+		return ct.parsePackageListFile(path, list)
+	}
+
+	return nil
+}
+
+// parsePackageListFile parses a file containing package atoms.
+func (ct *ConfigTransfer) parsePackageListFile(path string, list *[]string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		*list = append(*list, line)
+	}
+
+	return nil
+}
+
+// readReposConf reads repository configurations.
+func (ct *ConfigTransfer) readReposConf(path string, config *PortageConfig) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && strings.HasSuffix(entry.Name(), ".conf") {
+				_ = ct.parseRepoConfFile(filepath.Join(path, entry.Name()), config)
+			}
+		}
+	} else {
+		return ct.parseRepoConfFile(path, config)
+	}
+
+	return nil
+}
+
+// parseRepoConfFile parses a repository configuration file.
+func (ct *ConfigTransfer) parseRepoConfFile(path string, config *PortageConfig) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	var currentRepo *RepoConfig
+	lines := strings.Split(string(data), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Check for section header [repo-name]
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			if currentRepo != nil {
+				config.Repos = append(config.Repos, *currentRepo)
+			}
+			repoName := strings.Trim(line, "[]")
+			currentRepo = &RepoConfig{Name: repoName}
+			continue
+		}
+
+		// Parse key = value
+		if currentRepo != nil && strings.Contains(line, "=") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				value := strings.TrimSpace(parts[1])
+
+				switch key {
+				case "location":
+					currentRepo.Location = value
+				case "sync-type":
+					currentRepo.SyncType = value
+				case "sync-uri":
+					currentRepo.SyncURI = value
+				case "priority":
+					fmt.Sscanf(value, "%d", &currentRepo.Priority)
+				}
+			}
+		}
+	}
+
+	// Add last repo
+	if currentRepo != nil {
+		config.Repos = append(config.Repos, *currentRepo)
+	}
+
+	return nil
+}
+
 // CreateConfigBundle creates a configuration bundle from user's Portage setup.
 func (ct *ConfigTransfer) CreateConfigBundle(
 	config *PortageConfig,

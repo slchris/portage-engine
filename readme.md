@@ -30,11 +30,15 @@ Central server that handles package queries, build requests, and coordinates inf
 Advanced system for collecting, packaging, and applying Portage configurations.
 
 **Features:**
+- **Read system configuration**: Direct import from `/etc/portage` directory
 - Collect user's Portage configuration (package.use, make.conf, etc.)
 - Package configuration into portable bundles
 - Transfer and apply configuration to build instances
 - Support for package-specific USE flags and environment variables
 - Repository configuration management
+- Ensure USE flag consistency between systems
+
+**📚 See detailed documentation**: [Using System Portage Configuration](docs/SYSTEM_CONFIG_USAGE.md)
 
 ### 3. Infrastructure as Code (IaC)
 Automated cloud infrastructure provisioning system that creates build machines on-demand.
@@ -123,6 +127,38 @@ export DOCKER_IMAGE=gentoo/stage3:latest
   -version=3.11 \
   -use=ssl,threads,sqlite,readline
 ```
+
+### 🆕 Build Using System Portage Configuration
+
+**New Feature**: Use your system's `/etc/portage` configuration directly!
+
+```bash
+# Build with your exact system configuration
+./bin/portage-client \
+  -portage-dir=/etc/portage \
+  -package=dev-lang/python:3.11
+
+# This will:
+# ✓ Read all your package.use settings
+# ✓ Include package.accept_keywords
+# ✓ Apply your make.conf settings
+# ✓ Use your repository configurations
+# ✓ Ensure USE flag consistency
+
+# Generate a configuration bundle from your system
+./bin/portage-client \
+  -portage-dir=/etc/portage \
+  -package=dev-lang/python:3.11 \
+  -output=python-system-config.tar.gz
+```
+
+**Benefits**:
+- ✅ Guarantees USE flag consistency with your system
+- ✅ No manual configuration needed
+- ✅ Includes all package-specific settings
+- ✅ Respects keywords and masks
+
+See [System Configuration Usage Guide](docs/SYSTEM_CONFIG_USAGE.md) for details.
 
 ### Build with Configuration File
 
