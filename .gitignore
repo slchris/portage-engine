@@ -89,3 +89,9 @@ Desktop.ini
 .env
 .env.local
 .env.*.local
+
+# CodeQL
+codeql-db/
+codeql-results*.sarif
+codeql-results*.csv
+codeql-report.html

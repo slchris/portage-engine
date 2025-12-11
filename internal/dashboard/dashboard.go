@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/slchris/portage-engine/pkg/config"
@@ -171,7 +173,50 @@ func (d *Dashboard) handleInstances(w http.ResponseWriter, _ *http.Request) {
 
 // handleStatic serves static files.
 func (d *Dashboard) handleStatic(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, r.URL.Path[1:])
+	// Define the static files root directory
+	staticRoot := "./static"
+
+	// Extract the requested path and remove the /static/ prefix
+	requestPath := strings.TrimPrefix(r.URL.Path, "/static/")
+
+	// Clean the path to prevent directory traversal attacks
+	requestPath = filepath.Clean(requestPath)
+
+	// Prevent accessing files outside the static directory
+	// Check for any attempt to traverse up (..)
+	if strings.Contains(requestPath, "..") || strings.HasPrefix(requestPath, "/") {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		log.Printf("Blocked path traversal attempt: %s", r.URL.Path)
+		return
+	}
+
+	// Construct the full file path
+	fullPath := filepath.Join(staticRoot, requestPath)
+
+	// Verify the resolved path is still within staticRoot
+	absStaticRoot, err := filepath.Abs(staticRoot)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Printf("Failed to resolve static root: %v", err)
+		return
+	}
+
+	absFullPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Printf("Failed to resolve file path: %v", err)
+		return
+	}
+
+	// Ensure the file is within the static directory
+	if !strings.HasPrefix(absFullPath, absStaticRoot) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		log.Printf("Blocked access outside static directory: %s -> %s", r.URL.Path, absFullPath)
+		return
+	}
+
+	// Serve the file
+	http.ServeFile(w, r, fullPath)
 }
 
 // fetchClusterStatus fetches cluster status from the server.
