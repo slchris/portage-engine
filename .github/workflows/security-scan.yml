@@ -13,6 +13,9 @@ jobs:
   security-scan:
     name: Trivy Security Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@v4
 
@@ -21,17 +24,24 @@ jobs:
         with:
           scan-type: 'fs'
           scan-ref: '.'
-          format: 'table'
-          output: 'trivy-results.txt'
+          format: 'json'
+          output: 'trivy-results.json'
           severity: 'CRITICAL,HIGH'
 
       - name: Display Trivy results
         if: always()
-        run: cat trivy-results.txt
+        run: |
+          if [ -f trivy-results.json ]; then
+            echo "=== Trivy Scan Results ==="
+            cat trivy-results.json | jq '.Results[]? | select(.Vulnerabilities != null) | {Resource: .Target, VulnerabilityCount: (.Vulnerabilities | length)}' | head -50
+          fi
 
   gosec-scan:
     name: GoSec Security Scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@v4
 
@@ -45,12 +55,21 @@ jobs:
         if: always()
         run: |
           if [ -f gosec-results.json ]; then
-            cat gosec-results.json | jq '.Issues // empty' | head -100
+            echo "=== GoSec Scan Results ==="
+            ISSUE_COUNT=$(cat gosec-results.json | jq '.Issues | length')
+            echo "Total Issues Found: $ISSUE_COUNT"
+            if [ "$ISSUE_COUNT" -gt 0 ]; then
+              cat gosec-results.json | jq '.Issues[] | {Rule: .rule_id, File: .file, Severity: .severity}' | head -50
+            fi
           fi
 
   codeql-analysis:
     name: CodeQL Analysis
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
