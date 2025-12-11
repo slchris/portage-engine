@@ -2,6 +2,8 @@ run:
   timeout: 5m
   tests: true
   modules-download-mode: readonly
+  build-tags:
+    - ""
 
 linters:
   enable:
@@ -21,7 +23,6 @@ linters:
     - exhaustive
   disable:
     - gosec  # Too many false positives for a build/package management tool
-    - typecheck  # Has issues with module resolution in CI environment
 
 linters-settings:
   errcheck:
@@ -29,7 +30,30 @@ linters-settings:
     check-blank: true
 
   govet:
-    enable-all: true
+    enable:
+      - assign
+      - atomic
+      - bools
+      - buildtag
+      - cgocall
+      - composites
+      - copylocks
+      - errorsas
+      - httpresponse
+      - ifaceassert
+      - loopclosure
+      - lostcancel
+      - nilfunc
+      - printf
+      - shift
+      - stdmethods
+      - structtag
+      - unmarshal
+      - unreachable
+      - unsafeptr
+      - unusedresult
+    disable:
+      - shadow
 
   revive:
     rules:
