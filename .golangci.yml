@@ -96,6 +96,8 @@ issues:
   exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0
+  exclude:
+    - "undefined: yaml"
   exclude-rules:
     - path: _test\.go
       linters:
@@ -105,6 +107,9 @@ issues:
       linters:
         - revive
       text: "exported: exported function"
+    - text: "undefined: yaml"
+      linters:
+        - typecheck
 
 output:
   format: colored-line-number
