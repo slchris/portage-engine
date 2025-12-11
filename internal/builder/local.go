@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/slchris/portage-engine/internal/gpg"
+	"github.com/slchris/portage-engine/internal/notification"
 )
 
 // LocalBuildRequest represents a local package build request.
@@ -52,6 +53,7 @@ type LocalBuilder struct {
 	dockerImage    string
 	executor       *BuildExecutor
 	dockerExecutor *DockerBuildExecutor
+	notifier       *notification.Notifier
 }
 
 // NewLocalBuilder creates a new local builder instance.
@@ -75,6 +77,20 @@ func NewLocalBuilder(workers int, signer *gpg.Signer) *LocalBuilder {
 	_ = os.MkdirAll(workDir, 0750)
 	_ = os.MkdirAll(artifactDir, 0750)
 
+	// Load notification config if exists
+	var notifier *notification.Notifier
+	notifyConfigPath := os.Getenv("NOTIFY_CONFIG")
+	if notifyConfigPath == "" {
+		notifyConfigPath = "configs/notification.json"
+	}
+	notifyConfig, err := notification.LoadConfig(notifyConfigPath)
+	if err == nil {
+		notifier = notification.NewNotifier(notifyConfig)
+		log.Printf("Notification system loaded from %s", notifyConfigPath)
+	} else {
+		log.Printf("Notification config not loaded (optional): %v", err)
+	}
+
 	lb := &LocalBuilder{
 		workers:        workers,
 		jobQueue:       make(chan *BuildJob, 100),
@@ -86,6 +102,7 @@ func NewLocalBuilder(workers int, signer *gpg.Signer) *LocalBuilder {
 		dockerImage:    dockerImage,
 		executor:       NewBuildExecutor(workDir, artifactDir),
 		dockerExecutor: NewDockerBuildExecutor(workDir, artifactDir, dockerImage),
+		notifier:       notifier,
 	}
 
 	// Start worker pool
@@ -213,6 +230,9 @@ func (lb *LocalBuilder) worker(id int) {
 			log.Printf("Worker %d: Job %s completed successfully", id, job.ID)
 		}
 		lb.jobsMutex.Unlock()
+
+		// Send notification
+		lb.sendNotification(job)
 	}
 }
 
@@ -447,4 +467,29 @@ func (lb *LocalBuilder) findLatestPackage(dir, _ string) (string, error) {
 	}
 
 	return latestFile, nil
+}
+
+// sendNotification sends build completion notification.
+func (lb *LocalBuilder) sendNotification(job *BuildJob) {
+	if lb.notifier == nil {
+		return
+	}
+
+	duration := job.EndTime.Sub(job.StartTime)
+	notify := &notification.BuildNotification{
+		JobID:       job.ID,
+		PackageName: job.Request.PackageName,
+		Version:     job.Request.Version,
+		Status:      job.Status,
+		StartTime:   job.StartTime,
+		EndTime:     job.EndTime,
+		Duration:    duration.String(),
+		BuildLog:    job.Log,
+		Error:       job.Error,
+		ArtifactURL: job.ArtifactURL,
+	}
+
+	if err := lb.notifier.Notify(notify); err != nil {
+		log.Printf("Failed to send notification for job %s: %v", job.ID, err)
+	}
 }

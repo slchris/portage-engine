@@ -1,0 +1,42 @@
+{
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 587,
+    "username": "build-notify@example.com",
+    "password": "your-password",
+    "from": "build-notify@example.com",
+    "to": ["admin@example.com", "dev-team@example.com"],
+    "subject": "Portage Build Notification"
+  },
+  "webhook": {
+    "enabled": false,
+    "url": "https://your-webhook-endpoint.com/notify",
+    "method": "POST",
+    "headers": {
+      "Content-Type": "application/json",
+      "Authorization": "Bearer your-token"
+    },
+    "timeout": 30
+  },
+  "irc": {
+    "enabled": false,
+    "server": "irc.libera.chat",
+    "port": 6667,
+    "nick": "portage-bot",
+    "channels": ["#gentoo-builds"],
+    "use_tls": false
+  },
+  "slack": {
+    "enabled": false,
+    "webhook_url": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+    "channel": "#builds",
+    "username": "Portage Bot",
+    "icon_emoji": ":package:"
+  },
+  "telegram": {
+    "enabled": false,
+    "bot_token": "your-bot-token",
+    "chat_id": "your-chat-id"
+  }
+}
