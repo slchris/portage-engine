@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	configPath = flag.String("config", "configs/server.yaml", "Path to configuration file")
+	configPath = flag.String("config", "configs/server.conf", "Path to configuration file")
 	port       = flag.Int("port", 8080, "Server port")
 )
 

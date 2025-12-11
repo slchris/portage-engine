@@ -2,52 +2,147 @@
 package config
 
 import (
+	"bufio"
 	"fmt"
 	"os"
-
-	"gopkg.in/yaml.v3"
+	"strconv"
+	"strings"
 )
 
 // ServerConfig represents the server configuration.
 type ServerConfig struct {
-	Port        int               `yaml:"port"`
-	BinpkgPath  string            `yaml:"binpkg_path"`
-	MaxWorkers  int               `yaml:"max_workers"`
-	CloudConfig map[string]string `yaml:"cloud_config"`
-	// Build mode: "docker" for local containers, "cloud" for IaC provisioning
-	BuildMode string `yaml:"build_mode"`
-	// Docker configuration for local builds
-	DockerImage string `yaml:"docker_image"`
-	// GPG signing configuration
-	GPGEnabled bool   `yaml:"gpg_enabled"`
-	GPGKeyID   string `yaml:"gpg_key_id"`
-	GPGKeyPath string `yaml:"gpg_key_path"`
+	Port              int
+	BinpkgPath        string
+	MaxWorkers        int
+	BuildMode         string
+	StorageType       string
+	StorageLocalDir   string
+	StorageS3Bucket   string
+	StorageS3Region   string
+	StorageS3Prefix   string
+	StorageHTTPBase   string
+	GPGEnabled        bool
+	GPGKeyID          string
+	GPGKeyPath        string
+	CloudProvider     string
+	CloudAliyunRegion string
+	CloudAliyunZone   string
+	CloudGCPProject   string
+	CloudGCPRegion    string
+	CloudGCPZone      string
+	CloudAWSRegion    string
+	CloudAWSZone      string
+	RemoteBuilders    []string
 }
 
 // DashboardConfig represents the dashboard configuration.
 type DashboardConfig struct {
-	Port           int    `yaml:"port"`
-	ServerURL      string `yaml:"server_url"`
-	AuthEnabled    bool   `yaml:"auth_enabled"`
-	JWTSecret      string `yaml:"jwt_secret"`
-	AllowAnonymous bool   `yaml:"allow_anonymous"`
+	Port           int
+	ServerURL      string
+	AuthEnabled    bool
+	JWTSecret      string
+	AllowAnonymous bool
+}
+
+// BuilderConfig represents the builder configuration.
+type BuilderConfig struct {
+	Port            int
+	Workers         int
+	UseDocker       bool
+	DockerImage     string
+	WorkDir         string
+	ArtifactDir     string
+	GPGEnabled      bool
+	GPGKeyID        string
+	GPGKeyPath      string
+	StorageType     string
+	StorageLocalDir string
+	StorageS3Bucket string
+	StorageS3Region string
+	StorageS3Prefix string
+	StorageHTTPBase string
+	NotifyConfig    string
+}
+
+// loadEnvFile loads key=value pairs from a .conf file.
+func loadEnvFile(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	env := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Split on first =
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			env[key] = value
+		}
+	}
+
+	return env, scanner.Err()
+}
+
+// getEnvString gets string value from env map with fallback to system env.
+func getEnvString(env map[string]string, key, defaultValue string) string {
+	if val, ok := env[key]; ok && val != "" {
+		return val
+	}
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return defaultValue
+}
+
+// getEnvInt gets int value from env map with fallback to system env.
+func getEnvInt(env map[string]string, key string, defaultValue int) int {
+	val := getEnvString(env, key, "")
+	if val == "" {
+		return defaultValue
+	}
+	if i, err := strconv.Atoi(val); err == nil {
+		return i
+	}
+	return defaultValue
+}
+
+// getEnvBool gets bool value from env map with fallback to system env.
+func getEnvBool(env map[string]string, key string, defaultValue bool) bool {
+	val := getEnvString(env, key, "")
+	if val == "" {
+		return defaultValue
+	}
+	val = strings.ToLower(val)
+	return val == "true" || val == "1" || val == "yes"
 }
 
 // LoadServerConfig loads server configuration from a file.
 func LoadServerConfig(path string) (*ServerConfig, error) {
 	// Set defaults
 	config := &ServerConfig{
-		Port:       8080,
-		BinpkgPath: "/var/cache/binpkgs",
-		MaxWorkers: 5,
-		CloudConfig: map[string]string{
-			"default_provider": "gcp",
-		},
-		BuildMode:   "docker", // Default to local Docker builds
-		DockerImage: "gentoo/stage3:latest",
-		GPGEnabled:  false,
-		GPGKeyID:    "",
-		GPGKeyPath:  "",
+		Port:            8080,
+		BinpkgPath:      "/var/cache/binpkgs",
+		MaxWorkers:      5,
+		BuildMode:       "remote",
+		StorageType:     "local",
+		StorageLocalDir: "/var/cache/binpkgs",
+		GPGEnabled:      false,
+		CloudProvider:   "gcp",
+		CloudGCPProject: "portage-engine",
+		CloudGCPRegion:  "us-central1",
+		CloudGCPZone:    "us-central1-a",
 	}
 
 	// If config file doesn't exist, return defaults
@@ -56,13 +151,42 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		return config, nil
 	}
 
-	data, err := os.ReadFile(path)
+	env, err := loadEnvFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, config); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	config.Port = getEnvInt(env, "SERVER_PORT", config.Port)
+	config.BinpkgPath = getEnvString(env, "BINPKG_PATH", config.BinpkgPath)
+	config.MaxWorkers = getEnvInt(env, "MAX_WORKERS", config.MaxWorkers)
+	config.BuildMode = getEnvString(env, "BUILD_MODE", config.BuildMode)
+
+	config.StorageType = getEnvString(env, "STORAGE_TYPE", config.StorageType)
+	config.StorageLocalDir = getEnvString(env, "STORAGE_LOCAL_DIR", config.StorageLocalDir)
+	config.StorageS3Bucket = getEnvString(env, "STORAGE_S3_BUCKET", "")
+	config.StorageS3Region = getEnvString(env, "STORAGE_S3_REGION", "")
+	config.StorageS3Prefix = getEnvString(env, "STORAGE_S3_PREFIX", "")
+	config.StorageHTTPBase = getEnvString(env, "STORAGE_HTTP_BASE", "")
+
+	config.GPGEnabled = getEnvBool(env, "GPG_ENABLED", config.GPGEnabled)
+	config.GPGKeyID = getEnvString(env, "GPG_KEY_ID", "")
+	config.GPGKeyPath = getEnvString(env, "GPG_KEY_PATH", "")
+
+	config.CloudProvider = getEnvString(env, "CLOUD_DEFAULT_PROVIDER", config.CloudProvider)
+	config.CloudAliyunRegion = getEnvString(env, "CLOUD_ALIYUN_REGION", "cn-hangzhou")
+	config.CloudAliyunZone = getEnvString(env, "CLOUD_ALIYUN_ZONE", "cn-hangzhou-a")
+	config.CloudGCPProject = getEnvString(env, "CLOUD_GCP_PROJECT", config.CloudGCPProject)
+	config.CloudGCPRegion = getEnvString(env, "CLOUD_GCP_REGION", config.CloudGCPRegion)
+	config.CloudGCPZone = getEnvString(env, "CLOUD_GCP_ZONE", config.CloudGCPZone)
+	config.CloudAWSRegion = getEnvString(env, "CLOUD_AWS_REGION", "us-east-1")
+	config.CloudAWSZone = getEnvString(env, "CLOUD_AWS_ZONE", "us-east-1a")
+
+	// Parse remote builders
+	if builders := getEnvString(env, "REMOTE_BUILDERS", ""); builders != "" {
+		config.RemoteBuilders = strings.Split(builders, ",")
+		for i := range config.RemoteBuilders {
+			config.RemoteBuilders[i] = strings.TrimSpace(config.RemoteBuilders[i])
+		}
 	}
 
 	return config, nil
@@ -85,14 +209,65 @@ func LoadDashboardConfig(path string) (*DashboardConfig, error) {
 		return config, nil
 	}
 
-	data, err := os.ReadFile(path)
+	env, err := loadEnvFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	if err := yaml.Unmarshal(data, config); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	config.Port = getEnvInt(env, "DASHBOARD_PORT", config.Port)
+	config.ServerURL = getEnvString(env, "SERVER_URL", config.ServerURL)
+	config.AuthEnabled = getEnvBool(env, "AUTH_ENABLED", config.AuthEnabled)
+	config.JWTSecret = getEnvString(env, "JWT_SECRET", config.JWTSecret)
+	config.AllowAnonymous = getEnvBool(env, "ALLOW_ANONYMOUS", config.AllowAnonymous)
+
+	return config, nil
+}
+
+// LoadBuilderConfig loads builder configuration from a file.
+func LoadBuilderConfig(path string) (*BuilderConfig, error) {
+	// Set defaults
+	config := &BuilderConfig{
+		Port:            9090,
+		Workers:         2,
+		UseDocker:       true,
+		DockerImage:     "gentoo/stage3:latest",
+		WorkDir:         "/var/tmp/portage-builds",
+		ArtifactDir:     "/var/tmp/portage-artifacts",
+		GPGEnabled:      false,
+		StorageType:     "local",
+		StorageLocalDir: "/var/binpkgs",
 	}
+
+	// If config file doesn't exist, return defaults
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		fmt.Printf("Config file not found, using defaults: %s\n", path)
+		return config, nil
+	}
+
+	env, err := loadEnvFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	config.Port = getEnvInt(env, "BUILDER_PORT", config.Port)
+	config.Workers = getEnvInt(env, "BUILDER_WORKERS", config.Workers)
+	config.UseDocker = getEnvBool(env, "USE_DOCKER", config.UseDocker)
+	config.DockerImage = getEnvString(env, "DOCKER_IMAGE", config.DockerImage)
+	config.WorkDir = getEnvString(env, "BUILD_WORK_DIR", config.WorkDir)
+	config.ArtifactDir = getEnvString(env, "BUILD_ARTIFACT_DIR", config.ArtifactDir)
+
+	config.GPGEnabled = getEnvBool(env, "GPG_ENABLED", config.GPGEnabled)
+	config.GPGKeyID = getEnvString(env, "GPG_KEY_ID", "")
+	config.GPGKeyPath = getEnvString(env, "GPG_KEY_PATH", "")
+
+	config.StorageType = getEnvString(env, "STORAGE_TYPE", config.StorageType)
+	config.StorageLocalDir = getEnvString(env, "STORAGE_LOCAL_DIR", config.StorageLocalDir)
+	config.StorageS3Bucket = getEnvString(env, "STORAGE_S3_BUCKET", "")
+	config.StorageS3Region = getEnvString(env, "STORAGE_S3_REGION", "")
+	config.StorageS3Prefix = getEnvString(env, "STORAGE_S3_PREFIX", "")
+	config.StorageHTTPBase = getEnvString(env, "STORAGE_HTTP_BASE", "")
+
+	config.NotifyConfig = getEnvString(env, "NOTIFY_CONFIG", "")
 
 	return config, nil
 }

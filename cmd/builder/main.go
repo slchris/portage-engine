@@ -15,37 +15,40 @@ import (
 
 	"github.com/slchris/portage-engine/internal/builder"
 	"github.com/slchris/portage-engine/internal/gpg"
+	"github.com/slchris/portage-engine/pkg/config"
 )
 
 func main() {
 	// Parse command line flags
+	configPath := flag.String("config", "configs/builder.conf", "Path to configuration file")
 	port := flag.Int("port", 9090, "Builder service port")
 	flag.Parse()
 
-	log.Printf("Starting Portage Builder Service on port %d", *port)
-
-	// Configuration from environment variables
-	workers := 2
-	if w := os.Getenv("WORKERS"); w != "" {
-		_, _ = fmt.Sscanf(w, "%d", &workers)
+	// Load configuration
+	cfg, err := config.LoadBuilderConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	gpgEnabled := os.Getenv("GPG_ENABLED") == "true"
-	gpgKeyID := os.Getenv("GPG_KEY_ID")
-	gpgKeyPath := os.Getenv("GPG_KEY_PATH")
+	// Override port if specified
+	if *port != 9090 {
+		cfg.Port = *port
+	}
+
+	log.Printf("Starting Portage Builder Service on port %d", cfg.Port)
 
 	// Initialize GPG signer if enabled
 	var signer *gpg.Signer
-	if gpgEnabled {
-		signer = gpg.NewSigner(gpgKeyID, gpgKeyPath, true)
+	if cfg.GPGEnabled {
+		signer = gpg.NewSigner(cfg.GPGKeyID, cfg.GPGKeyPath, true)
 		if err := gpg.CheckGPG(); err != nil {
 			log.Fatalf("GPG check failed: %v", err)
 		}
-		log.Printf("GPG signing enabled with key: %s", gpgKeyID)
+		log.Printf("GPG signing enabled with key: %s", cfg.GPGKeyID)
 	}
 
 	// Create builder instance
-	bldr := builder.NewLocalBuilder(workers, signer)
+	bldr := builder.NewLocalBuilder(cfg.Workers, signer)
 
 	// Setup HTTP server
 	mux := http.NewServeMux()
@@ -118,7 +121,7 @@ func main() {
 
 	// Start HTTP server
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", *port),
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           loggingMiddleware(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -138,7 +141,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("Builder service listening on :%d", *port)
+	log.Printf("Builder service listening on :%d", cfg.Port)
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}

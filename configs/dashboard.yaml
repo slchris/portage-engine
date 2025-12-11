@@ -1,9 +1,0 @@
-# Portage Engine Dashboard Configuration
-
-port: 8081
-server_url: http://localhost:8080
-
-# Authentication settings
-auth_enabled: true
-jwt_secret: change-me-in-production
-allow_anonymous: true

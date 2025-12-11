@@ -10,10 +10,8 @@ import (
 // TestNewManager tests the creation of a build manager.
 func TestNewManager(t *testing.T) {
 	cfg := &config.ServerConfig{
-		MaxWorkers: 4,
-		CloudConfig: map[string]string{
-			"default_provider": "gcp",
-		},
+		MaxWorkers:    4,
+		CloudProvider: "gcp",
 	}
 
 	mgr := NewManager(cfg)
