@@ -92,6 +92,15 @@ jobs:
         uses: github/codeql-action/analyze@v3
         continue-on-error: true
 
+      - name: Upload CodeQL results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-results
+          path: /home/runner/work/portage-engine/results/
+          retention-days: 7
+        continue-on-error: true
+
       - name: CodeQL Analysis Summary
         if: always()
-        run: echo "CodeQL analysis completed. Check the Security tab in GitHub for detailed results if code scanning is enabled."
+        run: echo "CodeQL analysis completed. Check the Security tab in GitHub for detailed results if code scanning is enabled, or download the artifacts to view the SARIF file."
