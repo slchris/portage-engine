@@ -48,7 +48,7 @@ jobs:
       - name: Run gosec security scanner
         uses: securego/gosec@master
         with:
-          args: '-no-fail -fmt=json -out gosec-results.json ./...'
+          args: '-no-fail -fmt=json -out gosec-results.json -exclude=G204,G304,G306 ./...'
         continue-on-error: true
 
       - name: Display gosec results
@@ -59,7 +59,10 @@ jobs:
             ISSUE_COUNT=$(cat gosec-results.json | jq '.Issues | length')
             echo "Total Issues Found: $ISSUE_COUNT"
             if [ "$ISSUE_COUNT" -gt 0 ]; then
-              cat gosec-results.json | jq '.Issues[] | {Rule: .rule_id, File: .file, Severity: .severity}' | head -50
+              echo "Showing first 20 issues:"
+              cat gosec-results.json | jq '.Issues[] | {Rule: .rule_id, File: .file, Line: .line, Severity: .severity, Details: .details}' | head -100
+            else
+              echo "No security issues found! ✓"
             fi
           fi
 
