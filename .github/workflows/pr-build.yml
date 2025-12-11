@@ -67,11 +67,14 @@ jobs:
       - name: Verify dependencies
         run: go mod verify
 
+      - name: Test build
+        run: go build ./...
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v3
         with:
           version: v1.55.2
-          args: --timeout=5m
+          args: --timeout=5m -v
           skip-pkg-cache: true
           skip-build-cache: true
 
