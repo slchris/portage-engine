@@ -88,3 +88,7 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         continue-on-error: true
+
+      - name: CodeQL Analysis Summary
+        if: always()
+        run: echo "CodeQL analysis completed. Check the Security tab in GitHub for detailed results if code scanning is enabled."
