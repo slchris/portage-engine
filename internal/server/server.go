@@ -38,6 +38,7 @@ func (s *Server) Router() http.Handler {
 
 	// Build management endpoints
 	mux.HandleFunc("/api/v1/builds/list", s.handleBuildsList)
+	mux.HandleFunc("/api/v1/builds/submit", s.handleSubmitBuildWithConfig)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 
 	// Health check
@@ -122,6 +123,35 @@ func (s *Server) handleBuildStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+// handleSubmitBuildWithConfig handles build requests with configuration bundles.
+func (s *Server) handleSubmitBuildWithConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req builder.LocalBuildRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate request
+	if req.ConfigBundle == nil {
+		http.Error(w, "Missing configuration bundle", http.StatusBadRequest)
+		return
+	}
+
+	if req.ConfigBundle.Packages == nil || len(req.ConfigBundle.Packages.Packages) == 0 {
+		http.Error(w, "No packages specified in bundle", http.StatusBadRequest)
+		return
+	}
+
+	// For now, this endpoint would need a different builder
+	// that supports config bundles. For simplicity, return not implemented.
+	http.Error(w, "Config bundle builds not yet implemented on server", http.StatusNotImplemented)
 }
 
 // handleHealth handles health check requests.

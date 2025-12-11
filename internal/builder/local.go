@@ -18,10 +18,12 @@ import (
 
 // LocalBuildRequest represents a local package build request.
 type LocalBuildRequest struct {
-	PackageName string            `json:"package_name"`
-	Version     string            `json:"version"`
-	UseFlags    map[string]string `json:"use_flags"`
-	Environment map[string]string `json:"environment"`
+	PackageName  string            `json:"package_name"`
+	Version      string            `json:"version"`
+	UseFlags     map[string]string `json:"use_flags"`
+	Environment  map[string]string `json:"environment"`
+	ConfigBundle *ConfigBundle     `json:"config_bundle,omitempty"`
+	PackageSpecs []PackageSpec     `json:"package_specs,omitempty"`
 }
 
 // BuildJob represents a build job with its status.
@@ -39,15 +41,17 @@ type BuildJob struct {
 
 // LocalBuilder handles build jobs locally using Docker or native builds.
 type LocalBuilder struct {
-	workers     int
-	jobQueue    chan *BuildJob
-	jobs        map[string]*BuildJob
-	jobsMutex   sync.RWMutex
-	signer      *gpg.Signer
-	workDir     string
-	artifactDir string
-	useDocker   bool
-	dockerImage string
+	workers        int
+	jobQueue       chan *BuildJob
+	jobs           map[string]*BuildJob
+	jobsMutex      sync.RWMutex
+	signer         *gpg.Signer
+	workDir        string
+	artifactDir    string
+	useDocker      bool
+	dockerImage    string
+	executor       *BuildExecutor
+	dockerExecutor *DockerBuildExecutor
 }
 
 // NewLocalBuilder creates a new local builder instance.
@@ -72,14 +76,16 @@ func NewLocalBuilder(workers int, signer *gpg.Signer) *LocalBuilder {
 	_ = os.MkdirAll(artifactDir, 0750)
 
 	lb := &LocalBuilder{
-		workers:     workers,
-		jobQueue:    make(chan *BuildJob, 100),
-		jobs:        make(map[string]*BuildJob),
-		signer:      signer,
-		workDir:     workDir,
-		artifactDir: artifactDir,
-		useDocker:   useDocker,
-		dockerImage: dockerImage,
+		workers:        workers,
+		jobQueue:       make(chan *BuildJob, 100),
+		jobs:           make(map[string]*BuildJob),
+		signer:         signer,
+		workDir:        workDir,
+		artifactDir:    artifactDir,
+		useDocker:      useDocker,
+		dockerImage:    dockerImage,
+		executor:       NewBuildExecutor(workDir, artifactDir),
+		dockerExecutor: NewDockerBuildExecutor(workDir, artifactDir, dockerImage),
 	}
 
 	// Start worker pool
@@ -184,10 +190,16 @@ func (lb *LocalBuilder) worker(id int) {
 		lb.jobsMutex.Unlock()
 
 		var err error
-		if lb.useDocker {
-			err = lb.executeDockerBuild(job)
+		// Check if this is a new-style config bundle build
+		if job.Request.ConfigBundle != nil {
+			err = lb.executeConfigBundleBuild(job)
 		} else {
-			err = lb.executeNativeBuild(job)
+			// Legacy build method
+			if lb.useDocker {
+				err = lb.executeDockerBuild(job)
+			} else {
+				err = lb.executeNativeBuild(job)
+			}
 		}
 
 		lb.jobsMutex.Lock()
@@ -202,6 +214,47 @@ func (lb *LocalBuilder) worker(id int) {
 		}
 		lb.jobsMutex.Unlock()
 	}
+}
+
+// executeConfigBundleBuild executes a build using configuration bundle.
+func (lb *LocalBuilder) executeConfigBundleBuild(job *BuildJob) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancel()
+
+	bundle := job.Request.ConfigBundle
+
+	// If no package specs provided, create from legacy request
+	if bundle.Packages == nil || len(bundle.Packages.Packages) == 0 {
+		bundle.Packages = &BuildPackageSpec{
+			Packages: []PackageSpec{
+				{
+					Atom:    job.Request.PackageName,
+					Version: job.Request.Version,
+				},
+			},
+		}
+		// Convert legacy UseFlags map to slice
+		if len(job.Request.UseFlags) > 0 {
+			var useFlags []string
+			for flag, enabled := range job.Request.UseFlags {
+				if enabled == "true" || enabled == "1" {
+					useFlags = append(useFlags, flag)
+				} else {
+					useFlags = append(useFlags, "-"+flag)
+				}
+			}
+			bundle.Packages.Packages[0].UseFlags = useFlags
+		}
+	}
+
+	var err error
+	if lb.useDocker {
+		err = lb.dockerExecutor.ExecuteBuild(ctx, bundle, job)
+	} else {
+		err = lb.executor.ExecuteBuild(ctx, bundle, job)
+	}
+
+	return err
 }
 
 // executeDockerBuild performs the build using Docker container.
