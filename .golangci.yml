@@ -19,7 +19,6 @@ linters:
     - bodyclose
     - errorlint
     - exhaustive
-    - copyloopvar
   disable:
     - gosec  # Too many false positives for a build/package management tool
 
