@@ -24,7 +24,7 @@ REMOTE_BUILDERS=http://builder1:9090,http://builder2:9090
 	if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
 		t.Fatalf("Failed to create test config: %v", err)
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	cfg, err := LoadServerConfig(tmpFile)
 	if err != nil {
@@ -90,7 +90,7 @@ ALLOW_ANONYMOUS=false
 	if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
 		t.Fatalf("Failed to create test config: %v", err)
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	cfg, err := LoadDashboardConfig(tmpFile)
 	if err != nil {
@@ -138,7 +138,7 @@ NOTIFY_CONFIG=/path/to/notify.json
 	if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
 		t.Fatalf("Failed to create test config: %v", err)
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	cfg, err := LoadBuilderConfig(tmpFile)
 	if err != nil {
@@ -222,7 +222,7 @@ EMPTY_KEY=
 	if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	env, err := loadEnvFile(tmpFile)
 	if err != nil {

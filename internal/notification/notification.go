@@ -132,9 +132,7 @@ func (n *Notifier) Notify(notification *BuildNotification) error {
 	}
 
 	if n.config.IRC != nil && n.config.IRC.Enabled {
-		if err := n.sendIRC(notification); err != nil {
-			errors = append(errors, fmt.Sprintf("irc: %v", err))
-		}
+		n.sendIRC(notification)
 	}
 
 	if n.config.Slack != nil && n.config.Slack.Enabled {
@@ -246,7 +244,7 @@ func (n *Notifier) sendWebhook(notification *BuildNotification) error {
 	if err != nil {
 		return fmt.Errorf("failed to send webhook: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
@@ -258,7 +256,7 @@ func (n *Notifier) sendWebhook(notification *BuildNotification) error {
 }
 
 // sendIRC sends IRC notification.
-func (n *Notifier) sendIRC(notification *BuildNotification) error {
+func (n *Notifier) sendIRC(notification *BuildNotification) {
 	// IRC notification is implemented as a placeholder
 	// In production, this would use an IRC library like github.com/thoj/go-ircevent
 	cfg := n.config.IRC
@@ -275,7 +273,6 @@ func (n *Notifier) sendIRC(notification *BuildNotification) error {
 		cfg.Server, cfg.Port, cfg.Channels, message)
 
 	// Actual IRC implementation would go here
-	return nil
 }
 
 // sendSlack sends Slack notification.
@@ -338,7 +335,7 @@ func (n *Notifier) sendSlack(notification *BuildNotification) error {
 	if err != nil {
 		return fmt.Errorf("failed to send slack notification: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -396,7 +393,7 @@ func (n *Notifier) sendTelegram(notification *BuildNotification) error {
 	if err != nil {
 		return fmt.Errorf("failed to send telegram notification: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)

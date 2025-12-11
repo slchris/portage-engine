@@ -52,7 +52,8 @@ func main() {
 
 	// Load or create configuration
 	var config *builder.PortageConfig
-	if *portageDir != "" {
+	switch {
+	case *portageDir != "":
 		// Read from system Portage directory
 		transfer := builder.NewConfigTransfer("")
 		var err error
@@ -62,13 +63,13 @@ func main() {
 		}
 		log.Printf("Successfully loaded configuration from %s", *portageDir)
 		log.Printf("Found %d package.use entries, %d repos", len(config.PackageUse), len(config.Repos))
-	} else if *configFile != "" {
+	case *configFile != "":
 		var err error
 		config, err = loadConfigFromFile(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load config: %v", err)
 		}
-	} else {
+	default:
 		config = &builder.PortageConfig{
 			PackageUse:      make(map[string][]string),
 			PackageKeywords: make(map[string][]string),

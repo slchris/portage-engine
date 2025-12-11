@@ -384,13 +384,11 @@ func (ct *ConfigTransfer) parseRepoConfFile(path string, config *PortageConfig) 
 				case "sync-uri":
 					currentRepo.SyncURI = value
 				case "priority":
-					fmt.Sscanf(value, "%d", &currentRepo.Priority)
+					_, _ = fmt.Sscanf(value, "%d", &currentRepo.Priority)
 				}
 			}
 		}
-	}
-
-	// Add last repo
+	} // Add last repo
 	if currentRepo != nil {
 		config.Repos = append(config.Repos, *currentRepo)
 	}

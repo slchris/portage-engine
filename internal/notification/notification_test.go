@@ -287,13 +287,13 @@ func TestNotifyMultipleChannels(t *testing.T) {
 	webhookCalled := false
 	slackCalled := false
 
-	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		webhookCalled = true
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer webhookServer.Close()
 
-	slackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	slackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		slackCalled = true
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -340,7 +340,7 @@ func TestNotifyMultipleChannels(t *testing.T) {
 func TestNotifyDisabledChannels(t *testing.T) {
 	webhookCalled := false
 
-	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		webhookCalled = true
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -376,7 +376,7 @@ func TestNotifyDisabledChannels(t *testing.T) {
 }
 
 // TestSendIRC tests IRC notification (placeholder).
-func TestSendIRC(t *testing.T) {
+func TestSendIRC(_ *testing.T) {
 	config := &Config{
 		IRC: &IRCConfig{
 			Enabled:  true,
@@ -399,10 +399,7 @@ func TestSendIRC(t *testing.T) {
 		Duration:    "8m0s",
 	}
 
-	err := notifier.sendIRC(notification)
-	if err != nil {
-		t.Fatalf("sendIRC failed: %v", err)
-	}
+	notifier.sendIRC(notification)
 }
 
 // contains checks if a string contains a substring.
@@ -435,7 +432,7 @@ func TestLoadConfig(t *testing.T) {
 	if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
 		t.Fatalf("Failed to create test config: %v", err)
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	config, err := LoadConfig(tmpFile)
 	if err != nil {

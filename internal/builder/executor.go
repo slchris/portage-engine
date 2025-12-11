@@ -108,8 +108,8 @@ func (be *BuildExecutor) buildPackage(
 // constructEmergeCommand constructs the emerge command for a package.
 func (be *BuildExecutor) constructEmergeCommand(
 	pkg PackageSpec,
-	bundle *ConfigBundle,
-	buildWorkDir string,
+	_ *ConfigBundle,
+	_ string,
 ) []string {
 	cmd := []string{"emerge"}
 
@@ -169,7 +169,7 @@ func (be *BuildExecutor) buildEnvironment(pkg PackageSpec, bundle *ConfigBundle)
 // collectArtifacts collects built package artifacts.
 func (be *BuildExecutor) collectArtifacts(
 	pkg PackageSpec,
-	buildWorkDir string,
+	_ string,
 	job *BuildJob,
 ) error {
 	// Find binary package in PKGDIR
@@ -185,7 +185,7 @@ func (be *BuildExecutor) collectArtifacts(
 		}
 		if !info.IsDir() && strings.HasSuffix(info.Name(), ".tbz2") {
 			// Check if this package matches the atom
-			if strings.Contains(path, strings.Replace(pkg.Atom, "/", string(os.PathSeparator), -1)) {
+			if strings.Contains(path, strings.ReplaceAll(pkg.Atom, "/", string(os.PathSeparator))) {
 				foundPackages = append(foundPackages, path)
 			}
 		}

@@ -383,20 +383,16 @@ priority = 50
 	pythonUse, ok := config.PackageUse["dev-lang/python"]
 	if !ok {
 		t.Error("dev-lang/python not found in package.use")
-	} else {
-		if len(pythonUse) < 3 {
-			t.Errorf("Expected at least 3 USE flags for python, got %d", len(pythonUse))
-		}
+	} else if len(pythonUse) < 3 {
+		t.Errorf("Expected at least 3 USE flags for python, got %d", len(pythonUse))
 	}
 
 	// Verify package.accept_keywords
 	rustKeywords, ok := config.PackageKeywords["dev-lang/rust"]
 	if !ok {
 		t.Error("dev-lang/rust not found in package.accept_keywords")
-	} else {
-		if len(rustKeywords) == 0 || rustKeywords[0] != "~amd64" {
-			t.Errorf("Expected ~amd64 keyword for rust, got %v", rustKeywords)
-		}
+	} else if len(rustKeywords) == 0 || rustKeywords[0] != "~amd64" {
+		t.Errorf("Expected ~amd64 keyword for rust, got %v", rustKeywords)
 	}
 
 	// Verify package.mask
