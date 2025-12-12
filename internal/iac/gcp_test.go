@@ -979,3 +979,140 @@ func TestGCPConfigWithInlineCredentials(t *testing.T) {
 		t.Errorf("InstanceTTL = %d, want 30", config.InstanceTTL)
 	}
 }
+
+func TestGCPProvisioner_GenerateMainTFWithCloudInit(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	config := &GCPConfig{
+		Project:     "test-project",
+		Region:      "us-central1",
+		Zone:        "us-central1-a",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewGCPProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewGCPProvisioner failed: %v", err)
+	}
+
+	spec := DefaultGCPInstanceSpec()
+	spec.Project = "my-project"
+	spec.Zone = "us-central1-b"
+	spec.MachineType = "n1-standard-8"
+
+	cloudInit := DefaultCloudInitConfig()
+	cloudInit.BuilderPort = 9090
+	cloudInit.ServerCallbackURL = "http://10.0.0.1:8080/callback"
+
+	tf := provisioner.GenerateMainTFWithCloudInit(spec, "builder-001", cloudInit)
+
+	// Verify basic terraform structure
+	if !strings.Contains(tf, `provider "google"`) {
+		t.Error("Missing google provider block")
+	}
+	if !strings.Contains(tf, "my-project") {
+		t.Error("Missing project in terraform")
+	}
+	if !strings.Contains(tf, "us-central1-b") {
+		t.Error("Missing zone in terraform")
+	}
+	if !strings.Contains(tf, "n1-standard-8") {
+		t.Error("Missing machine type in terraform")
+	}
+	if !strings.Contains(tf, "builder-001") {
+		t.Error("Missing instance name in terraform")
+	}
+
+	// Verify cloud-init metadata is included
+	if !strings.Contains(tf, "metadata_startup_script") {
+		t.Error("Missing metadata_startup_script in terraform")
+	}
+
+	// Verify cloud-init content is embedded
+	if !strings.Contains(tf, "install_docker") {
+		t.Error("Missing docker installation in startup script")
+	}
+	if !strings.Contains(tf, "9090") {
+		t.Error("Missing builder port in startup script")
+	}
+}
+
+func TestGCPProvisioner_GenerateMainTFWithCloudInit_CustomConfig(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	config := &GCPConfig{
+		Project:     "test-project",
+		Region:      "us-central1",
+		Zone:        "us-central1-a",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewGCPProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewGCPProvisioner failed: %v", err)
+	}
+
+	spec := DefaultGCPInstanceSpec()
+	cloudInit := &CloudInitConfig{
+		DockerImage:       "custom/builder:v1",
+		DockerRegistry:    "docker.io",
+		PullLatestImage:   true,
+		PortageTreeSync:   true,
+		PortageMirror:     "https://distfiles.gentoo.org",
+		BuilderPort:       8888,
+		ServerCallbackURL: "http://custom.server:8080",
+		ExtraPackages:     []string{"htop", "vim"},
+	}
+
+	tf := provisioner.GenerateMainTFWithCloudInit(spec, "custom-builder", cloudInit)
+
+	// Verify custom settings are included
+	if !strings.Contains(tf, "custom/builder:v1") {
+		t.Error("Missing custom docker image")
+	}
+	if !strings.Contains(tf, "8888") {
+		t.Error("Missing custom builder port")
+	}
+	if !strings.Contains(tf, "http://custom.server:8080") {
+		t.Error("Missing custom server callback URL")
+	}
+	if !strings.Contains(tf, "htop") {
+		t.Error("Missing extra package htop")
+	}
+}
+
+func TestGCPProvisioner_GenerateMainTFWithCloudInit_NilCloudInit(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	config := &GCPConfig{
+		Project:     "test-project",
+		Region:      "us-central1",
+		Zone:        "us-central1-a",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewGCPProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewGCPProvisioner failed: %v", err)
+	}
+
+	spec := DefaultGCPInstanceSpec()
+	tf := provisioner.GenerateMainTFWithCloudInit(spec, "test-instance", nil)
+
+	// Should still generate valid terraform with default cloud-init
+	if !strings.Contains(tf, `provider "google"`) {
+		t.Error("Missing google provider block")
+	}
+	if !strings.Contains(tf, "test-instance") {
+		t.Error("Missing instance name")
+	}
+	if !strings.Contains(tf, "metadata_startup_script") {
+		t.Error("Missing startup script even with nil cloud init")
+	}
+}

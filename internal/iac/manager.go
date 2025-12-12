@@ -560,48 +560,21 @@ func (m *Manager) sshCopyFile(instance *Instance, keyPath, localPath, remotePath
 
 // generateDeploymentScript generates a shell script to deploy the builder.
 func (m *Manager) generateDeploymentScript(serverCallback string, builderPort int) string {
-	return fmt.Sprintf(`#!/bin/bash
-set -e
+	config := &CloudInitConfig{
+		DockerImage:       "gentoo/stage3:latest",
+		PullLatestImage:   true,
+		PortageTreeSync:   true,
+		PortageMirror:     "https://distfiles.gentoo.org",
+		BuilderPort:       builderPort,
+		ServerCallbackURL: serverCallback,
+		DataDir:           "/var/lib/portage-engine",
+		WorkDir:           "/var/tmp/portage-builds",
+		ArtifactDir:       "/var/tmp/portage-artifacts",
+		SwapSizeGB:        4,
+		EnableFirewall:    true,
+	}
 
-# Install dependencies (example for Gentoo)
-if command -v emerge &> /dev/null; then
-    emerge --sync || true
-    emerge -u dev-lang/go || true
-fi
-
-# Create portage-builder directory
-mkdir -p /opt/portage-builder
-cd /opt/portage-builder
-
-# Download or build portage-builder binary
-# In production, this would download from a release URL
-# For now, we assume it's pre-installed or deployed separately
-
-# Create systemd service
-cat > /etc/systemd/system/portage-builder.service <<EOF
-[Unit]
-Description=Portage Builder Service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/opt/portage-builder/portage-builder
-Restart=always
-RestartSec=10
-Environment="SERVER_URL=%s"
-Environment="BUILDER_PORT=%d"
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable and start service
-systemctl daemon-reload
-systemctl enable portage-builder
-systemctl start portage-builder
-
-echo "Builder deployment complete"
-`, serverCallback, builderPort)
+	return GenerateCloudInitScript(config)
 }
 
 // generateTerraformConfig generates Terraform configuration based on provider.
