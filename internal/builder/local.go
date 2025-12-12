@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 type LocalBuildRequest struct {
 	PackageName  string            `json:"package_name"`
 	Version      string            `json:"version"`
+	Arch         string            `json:"arch,omitempty"`
 	UseFlags     map[string]string `json:"use_flags"`
 	Environment  map[string]string `json:"environment"`
 	ConfigBundle *ConfigBundle     `json:"config_bundle,omitempty"`
@@ -57,6 +59,10 @@ type LocalBuilder struct {
 	executor       *BuildExecutor
 	dockerExecutor *DockerBuildExecutor
 	notifier       *notification.Notifier
+	jobStore       *JobStore
+	persister      *JobPersister
+	instanceID     string
+	architecture   string
 }
 
 // NewLocalBuilder creates a new local builder instance.
@@ -95,6 +101,23 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 
 	_ = os.MkdirAll(workDir, 0750)
 	_ = os.MkdirAll(artifactDir, 0750)
+
+	// Verify directories are writable
+	testFile := filepath.Join(workDir, ".write_test")
+	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
+		log.Printf("WARNING: Work directory %s is not writable: %v", workDir, err)
+		log.Printf("Please ensure the directory exists and is owned by the service user")
+	} else {
+		_ = os.Remove(testFile)
+	}
+
+	testFile = filepath.Join(artifactDir, ".write_test")
+	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
+		log.Printf("WARNING: Artifact directory %s is not writable: %v", artifactDir, err)
+		log.Printf("Please ensure the directory exists and is owned by the service user")
+	} else {
+		_ = os.Remove(testFile)
+	}
 
 	// Load notification config if exists
 	var notifier *notification.Notifier
@@ -145,10 +168,69 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 		}
 	}
 
+	// Initialize job store for persistence
+	var jobStore *JobStore
+	var persister *JobPersister
+	var loadedJobs map[string]*BuildJob
+
+	persistenceEnabled := true
+	dataDir := "/var/lib/portage-engine"
+	retentionDays := 7
+
+	if cfg != nil {
+		persistenceEnabled = cfg.PersistenceEnabled
+		if cfg.DataDir != "" {
+			dataDir = cfg.DataDir
+		}
+		if cfg.RetentionDays > 0 {
+			retentionDays = cfg.RetentionDays
+		}
+	}
+
+	if persistenceEnabled {
+		var err error
+		jobStore, err = NewJobStore(dataDir)
+		if err != nil {
+			log.Printf("Failed to initialize job store: %v (persistence disabled)", err)
+		} else {
+			loadedJobs, err = jobStore.Load()
+			if err != nil {
+				log.Printf("Failed to load persisted jobs: %v", err)
+				loadedJobs = make(map[string]*BuildJob)
+			} else {
+				log.Printf("Loaded %d persisted jobs from %s", len(loadedJobs), dataDir)
+			}
+		}
+	}
+
+	if loadedJobs == nil {
+		loadedJobs = make(map[string]*BuildJob)
+	}
+
+	// Get instance ID and architecture from config or auto-detect
+	instanceID := ""
+	architecture := ""
+	if cfg != nil {
+		instanceID = cfg.InstanceID
+		architecture = cfg.Architecture
+	}
+	if instanceID == "" {
+		// Auto-generate instance ID from hostname
+		if hostname, err := os.Hostname(); err == nil {
+			instanceID = hostname
+		} else {
+			instanceID = uuid.New().String()[:8]
+		}
+	}
+	if architecture == "" {
+		// Auto-detect architecture
+		architecture = detectArchitecture()
+	}
+
 	lb := &LocalBuilder{
 		workers:        workers,
 		jobQueue:       make(chan *BuildJob, 100),
-		jobs:           make(map[string]*BuildJob),
+		jobs:           loadedJobs,
 		signer:         signer,
 		gpgClient:      gpgClient,
 		storageUpload:  storageUpload,
@@ -159,6 +241,21 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 		executor:       NewBuildExecutor(workDir, artifactDir),
 		dockerExecutor: NewDockerBuildExecutor(workDir, artifactDir, dockerImage),
 		notifier:       notifier,
+		jobStore:       jobStore,
+		persister:      nil,
+		instanceID:     instanceID,
+		architecture:   architecture,
+	}
+
+	log.Printf("Builder initialized: instance_id=%s, architecture=%s", instanceID, architecture)
+
+	// Initialize persister if job store is available
+	if jobStore != nil {
+		retentionDuration := time.Duration(retentionDays) * 24 * time.Hour
+		persister = NewJobPersister(jobStore, lb.getJobsSnapshot, 30*time.Second, retentionDuration)
+		persister.Start()
+		lb.persister = persister
+		log.Printf("Job persistence enabled with %d day retention", retentionDays)
 	}
 
 	// Start worker pool
@@ -217,6 +314,25 @@ func (lb *LocalBuilder) ListJobs() []*BuildJob {
 	return jobs
 }
 
+// getJobsSnapshot returns a copy of the jobs map for persistence.
+func (lb *LocalBuilder) getJobsSnapshot() map[string]*BuildJob {
+	lb.jobsMutex.RLock()
+	defer lb.jobsMutex.RUnlock()
+
+	snapshot := make(map[string]*BuildJob, len(lb.jobs))
+	for id, job := range lb.jobs {
+		snapshot[id] = job
+	}
+	return snapshot
+}
+
+// Shutdown gracefully shuts down the builder and persists jobs.
+func (lb *LocalBuilder) Shutdown() {
+	if lb.persister != nil {
+		lb.persister.Stop()
+	}
+}
+
 // GetStatus returns builder status.
 func (lb *LocalBuilder) GetStatus() map[string]interface{} {
 	lb.jobsMutex.RLock()
@@ -240,15 +356,41 @@ func (lb *LocalBuilder) GetStatus() map[string]interface{} {
 		}
 	}
 
+	// Get system resource information
+	sysInfo := GetSystemInfo()
+
+	// Determine status based on current load
+	status := "online"
+	if building >= lb.workers {
+		status = "busy"
+	}
+
 	return map[string]interface{}{
-		"workers":      lb.workers,
-		"queued":       queued,
-		"building":     building,
-		"completed":    completed,
-		"failed":       failed,
-		"total":        len(lb.jobs),
-		"use_docker":   lb.useDocker,
-		"docker_image": lb.dockerImage,
+		"instance_id":    lb.instanceID,
+		"architecture":   lb.architecture,
+		"status":         status,
+		"workers":        lb.workers,
+		"capacity":       lb.workers,
+		"current_load":   building,
+		"queued":         queued,
+		"building":       building,
+		"completed":      completed,
+		"failed":         failed,
+		"total":          len(lb.jobs),
+		"success_builds": completed,
+		"failed_builds":  failed,
+		"total_builds":   completed + failed,
+		"use_docker":     lb.useDocker,
+		"docker_image":   lb.dockerImage,
+		"cpu_usage":      sysInfo.CPUUsage,
+		"memory_usage":   sysInfo.MemoryUsage,
+		"disk_usage":     sysInfo.DiskUsage,
+		"cpu_count":      sysInfo.CPUCount,
+		"memory_total":   sysInfo.MemoryTotal,
+		"memory_used":    sysInfo.MemoryUsed,
+		"disk_total":     sysInfo.DiskTotal,
+		"disk_used":      sysInfo.DiskUsed,
+		"enabled":        true,
 	}
 }
 
@@ -281,6 +423,10 @@ func (lb *LocalBuilder) worker(id int) {
 		if err != nil {
 			job.Status = "failed"
 			job.Error = err.Error()
+			// Append log to error for visibility in API
+			if job.Log != "" {
+				job.Error = fmt.Sprintf("%s\n\nBuild Log:\n%s", job.Error, job.Log)
+			}
 			log.Printf("Worker %d: Job %s failed: %v", id, job.ID, err)
 		} else {
 			job.Status = "success"
@@ -288,8 +434,20 @@ func (lb *LocalBuilder) worker(id int) {
 		}
 		lb.jobsMutex.Unlock()
 
+		// Persist job state immediately after completion
+		lb.saveJobState()
+
 		// Send notification
 		lb.sendNotification(job)
+	}
+}
+
+// saveJobState saves the current job state to persistent storage.
+func (lb *LocalBuilder) saveJobState() {
+	if lb.persister != nil {
+		if err := lb.persister.SaveNow(); err != nil {
+			log.Printf("Failed to save job state: %v", err)
+		}
 	}
 }
 
@@ -360,19 +518,16 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 	}
 
 	// Create build script
-	scriptPath := filepath.Join(jobWorkDir, "build.sh")
 	script := fmt.Sprintf(`#!/bin/bash
 set -e
 export USE="%s"
-emerge --sync
-emerge -B --quiet %s
-cp /var/cache/binpkgs/*.tbz2 /output/ 2>/dev/null || true
-`, useFlags, pkgAtom)
-
-	//nolint:gosec // G306: Script needs exec permission
-	if err := os.WriteFile(scriptPath, []byte(script), 0700); err != nil {
-		return fmt.Errorf("failed to write build script: %w", err)
-	}
+export FEATURES="buildpkg"
+echo "Starting package build for %s"
+emerge --usepkg=n %s || exit 1
+echo "Build completed, copying artifacts..."
+find /var/cache/binpkgs -type f -name '*.gpkg.tar' -exec cp {} /output/ \; 2>/dev/null || find /var/cache/binpkgs -type f -name '*.tbz2' -exec cp {} /output/ \; 2>/dev/null || true
+ls -lh /output/
+`, useFlags, req.PackageName, pkgAtom)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
@@ -380,21 +535,51 @@ cp /var/cache/binpkgs/*.tbz2 /output/ 2>/dev/null || true
 	outputDir := filepath.Join(jobWorkDir, "output")
 	_ = os.MkdirAll(outputDir, 0750)
 
-	// Run Docker container
-	cmd := exec.CommandContext(ctx, "docker", "run", "--rm",
-		"-v", scriptPath+":/build.sh:ro",
+	// Run Docker container with script via stdin and mounted repos/portage config
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "-i",
 		"-v", outputDir+":/output",
+		"-v", "/var/db/repos:/var/db/repos:ro",
+		"-v", "/etc/portage/make.conf:/etc/portage/make.conf:ro",
+		"-v", "/etc/portage/repos.conf:/etc/portage/repos.conf:ro",
 		lb.dockerImage,
-		"/bin/bash", "/build.sh")
+		"/bin/bash", "-s")
+
+	cmd.Stdin = strings.NewReader(script)
 
 	output, err := cmd.CombinedOutput()
 	job.Log = string(output)
 
 	if err != nil {
+		log.Printf("Docker build failed for job %s: %v", job.ID, err)
 		return fmt.Errorf("docker build failed: %w", err)
 	}
 
-	artifact, err := lb.findLatestPackage(outputDir, req.PackageName)
+	log.Printf("Docker build completed for job %s, output size: %d bytes", job.ID, len(output))
+
+	// Ensure all filesystem writes are flushed
+	_ = exec.Command("sync").Run()
+
+	// Give Docker time to fully unmount volumes and sync filesystem
+	time.Sleep(10 * time.Second)
+
+	// Wait for Docker filesystem to sync and retry if needed
+	var artifact string
+	for i := 0; i < 10; i++ {
+		if i > 0 {
+			// Force filesystem sync before retrying
+			_ = exec.Command("sync").Run()
+			time.Sleep(2 * time.Second)
+		}
+
+		artifact, err = lb.findLatestPackage(outputDir, req.PackageName)
+		if err == nil {
+			break
+		}
+
+		if i < 4 {
+			log.Printf("Artifact not found on attempt %d, retrying...", i+1)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("artifact not found: %w", err)
 	}
@@ -522,34 +707,74 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 }
 
 // findLatestPackage finds the most recently created package file.
-func (lb *LocalBuilder) findLatestPackage(dir, _ string) (string, error) {
-	var latestFile string
-	var latestTime time.Time
+func (lb *LocalBuilder) findLatestPackage(dir, pkgName string) (string, error) {
+	var matchedFiles []string
+	var callbackCount int
 
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+	log.Printf("Finding packages in directory: %s for package: %s", dir, pkgName)
+
+	// Check if directory exists and is accessible
+	info, err := os.Stat(dir)
+	if err != nil {
+		log.Printf("ERROR: Cannot stat directory %s: %v", dir, err)
+		return "", fmt.Errorf("directory not accessible: %w", err)
+	}
+	log.Printf("Directory stat OK: %s (isDir: %v, mode: %v)", dir, info.IsDir(), info.Mode())
+
+	// Try to list directory contents directly
+	if entries, readErr := os.ReadDir(dir); readErr != nil {
+		log.Printf("ERROR: Cannot read directory %s: %v", dir, readErr)
+	} else {
+		log.Printf("Directory has %d entries", len(entries))
+		for _, entry := range entries {
+			log.Printf("  Entry: %s (isDir: %v)", entry.Name(), entry.IsDir())
+		}
+	}
+
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
+		callbackCount++
+		if walkErr != nil {
+			log.Printf("Walk error at %s: %v", path, walkErr)
 			return nil
 		}
 
-		if !info.IsDir() && filepath.Ext(path) == ".tbz2" {
-			if info.ModTime().After(latestTime) {
-				latestFile = path
-				latestTime = info.ModTime()
-			}
+		name := filepath.Base(path)
+		log.Printf("Walk callback #%d: %s (isDir: %v, size: %d)", callbackCount, name, info.IsDir(), info.Size())
+
+		if !info.IsDir() && (strings.HasSuffix(name, ".tbz2") || strings.HasSuffix(name, ".gpkg.tar")) {
+			log.Printf("Package file matched: %s", name)
+			matchedFiles = append(matchedFiles, path)
 		}
 
 		return nil
 	})
 
+	log.Printf("Walk completed. Callback was called %d times", callbackCount)
+
 	if err != nil {
+		log.Printf("Walk returned error: %v", err)
 		return "", err
 	}
 
-	if latestFile == "" {
+	if len(matchedFiles) == 0 {
+		log.Printf("No package files found in %s", dir)
 		return "", fmt.Errorf("no package found")
 	}
 
-	return latestFile, nil
+	// Return the largest file (main package is usually largest)
+	var largestFile string
+	var largestSize int64
+	for _, f := range matchedFiles {
+		if info, err := os.Stat(f); err == nil {
+			if info.Size() > largestSize {
+				largestSize = info.Size()
+				largestFile = f
+			}
+		}
+	}
+
+	log.Printf("Found %d packages, returning largest: %s (%d bytes)", len(matchedFiles), largestFile, largestSize)
+	return largestFile, nil
 }
 
 // sendNotification sends build completion notification.

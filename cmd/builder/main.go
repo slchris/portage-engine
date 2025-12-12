@@ -133,6 +133,10 @@ func main() {
 		<-sigChan
 
 		log.Println("Shutting down builder service...")
+
+		// Shutdown builder to persist jobs
+		bldr.Shutdown()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 

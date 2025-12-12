@@ -468,56 +468,10 @@ func TestHandleBuildersList(t *testing.T) {
 func TestHandleBuildersStatus(t *testing.T) {
 	cfg := &config.ServerConfig{
 		BinpkgPath: "/tmp/binpkgs",
+		// No remote builders configured - should return empty list
 	}
 
 	server := New(cfg)
-
-	// Register builders with various states
-	builders := []builder.BuilderInfo{
-		{
-			ID:            "builder-1",
-			Endpoint:      "http://localhost:9090",
-			Architecture:  "amd64",
-			Status:        "online",
-			Capacity:      4,
-			CurrentLoad:   2,
-			TotalBuilds:   100,
-			SuccessBuilds: 95,
-			FailedBuilds:  5,
-			Enabled:       true,
-		},
-		{
-			ID:            "builder-2",
-			Endpoint:      "http://localhost:9091",
-			Architecture:  "arm64",
-			Status:        "busy",
-			Capacity:      2,
-			CurrentLoad:   2,
-			TotalBuilds:   50,
-			SuccessBuilds: 48,
-			FailedBuilds:  2,
-			Enabled:       true,
-		},
-		{
-			ID:            "builder-3",
-			Endpoint:      "http://localhost:9092",
-			Architecture:  "amd64",
-			Status:        "offline",
-			Capacity:      4,
-			CurrentLoad:   0,
-			TotalBuilds:   30,
-			SuccessBuilds: 25,
-			FailedBuilds:  5,
-			Enabled:       false,
-		},
-	}
-
-	for _, b := range builders {
-		body, _ := json.Marshal(b)
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/builders/register", bytes.NewReader(body))
-		w := httptest.NewRecorder()
-		server.handleBuilderRegister(w, req)
-	}
 
 	// Test status endpoint
 	tests := []struct {
@@ -559,21 +513,129 @@ func TestHandleBuildersStatus(t *testing.T) {
 					t.Fatal("Expected stats in response")
 				}
 
-				if stats["total_builders"].(float64) != 3 {
-					t.Errorf("Expected 3 total builders, got %v", stats["total_builders"])
-				}
-
-				// Check builders array
-				buildersArray, ok := result["builders"].([]interface{})
-				if !ok {
-					t.Fatal("Expected builders array in response")
-				}
-
-				if len(buildersArray) != 3 {
-					t.Errorf("Expected 3 builders, got %d", len(buildersArray))
+				// With no remote builders configured, total should be 0
+				if stats["total_builders"].(float64) != 0 {
+					t.Errorf("Expected 0 total builders, got %v", stats["total_builders"])
 				}
 			}
 		})
+	}
+}
+
+// TestCalculateBuilderStats tests the builder stats calculation.
+func TestCalculateBuilderStats(t *testing.T) {
+	builders := []BuilderStatusInfo{
+		{
+			ID:            "builder-1",
+			Status:        "online",
+			Capacity:      4,
+			CurrentLoad:   2,
+			TotalBuilds:   100,
+			SuccessBuilds: 95,
+			FailedBuilds:  5,
+		},
+		{
+			ID:            "builder-2",
+			Status:        "busy",
+			Capacity:      2,
+			CurrentLoad:   2,
+			TotalBuilds:   50,
+			SuccessBuilds: 48,
+			FailedBuilds:  2,
+		},
+		{
+			ID:            "builder-3",
+			Status:        "offline",
+			Capacity:      4,
+			CurrentLoad:   0,
+			TotalBuilds:   30,
+			SuccessBuilds: 25,
+			FailedBuilds:  5,
+		},
+	}
+
+	stats := calculateBuilderStats(builders)
+
+	if stats["total_builders"].(int) != 3 {
+		t.Errorf("Expected 3 total builders, got %v", stats["total_builders"])
+	}
+
+	if stats["online_builders"].(int) != 2 {
+		t.Errorf("Expected 2 online builders, got %v", stats["online_builders"])
+	}
+
+	if stats["offline_builders"].(int) != 1 {
+		t.Errorf("Expected 1 offline builder, got %v", stats["offline_builders"])
+	}
+
+	if stats["total_capacity"].(int) != 10 {
+		t.Errorf("Expected capacity 10, got %v", stats["total_capacity"])
+	}
+
+	if stats["total_load"].(int) != 4 {
+		t.Errorf("Expected load 4, got %v", stats["total_load"])
+	}
+
+	if stats["total_builds"].(int) != 180 {
+		t.Errorf("Expected 180 total builds, got %v", stats["total_builds"])
+	}
+
+	expectedSuccessRate := float64(168) / float64(180) * 100
+	if stats["success_rate"].(float64) != expectedSuccessRate {
+		t.Errorf("Expected success rate %f, got %v", expectedSuccessRate, stats["success_rate"])
+	}
+}
+
+// TestHelperFunctions tests the type conversion helper functions.
+func TestHelperFunctions(t *testing.T) {
+	m := map[string]interface{}{
+		"string_val":  "test",
+		"int_val":     42,
+		"float_val":   3.14,
+		"bool_val":    true,
+		"int64_val":   int64(100),
+		"float64_val": float64(99.9),
+	}
+
+	// Test getStringValue
+	if v := getStringValue(m, "string_val", "default"); v != "test" {
+		t.Errorf("Expected 'test', got '%s'", v)
+	}
+	if v := getStringValue(m, "missing", "default"); v != "default" {
+		t.Errorf("Expected 'default', got '%s'", v)
+	}
+
+	// Test getIntValue
+	if v := getIntValue(m, "int_val", 0); v != 42 {
+		t.Errorf("Expected 42, got %d", v)
+	}
+	if v := getIntValue(m, "float64_val", 0); v != 99 {
+		t.Errorf("Expected 99, got %d", v)
+	}
+	if v := getIntValue(m, "int64_val", 0); v != 100 {
+		t.Errorf("Expected 100, got %d", v)
+	}
+	if v := getIntValue(m, "missing", 10); v != 10 {
+		t.Errorf("Expected 10, got %d", v)
+	}
+
+	// Test getFloatValue
+	if v := getFloatValue(m, "float_val", 0); v != 3.14 {
+		t.Errorf("Expected 3.14, got %f", v)
+	}
+	if v := getFloatValue(m, "int_val", 0); v != 42.0 {
+		t.Errorf("Expected 42.0, got %f", v)
+	}
+	if v := getFloatValue(m, "missing", 1.5); v != 1.5 {
+		t.Errorf("Expected 1.5, got %f", v)
+	}
+
+	// Test getBoolValue
+	if v := getBoolValue(m, "bool_val", false); v != true {
+		t.Errorf("Expected true, got %v", v)
+	}
+	if v := getBoolValue(m, "missing", true); v != true {
+		t.Errorf("Expected true, got %v", v)
 	}
 }
 
@@ -622,31 +684,16 @@ func TestBuilderRegistryIntegration(t *testing.T) {
 		t.Fatalf("Heartbeat failed: %d", w.Code)
 	}
 
-	// Verify the builder was updated via status endpoint
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/builders/status", nil)
-	w = httptest.NewRecorder()
-	server.handleBuildersStatus(w, req)
-
-	var result map[string]interface{}
-	_ = json.NewDecoder(w.Body).Decode(&result)
-
-	buildersArray := result["builders"].([]interface{})
-	found := false
-	for _, b := range buildersArray {
-		builderMap := b.(map[string]interface{})
-		if builderMap["id"] == "test-builder" {
-			found = true
-			if builderMap["status"] != "busy" {
-				t.Errorf("Expected status 'busy', got %v", builderMap["status"])
-			}
-			if builderMap["current_load"] != float64(3) {
-				t.Errorf("Expected current_load 3, got %v", builderMap["current_load"])
-			}
-		}
+	// Verify the builder was updated in the registry
+	info, exists := server.builderRegistry.Get("test-builder")
+	if !exists {
+		t.Error("Builder not found in registry")
 	}
-
-	if !found {
-		t.Error("Builder not found in status response")
+	if info.Status != "busy" {
+		t.Errorf("Expected status 'busy', got %v", info.Status)
+	}
+	if info.CurrentLoad != 3 {
+		t.Errorf("Expected current_load 3, got %v", info.CurrentLoad)
 	}
 }
 

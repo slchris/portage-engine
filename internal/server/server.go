@@ -3,9 +3,14 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"runtime"
+	"sort"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/slchris/portage-engine/internal/binpkg"
@@ -52,6 +57,7 @@ func (s *Server) Router() http.Handler {
 	// Build management endpoints
 	mux.HandleFunc("/api/v1/builds/list", s.handleBuildsList)
 	mux.HandleFunc("/api/v1/builds/submit", s.handleSubmitBuildWithConfig)
+	mux.HandleFunc("/api/v1/builds/status", s.handleBuildStatus)
 	mux.HandleFunc("/api/v1/builds/logs", s.handleBuildLogs)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/scheduler/status", s.handleSchedulerStatus)
@@ -75,7 +81,23 @@ func (s *Server) Router() http.Handler {
 	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
 
-	return s.loggingMiddleware(mux)
+	return s.corsMiddleware(s.loggingMiddleware(mux))
+}
+
+// corsMiddleware adds CORS headers to allow cross-origin requests.
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handlePackageQuery handles package availability queries.
@@ -121,11 +143,36 @@ func (s *Server) handleBuildRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req builder.BuildRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	// Support both formats: {"package_name":"cat/pkg"} and {"category":"cat","package":"pkg"}
+	var rawReq map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&rawReq); err != nil {
 		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
+	}
+
+	var req builder.BuildRequest
+
+	// Convert to BuildRequest format
+	if packageName, ok := rawReq["package_name"].(string); ok {
+		req.PackageName = packageName
+	} else if category, okCat := rawReq["category"].(string); okCat {
+		if pkg, okPkg := rawReq["package"].(string); okPkg {
+			req.PackageName = category + "/" + pkg
+		}
+	}
+
+	if version, ok := rawReq["version"].(string); ok {
+		req.Version = version
+	}
+
+	if useFlags, ok := rawReq["use_flags"].([]interface{}); ok {
+		req.UseFlags = make([]string, len(useFlags))
+		for i, flag := range useFlags {
+			if flagStr, ok := flag.(string); ok {
+				req.UseFlags[i] = flagStr
+			}
+		}
 	}
 
 	// Submit build request
@@ -218,7 +265,30 @@ func (s *Server) handleBuildsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get limit parameter (default 0 = all, max 200)
+	limitStr := r.URL.Query().Get("limit")
+	limit := 0
+	if limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
+			limit = parsed
+			if limit > 200 {
+				limit = 200
+			}
+		}
+	}
+
 	builds := s.builder.ListAllBuilds()
+
+	// Sort by created_at descending (newest first) for stable ordering
+	sort.Slice(builds, func(i, j int) bool {
+		return builds[i].CreatedAt.After(builds[j].CreatedAt)
+	})
+
+	// Apply limit if specified
+	if limit > 0 && len(builds) > limit {
+		builds = builds[:limit]
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(builds)
 }
@@ -328,8 +398,11 @@ func (s *Server) handleBuildersStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stats := s.builderRegistry.GetStats()
-	builders := s.builderRegistry.List()
+	// Fetch real-time status from all configured remote builders
+	builders := s.fetchAllBuilderStatus()
+
+	// Calculate aggregate statistics
+	stats := calculateBuilderStats(builders)
 
 	response := map[string]interface{}{
 		"stats":    stats,
@@ -337,6 +410,201 @@ func (s *Server) handleBuildersStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+// BuilderStatusInfo represents status information from a builder.
+type BuilderStatusInfo struct {
+	ID            string  `json:"id"`
+	Endpoint      string  `json:"endpoint"`
+	Architecture  string  `json:"architecture"`
+	Status        string  `json:"status"`
+	Capacity      int     `json:"capacity"`
+	CurrentLoad   int     `json:"current_load"`
+	Enabled       bool    `json:"enabled"`
+	CPUUsage      float64 `json:"cpu_usage"`
+	MemoryUsage   float64 `json:"memory_usage"`
+	DiskUsage     float64 `json:"disk_usage"`
+	TotalBuilds   int     `json:"total_builds"`
+	SuccessBuilds int     `json:"success_builds"`
+	FailedBuilds  int     `json:"failed_builds"`
+}
+
+// fetchAllBuilderStatus queries all configured remote builders for their status.
+func (s *Server) fetchAllBuilderStatus() []BuilderStatusInfo {
+	remoteBuilders := s.config.RemoteBuilders
+	if len(remoteBuilders) == 0 {
+		return nil
+	}
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		builders []BuilderStatusInfo
+	)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for _, addr := range remoteBuilders {
+		wg.Add(1)
+		go func(address string) {
+			defer wg.Done()
+
+			url := fmt.Sprintf("http://%s/api/v1/status", address)
+			resp, err := client.Get(url)
+			if err != nil {
+				log.Printf("Failed to query builder %s: %v", address, err)
+				// Add offline entry for unreachable builder
+				mu.Lock()
+				builders = append(builders, BuilderStatusInfo{
+					ID:       address,
+					Endpoint: fmt.Sprintf("http://%s", address),
+					Status:   "offline",
+					Enabled:  false,
+				})
+				mu.Unlock()
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusOK {
+				log.Printf("Builder %s returned status %d", address, resp.StatusCode)
+				mu.Lock()
+				builders = append(builders, BuilderStatusInfo{
+					ID:       address,
+					Endpoint: fmt.Sprintf("http://%s", address),
+					Status:   "error",
+					Enabled:  false,
+				})
+				mu.Unlock()
+				return
+			}
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				log.Printf("Failed to read response from builder %s: %v", address, err)
+				return
+			}
+
+			var status map[string]interface{}
+			if err := json.Unmarshal(body, &status); err != nil {
+				log.Printf("Failed to parse response from builder %s: %v", address, err)
+				return
+			}
+
+			info := BuilderStatusInfo{
+				ID:            getStringValue(status, "instance_id", address),
+				Endpoint:      fmt.Sprintf("http://%s", address),
+				Architecture:  getStringValue(status, "architecture", "unknown"),
+				Status:        getStringValue(status, "status", "online"),
+				Capacity:      getIntValue(status, "capacity", 0),
+				CurrentLoad:   getIntValue(status, "current_load", 0),
+				Enabled:       getBoolValue(status, "enabled", true),
+				CPUUsage:      getFloatValue(status, "cpu_usage", 0),
+				MemoryUsage:   getFloatValue(status, "memory_usage", 0),
+				DiskUsage:     getFloatValue(status, "disk_usage", 0),
+				TotalBuilds:   getIntValue(status, "total_builds", 0),
+				SuccessBuilds: getIntValue(status, "success_builds", 0),
+				FailedBuilds:  getIntValue(status, "failed_builds", 0),
+			}
+
+			mu.Lock()
+			builders = append(builders, info)
+			mu.Unlock()
+		}(addr)
+	}
+
+	wg.Wait()
+	return builders
+}
+
+// calculateBuilderStats calculates aggregate statistics from builder list.
+func calculateBuilderStats(builders []BuilderStatusInfo) map[string]interface{} {
+	totalBuilders := len(builders)
+	onlineBuilders := 0
+	offlineBuilders := 0
+	totalCapacity := 0
+	totalLoad := 0
+	totalBuilds := 0
+	totalSuccess := 0
+	totalFailed := 0
+
+	for _, b := range builders {
+		if b.Status == "online" || b.Status == "busy" {
+			onlineBuilders++
+		} else {
+			offlineBuilders++
+		}
+		totalCapacity += b.Capacity
+		totalLoad += b.CurrentLoad
+		totalBuilds += b.TotalBuilds
+		totalSuccess += b.SuccessBuilds
+		totalFailed += b.FailedBuilds
+	}
+
+	successRate := 0.0
+	if totalBuilds > 0 {
+		successRate = float64(totalSuccess) / float64(totalBuilds) * 100
+	}
+
+	return map[string]interface{}{
+		"total_builders":   totalBuilders,
+		"online_builders":  onlineBuilders,
+		"offline_builders": offlineBuilders,
+		"total_capacity":   totalCapacity,
+		"total_load":       totalLoad,
+		"total_builds":     totalBuilds,
+		"success_builds":   totalSuccess,
+		"failed_builds":    totalFailed,
+		"success_rate":     successRate,
+	}
+}
+
+// Helper functions for type conversion from map[string]interface{}
+
+func getStringValue(m map[string]interface{}, key, defaultVal string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return defaultVal
+}
+
+func getIntValue(m map[string]interface{}, key string, defaultVal int) int {
+	if v, ok := m[key]; ok {
+		switch n := v.(type) {
+		case int:
+			return n
+		case int64:
+			return int(n)
+		case float64:
+			return int(n)
+		}
+	}
+	return defaultVal
+}
+
+func getFloatValue(m map[string]interface{}, key string, defaultVal float64) float64 {
+	if v, ok := m[key]; ok {
+		switch n := v.(type) {
+		case float64:
+			return n
+		case int:
+			return float64(n)
+		case int64:
+			return float64(n)
+		}
+	}
+	return defaultVal
+}
+
+func getBoolValue(m map[string]interface{}, key string, defaultVal bool) bool {
+	if v, ok := m[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return defaultVal
 }
 
 // handleHeartbeat handles builder heartbeat requests.

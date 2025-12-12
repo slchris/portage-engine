@@ -76,34 +76,39 @@ type DashboardConfig struct {
 
 // BuilderConfig represents the builder configuration.
 type BuilderConfig struct {
-	Port             int
-	Workers          int
-	UseDocker        bool
-	DockerImage      string
-	WorkDir          string
-	ArtifactDir      string
-	GPGEnabled       bool
-	GPGKeyID         string
-	GPGKeyPath       string
-	StorageType      string
-	StorageLocalDir  string
-	StorageS3Bucket  string
-	StorageS3Region  string
-	StorageS3Prefix  string
-	StorageHTTPBase  string
-	ServerURL        string
-	NotifyConfig     string
-	MetricsEnabled   bool
-	MetricsPort      string
-	MetricsPassword  string
-	LogEnabled       bool
-	LogLevel         string
-	LogDir           string
-	LogMaxSizeMB     int
-	LogMaxAgeDays    int
-	LogMaxBackups    int
-	LogEnableConsole bool
-	LogEnableFile    bool
+	Port               int
+	Workers            int
+	InstanceID         string
+	Architecture       string
+	UseDocker          bool
+	DockerImage        string
+	WorkDir            string
+	ArtifactDir        string
+	DataDir            string
+	PersistenceEnabled bool
+	RetentionDays      int
+	GPGEnabled         bool
+	GPGKeyID           string
+	GPGKeyPath         string
+	StorageType        string
+	StorageLocalDir    string
+	StorageS3Bucket    string
+	StorageS3Region    string
+	StorageS3Prefix    string
+	StorageHTTPBase    string
+	ServerURL          string
+	NotifyConfig       string
+	MetricsEnabled     bool
+	MetricsPort        string
+	MetricsPassword    string
+	LogEnabled         bool
+	LogLevel           string
+	LogDir             string
+	LogMaxSizeMB       int
+	LogMaxAgeDays      int
+	LogMaxBackups      int
+	LogEnableConsole   bool
+	LogEnableFile      bool
 }
 
 // loadEnvFile loads key=value pairs from a .conf file.
@@ -303,15 +308,18 @@ func LoadDashboardConfig(path string) (*DashboardConfig, error) {
 func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	// Set defaults
 	config := &BuilderConfig{
-		Port:            9090,
-		Workers:         2,
-		UseDocker:       true,
-		DockerImage:     "gentoo/stage3:latest",
-		WorkDir:         "/var/tmp/portage-builds",
-		ArtifactDir:     "/var/tmp/portage-artifacts",
-		GPGEnabled:      false,
-		StorageType:     "local",
-		StorageLocalDir: "/var/binpkgs",
+		Port:               9090,
+		Workers:            2,
+		UseDocker:          true,
+		DockerImage:        "gentoo/stage3:latest",
+		WorkDir:            "/var/tmp/portage-builds",
+		ArtifactDir:        "/var/tmp/portage-artifacts",
+		DataDir:            "/var/lib/portage-engine",
+		PersistenceEnabled: true,
+		RetentionDays:      7,
+		GPGEnabled:         false,
+		StorageType:        "local",
+		StorageLocalDir:    "/var/binpkgs",
 	}
 
 	// If config file doesn't exist, return defaults
@@ -327,10 +335,15 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 
 	config.Port = getEnvInt(env, "BUILDER_PORT", config.Port)
 	config.Workers = getEnvInt(env, "BUILDER_WORKERS", config.Workers)
+	config.InstanceID = getEnvString(env, "INSTANCE_ID", "")
+	config.Architecture = getEnvString(env, "ARCHITECTURE", "")
 	config.UseDocker = getEnvBool(env, "USE_DOCKER", config.UseDocker)
 	config.DockerImage = getEnvString(env, "DOCKER_IMAGE", config.DockerImage)
 	config.WorkDir = getEnvString(env, "BUILD_WORK_DIR", config.WorkDir)
 	config.ArtifactDir = getEnvString(env, "BUILD_ARTIFACT_DIR", config.ArtifactDir)
+	config.DataDir = getEnvString(env, "DATA_DIR", config.DataDir)
+	config.PersistenceEnabled = getEnvBool(env, "PERSISTENCE_ENABLED", config.PersistenceEnabled)
+	config.RetentionDays = getEnvInt(env, "RETENTION_DAYS", config.RetentionDays)
 
 	config.GPGEnabled = getEnvBool(env, "GPG_ENABLED", config.GPGEnabled)
 	config.GPGKeyID = getEnvString(env, "GPG_KEY_ID", "")

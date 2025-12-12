@@ -149,6 +149,76 @@ func TestGetClusterStatus(t *testing.T) {
 	}
 }
 
+// TestGetClusterStatusCalculations tests cluster status calculations.
+func TestGetClusterStatusCalculations(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.ServerConfig{
+		MaxWorkers: 1,
+	}
+
+	mgr := NewManager(cfg)
+
+	// Initially should be all zeros
+	status := mgr.GetClusterStatus()
+	if status.TotalBuilds != 0 {
+		t.Errorf("Expected TotalBuilds=0, got %d", status.TotalBuilds)
+	}
+	if status.SuccessRate != 0 {
+		t.Errorf("Expected SuccessRate=0, got %f", status.SuccessRate)
+	}
+
+	// Submit a build
+	req := &BuildRequest{
+		PackageName: "dev-lang/python",
+		Version:     "3.11",
+		Arch:        "amd64",
+	}
+	_, _ = mgr.SubmitBuild(req)
+
+	status = mgr.GetClusterStatus()
+	if status.TotalBuilds != 1 {
+		t.Errorf("Expected TotalBuilds=1, got %d", status.TotalBuilds)
+	}
+
+	// Verify LastUpdated is set
+	if status.LastUpdated.IsZero() {
+		t.Error("LastUpdated should not be zero")
+	}
+}
+
+// TestClusterStatusSuccessRate tests success rate calculation.
+func TestClusterStatusSuccessRate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		completed   int
+		failed      int
+		expectedPct float64
+	}{
+		{"all success", 10, 0, 100.0},
+		{"all failed", 0, 10, 0.0},
+		{"50-50", 5, 5, 50.0},
+		{"no builds", 0, 0, 0.0},
+		{"75% success", 3, 1, 75.0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			completed := tt.completed
+			failed := tt.failed
+			var rate float64
+			if completed+failed > 0 {
+				rate = float64(completed) / float64(completed+failed) * 100
+			}
+			if rate != tt.expectedPct {
+				t.Errorf("Expected rate=%f, got %f", tt.expectedPct, rate)
+			}
+		})
+	}
+}
+
 // TestBuildRequest tests BuildRequest structure.
 func TestBuildRequest(t *testing.T) {
 	req := &BuildRequest{
@@ -393,5 +463,158 @@ func TestUpdateBuilderHeartbeatConcurrent(_ *testing.T) {
 	// Wait for all goroutines to complete
 	for i := 0; i < numGoroutines; i++ {
 		<-done
+	}
+}
+
+// TestBuildStatusArch tests that Arch field is properly handled in BuildStatus.
+func TestBuildStatusArch(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.ServerConfig{
+		MaxWorkers: 2,
+	}
+
+	mgr := NewManager(cfg)
+
+	tests := []struct {
+		name         string
+		arch         string
+		expectedArch string
+	}{
+		{
+			name:         "explicit amd64",
+			arch:         "amd64",
+			expectedArch: "amd64",
+		},
+		{
+			name:         "explicit arm64",
+			arch:         "arm64",
+			expectedArch: "arm64",
+		},
+		{
+			name:         "empty arch",
+			arch:         "",
+			expectedArch: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &BuildRequest{
+				PackageName: "dev-lang/python",
+				Version:     "3.11",
+				Arch:        tt.arch,
+			}
+
+			jobID, err := mgr.SubmitBuild(req)
+			if err != nil {
+				t.Fatalf("SubmitBuild failed: %v", err)
+			}
+
+			status, err := mgr.GetStatus(jobID)
+			if err != nil {
+				t.Fatalf("GetStatus failed: %v", err)
+			}
+
+			if status.Arch != tt.expectedArch {
+				t.Errorf("Expected Arch=%q, got %q", tt.expectedArch, status.Arch)
+			}
+		})
+	}
+}
+
+// TestLocalBuildRequestArch tests LocalBuildRequest Arch field.
+func TestLocalBuildRequestArch(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		req  *LocalBuildRequest
+		arch string
+	}{
+		{
+			name: "with arch",
+			req: &LocalBuildRequest{
+				PackageName: "app-misc/neofetch",
+				Version:     "7.1.0",
+				Arch:        "amd64",
+			},
+			arch: "amd64",
+		},
+		{
+			name: "without arch",
+			req: &LocalBuildRequest{
+				PackageName: "app-misc/neofetch",
+				Version:     "7.1.0",
+			},
+			arch: "",
+		},
+		{
+			name: "arm64 arch",
+			req: &LocalBuildRequest{
+				PackageName: "app-misc/neofetch",
+				Arch:        "arm64",
+			},
+			arch: "arm64",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.req.Arch != tt.arch {
+				t.Errorf("Expected Arch=%q, got %q", tt.arch, tt.req.Arch)
+			}
+		})
+	}
+}
+
+// TestExtractVersionFromArtifact tests extracting version from artifact path.
+func TestExtractVersionFromArtifact(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		artifactPath string
+		expected     string
+	}{
+		{
+			name:         "standard gpkg format",
+			artifactPath: "/var/tmp/portage-artifacts/screenfetch-3.9.9-1.gpkg.tar",
+			expected:     "3.9.9",
+		},
+		{
+			name:         "version with revision",
+			artifactPath: "/var/tmp/portage-artifacts/neofetch-7.1.0-r1-1.gpkg.tar",
+			expected:     "7.1.0-r1",
+		},
+		{
+			name:         "two part version",
+			artifactPath: "/var/tmp/portage-artifacts/htop-3.3-1.gpkg.tar",
+			expected:     "3.3",
+		},
+		{
+			name:         "complex package name",
+			artifactPath: "/var/tmp/portage-artifacts/dev-python-setuptools-69.0.3-1.gpkg.tar",
+			expected:     "69.0.3",
+		},
+		{
+			name:         "empty path",
+			artifactPath: "",
+			expected:     "",
+		},
+		{
+			name:         "no version pattern",
+			artifactPath: "/var/tmp/portage-artifacts/somefile.tar",
+			expected:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractVersionFromArtifact(tt.artifactPath)
+			if result != tt.expected {
+				t.Errorf("extractVersionFromArtifact(%q) = %q, want %q", tt.artifactPath, result, tt.expected)
+			}
+		})
 	}
 }

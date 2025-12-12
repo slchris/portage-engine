@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -128,9 +129,22 @@ func (d *Dashboard) handleStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleBuilds returns the list of builds from the server.
-func (d *Dashboard) handleBuilds(w http.ResponseWriter, _ *http.Request) {
+func (d *Dashboard) handleBuilds(w http.ResponseWriter, r *http.Request) {
+	// Get limit parameter (default 50, max 200)
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50
+	if limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
+			limit = parsed
+			if limit > 200 {
+				limit = 200
+			}
+		}
+	}
+
 	// Query the server for build list
-	resp, err := d.httpClient.Get(fmt.Sprintf("%s/api/v1/builds/list", d.config.ServerURL))
+	url := fmt.Sprintf("%s/api/v1/builds/list?limit=%d", d.config.ServerURL, limit)
+	resp, err := d.httpClient.Get(url)
 	if err != nil {
 		log.Printf("Failed to query builds: %v", err)
 		// Return sample data on error
@@ -535,6 +549,19 @@ const dashboardHTML = `<!DOCTYPE html>
             font-size: 12px;
             color: #ccc;
         }
+        .nav-links {
+            margin-top: 8px;
+        }
+        .nav-links a {
+            color: #aaa;
+            text-decoration: none;
+            margin-right: 15px;
+            font-size: 12px;
+        }
+        .nav-links a:hover {
+            color: white;
+            text-decoration: underline;
+        }
         .stats {
             display: table;
             width: 100%;
@@ -568,6 +595,34 @@ const dashboardHTML = `<!DOCTYPE html>
         .filter-btn.active {
             background: #333;
             color: white;
+        }
+        .auto-refresh-toggle {
+            float: right;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .auto-refresh-toggle label {
+            cursor: pointer;
+            user-select: none;
+        }
+        .auto-refresh-toggle input[type="checkbox"] {
+            cursor: pointer;
+        }
+        .refresh-btn {
+            background: #0066cc;
+            color: white;
+            border: none;
+            padding: 4px 12px;
+            cursor: pointer;
+            border-radius: 3px;
+        }
+        .refresh-btn:hover {
+            background: #0052a3;
+        }
+        .refresh-btn:disabled {
+            background: #999;
+            cursor: not-allowed;
         }
         .builds-table {
             width: 100%;
@@ -605,6 +660,10 @@ const dashboardHTML = `<!DOCTYPE html>
         <header>
             <h1>{{.Title}}</h1>
             <p class="subtitle">Portage Build Cluster Monitor</p>
+            <div class="nav-links">
+                <a href="/">Dashboard</a>
+                <a href="/monitor">Builders Monitor</a>
+            </div>
         </header>
 
         <div class="stats">
@@ -626,7 +685,14 @@ const dashboardHTML = `<!DOCTYPE html>
             <button class="filter-btn" onclick="filterBuilds('queued')">Queued</button>
             <button class="filter-btn" onclick="filterBuilds('completed')">Completed</button>
             <button class="filter-btn" onclick="filterBuilds('failed')">Failed</button>
-            <span class="refresh-info" id="refresh-info">Auto-refresh: 5s</span>
+            <div class="auto-refresh-toggle">
+                <button class="refresh-btn" id="refresh-btn" onclick="manualRefresh()">Refresh</button>
+                <label>
+                    <input type="checkbox" id="auto-refresh-toggle" checked>
+                    Auto-refresh
+                </label>
+                <span id="refresh-info">5s</span>
+            </div>
         </div>
 
         <table class="builds-table" id="builds-table">
@@ -636,12 +702,13 @@ const dashboardHTML = `<!DOCTYPE html>
                     <th>Version</th>
                     <th>Arch</th>
                     <th>Status</th>
+                    <th>Node</th>
                     <th>Job ID</th>
                     <th>Created</th>
                 </tr>
             </thead>
             <tbody id="builds-tbody">
-                <tr><td colspan="6">Loading...</td></tr>
+                <tr><td colspan="7">Loading...</td></tr>
             </tbody>
         </table>
     </div>
@@ -649,6 +716,66 @@ const dashboardHTML = `<!DOCTYPE html>
     <script>
         let currentFilter = 'all';
         let allBuilds = [];
+        let autoRefreshEnabled = true;
+        let refreshIntervalId = null;
+        let sortField = 'created_at';
+        let sortDescending = true;
+
+        // Load auto-refresh preference from localStorage
+        const savedAutoRefresh = localStorage.getItem('dashboard_auto_refresh');
+        if (savedAutoRefresh !== null) {
+            autoRefreshEnabled = savedAutoRefresh === 'true';
+            document.addEventListener('DOMContentLoaded', function() {
+                document.getElementById('auto-refresh-toggle').checked = autoRefreshEnabled;
+                updateRefreshInfo();
+            });
+        }
+
+        function toggleAutoRefresh() {
+            autoRefreshEnabled = document.getElementById('auto-refresh-toggle').checked;
+            localStorage.setItem('dashboard_auto_refresh', autoRefreshEnabled);
+            updateRefreshInfo();
+            if (autoRefreshEnabled) {
+                startAutoRefresh();
+            } else {
+                stopAutoRefresh();
+            }
+        }
+
+        function updateRefreshInfo() {
+            const info = document.getElementById('refresh-info');
+            info.textContent = autoRefreshEnabled ? '5s' : 'off';
+            info.style.color = autoRefreshEnabled ? '#666' : '#999';
+        }
+
+        function startAutoRefresh() {
+            if (refreshIntervalId) {
+                clearInterval(refreshIntervalId);
+            }
+            refreshIntervalId = setInterval(() => {
+                updateStatus();
+                updateBuilds();
+            }, 5000);
+        }
+
+        function stopAutoRefresh() {
+            if (refreshIntervalId) {
+                clearInterval(refreshIntervalId);
+                refreshIntervalId = null;
+            }
+        }
+
+        function manualRefresh() {
+            const btn = document.getElementById('refresh-btn');
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+            Promise.all([updateStatus(), updateBuilds()]).finally(() => {
+                btn.disabled = false;
+                btn.textContent = 'Refresh';
+            });
+        }
+
+        document.getElementById('auto-refresh-toggle').addEventListener('change', toggleAutoRefresh);
 
         function filterBuilds(filter) {
             currentFilter = filter;
@@ -659,6 +786,21 @@ const dashboardHTML = `<!DOCTYPE html>
             renderBuilds();
         }
 
+        function sortBuilds(builds) {
+            return builds.slice().sort((a, b) => {
+                let aVal = a[sortField] || '';
+                let bVal = b[sortField] || '';
+                if (sortField === 'created_at') {
+                    aVal = new Date(aVal).getTime() || 0;
+                    bVal = new Date(bVal).getTime() || 0;
+                }
+                if (sortDescending) {
+                    return bVal > aVal ? 1 : bVal < aVal ? -1 : 0;
+                }
+                return aVal > bVal ? 1 : aVal < bVal ? -1 : 0;
+            });
+        }
+
         function renderBuilds() {
             const tbody = document.getElementById('builds-tbody');
             let filteredBuilds = allBuilds;
@@ -666,8 +808,11 @@ const dashboardHTML = `<!DOCTYPE html>
                 filteredBuilds = allBuilds.filter(b => b.status === currentFilter);
             }
 
+            // Sort builds to maintain stable order
+            filteredBuilds = sortBuilds(filteredBuilds);
+
             if (filteredBuilds.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6">No builds found</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7">No builds found</td></tr>';
                 return;
             }
 
@@ -675,13 +820,14 @@ const dashboardHTML = `<!DOCTYPE html>
                 const createdDate = new Date(build.created_at);
                 const timeStr = createdDate.toLocaleString();
                 const shortId = build.job_id.substring(0, 8);
-                const builderInfo = build.builder_node ? ' on ' + build.builder_node : '';
+                const nodeInfo = build.instance_id ? build.instance_id.split(':')[0] : '';
 
                 return '<tr onclick="window.location.href=\'/build/' + build.job_id + '\'">' +
                     '<td>' + (build.package_name || 'N/A') + '</td>' +
-                    '<td>' + build.version + '</td>' +
-                    '<td>' + build.arch + '</td>' +
-                    '<td class="status-' + build.status + '">' + build.status + builderInfo + '</td>' +
+                    '<td>' + (build.version || '-') + '</td>' +
+                    '<td>' + (build.arch || '-') + '</td>' +
+                    '<td class="status-' + build.status + '">' + build.status + '</td>' +
+                    '<td>' + (nodeInfo || '-') + '</td>' +
                     '<td>' + shortId + '</td>' +
                     '<td>' + timeStr + '</td>' +
                     '</tr>';
@@ -689,7 +835,7 @@ const dashboardHTML = `<!DOCTYPE html>
         }
 
         function updateStatus() {
-            fetch('/api/status')
+            return fetch('/api/status')
                 .then(r => r.json())
                 .then(data => {
                     document.getElementById('active-builds').textContent = data.active_builds;
@@ -701,7 +847,7 @@ const dashboardHTML = `<!DOCTYPE html>
         }
 
         function updateBuilds() {
-            fetch('/api/builds')
+            return fetch('/api/builds?limit=50')
                 .then(r => r.json())
                 .then(data => {
                     allBuilds = data || [];
@@ -712,10 +858,10 @@ const dashboardHTML = `<!DOCTYPE html>
 
         updateStatus();
         updateBuilds();
-        setInterval(() => {
-            updateStatus();
-            updateBuilds();
-        }, 5000);
+        updateRefreshInfo();
+        if (autoRefreshEnabled) {
+            startAutoRefresh();
+        }
     </script>
 </body>
 </html>`
@@ -925,93 +1071,204 @@ const monitorHTML = `<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; }
-        .header { background: #24292e; color: white; padding: 15px 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
-        .header h1 { font-size: 24px; margin-bottom: 5px; }
-        .header .subtitle { font-size: 14px; color: #959da5; }
-        .nav { background: white; padding: 10px 20px; border-bottom: 1px solid #e1e4e8; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
-        .nav a { color: #0366d6; text-decoration: none; margin-right: 20px; font-size: 14px; }
-        .nav a:hover { text-decoration: underline; }
-        .container { max-width: 1400px; margin: 20px auto; padding: 0 20px; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); border-left: 4px solid #0366d6; }
-        .stat-card .label { font-size: 12px; color: #586069; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
-        .stat-card .value { font-size: 32px; font-weight: bold; color: #24292e; }
-        .stat-card .subvalue { font-size: 14px; color: #586069; margin-top: 5px; }
-        .section-title { font-size: 18px; font-weight: 600; color: #24292e; margin-bottom: 15px; padding-bottom: 8px; border-bottom: 2px solid #e1e4e8; }
-        .builders-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }
-        .builder-card { background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); overflow: hidden; transition: box-shadow 0.2s; }
-        .builder-card:hover { box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
-        .builder-header { padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
-        .builder-header.offline { background: linear-gradient(135deg, #868e96 0%, #495057 100%); }
-        .builder-header.busy { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
-        .builder-id { font-size: 16px; font-weight: 600; margin-bottom: 5px; }
-        .builder-arch { font-size: 13px; opacity: 0.9; }
-        .builder-status { display: inline-block; padding: 3px 10px; background: rgba(255,255,255,0.25); border-radius: 12px; font-size: 11px; margin-top: 8px; }
-        .builder-body { padding: 15px; }
-        .metric { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-        .metric-label { font-size: 13px; color: #586069; }
-        .metric-value { font-size: 14px; font-weight: 600; color: #24292e; }
-        .progress-bar { width: 100%; height: 8px; background: #e1e4e8; border-radius: 4px; overflow: hidden; margin-top: 5px; }
-        .progress-fill { height: 100%; background: linear-gradient(90deg, #0366d6 0%, #00a8e8 100%); transition: width 0.3s ease; }
-        .progress-fill.high { background: linear-gradient(90deg, #f5576c 0%, #f093fb 100%); }
-        .progress-fill.warning { background: linear-gradient(90deg, #f39c12 0%, #f1c40f 100%); }
-        .endpoint { font-size: 11px; color: #959da5; word-break: break-all; margin-top: 8px; padding-top: 8px; border-top: 1px solid #e1e4e8; }
-        .build-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #e1e4e8; }
-        .build-stat { text-align: center; }
-        .build-stat-value { font-size: 18px; font-weight: bold; color: #24292e; }
-        .build-stat-label { font-size: 10px; color: #586069; text-transform: uppercase; margin-top: 2px; }
-        .refresh-indicator { float: right; font-size: 12px; color: #586069; }
-        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
-        .status-online { background: #28a745; }
-        .status-offline { background: #dc3545; }
-        .status-busy { background: #ffc107; }
-        .no-builders { text-align: center; padding: 60px 20px; background: white; border-radius: 8px; color: #586069; }
+        body {
+            font-family: "Courier New", monospace;
+            background: #eee;
+            padding: 10px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border: 1px solid #ccc;
+        }
+        header {
+            background: #333;
+            color: white;
+            padding: 10px;
+            border-bottom: 1px solid #000;
+        }
+        h1 {
+            font-size: 18px;
+            margin: 0;
+        }
+        .subtitle {
+            font-size: 12px;
+            color: #ccc;
+        }
+        .nav-links {
+            margin-top: 8px;
+        }
+        .nav-links a {
+            color: #aaa;
+            text-decoration: none;
+            margin-right: 15px;
+            font-size: 12px;
+        }
+        .nav-links a:hover {
+            color: white;
+            text-decoration: underline;
+        }
+        .stats {
+            display: table;
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .stat-row {
+            display: table-row;
+        }
+        .stat-cell {
+            display: table-cell;
+            padding: 8px;
+            border: 1px solid #ddd;
+        }
+        .stat-label {
+            font-weight: bold;
+        }
+        .stat-value {
+            text-align: right;
+        }
+        .section-header {
+            background: #333;
+            color: white;
+            padding: 8px;
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .refresh-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .refresh-btn {
+            background: #0066cc;
+            color: white;
+            border: none;
+            padding: 4px 12px;
+            cursor: pointer;
+            font-family: "Courier New", monospace;
+            font-size: 12px;
+        }
+        .refresh-btn:hover {
+            background: #0052a3;
+        }
+        .refresh-btn:disabled {
+            background: #999;
+            cursor: not-allowed;
+        }
+        .builders-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .builders-table th {
+            background: #333;
+            color: white;
+            padding: 6px;
+            text-align: left;
+            border: 1px solid #000;
+        }
+        .builders-table td {
+            padding: 6px;
+            border: 1px solid #ddd;
+        }
+        .builders-table tr:nth-child(even) {
+            background: #f9f9f9;
+        }
+        .status-online { color: #00aa00; font-weight: bold; }
+        .status-offline { color: #cc0000; font-weight: bold; }
+        .status-busy { color: #ff6600; font-weight: bold; }
+        .progress-bar {
+            width: 100%;
+            height: 14px;
+            background: #ddd;
+            border: 1px solid #999;
+            position: relative;
+        }
+        .progress-fill {
+            height: 100%;
+            background: #0066cc;
+            transition: width 0.3s ease;
+        }
+        .progress-fill.high { background: #cc0000; }
+        .progress-fill.warning { background: #ff6600; }
+        .progress-text {
+            position: absolute;
+            width: 100%;
+            text-align: center;
+            font-size: 10px;
+            line-height: 14px;
+            color: #333;
+        }
+        .no-builders {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+        .build-counts {
+            font-size: 11px;
+        }
+        .build-counts .success { color: #00aa00; }
+        .build-counts .failed { color: #cc0000; }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>{{.Title}}</h1>
-        <p class="subtitle">Builders Status Monitor - OpenBuildService Style</p>
-    </div>
-
-    <div class="nav">
-        <a href="/">← Dashboard</a>
-        <a href="/builds">Build Jobs</a>
-        <a href="/monitor">Builders Monitor</a>
-    </div>
-
     <div class="container">
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="label">Total Builders</div>
-                <div class="value" id="total-builders">-</div>
+        <header>
+            <h1>{{.Title}}</h1>
+            <p class="subtitle">Builders Status Monitor</p>
+            <div class="nav-links">
+                <a href="/">Dashboard</a>
+                <a href="/builds">Build Jobs</a>
+                <a href="/monitor">Builders Monitor</a>
             </div>
-            <div class="stat-card">
-                <div class="label">Online</div>
-                <div class="value" id="online-builders">-</div>
-                <div class="subvalue" id="offline-builders-text">- offline</div>
-            </div>
-            <div class="stat-card">
-                <div class="label">Total Capacity</div>
-                <div class="value" id="total-capacity">-</div>
-                <div class="subvalue" id="total-load-text">- in use</div>
-            </div>
-            <div class="stat-card">
-                <div class="label">Success Rate</div>
-                <div class="value" id="success-rate">-</div>
-                <div class="subvalue" id="total-builds-text">- total builds</div>
+        </header>
+
+        <div class="stats">
+            <div class="stat-row">
+                <div class="stat-cell stat-label">Total Builders:</div>
+                <div class="stat-cell stat-value" id="total-builders">-</div>
+                <div class="stat-cell stat-label">Online:</div>
+                <div class="stat-cell stat-value" id="online-builders">-</div>
+                <div class="stat-cell stat-label">Capacity:</div>
+                <div class="stat-cell stat-value" id="total-capacity">-</div>
+                <div class="stat-cell stat-label">Success Rate:</div>
+                <div class="stat-cell stat-value" id="success-rate">-</div>
             </div>
         </div>
 
-        <div class="section-title">
-            Builders
-            <span class="refresh-indicator" id="refresh-info">Auto-refresh: 5s</span>
+        <div class="section-header">
+            <span>Builders List</span>
+            <div class="refresh-controls">
+                <button class="refresh-btn" id="refresh-btn" onclick="manualRefresh()">Refresh</button>
+                <label style="cursor:pointer;font-weight:normal;font-size:12px;">
+                    <input type="checkbox" id="auto-refresh-toggle" checked style="cursor:pointer;">
+                    Auto-refresh
+                </label>
+                <span id="refresh-info" style="font-size:11px;font-weight:normal;">5s</span>
+            </div>
         </div>
 
-        <div class="builders-grid" id="builders-grid">
-            <div class="no-builders">Loading builders...</div>
-        </div>
+        <table class="builders-table">
+            <thead>
+                <tr>
+                    <th>Builder ID</th>
+                    <th>Status</th>
+                    <th>Architecture</th>
+                    <th>Load</th>
+                    <th>CPU</th>
+                    <th>Memory</th>
+                    <th>Disk</th>
+                    <th>Builds (S/F/T)</th>
+                    <th>Endpoint</th>
+                </tr>
+            </thead>
+            <tbody id="builders-tbody">
+                <tr><td colspan="9" class="no-builders">Loading builders...</td></tr>
+            </tbody>
+        </table>
     </div>
 
     <script>
@@ -1027,109 +1284,56 @@ const monitorHTML = `<!DOCTYPE html>
             return value ? value.toFixed(1) + '%' : '0%';
         }
 
+        function renderProgressBar(value) {
+            const pct = value || 0;
+            const cls = getProgressBarClass(pct);
+            return ` + "`" + `<div class="progress-bar">
+                <div class="progress-fill ${cls}" style="width: ${pct}%"></div>
+                <span class="progress-text">${formatPercentage(value)}</span>
+            </div>` + "`" + `;
+        }
+
         function renderBuilders(data) {
             const stats = data.stats || {};
             const builders = data.builders || [];
 
             // Update stats
             document.getElementById('total-builders').textContent = stats.total_builders || 0;
-            document.getElementById('online-builders').textContent = stats.online_builders || 0;
-            document.getElementById('offline-builders-text').textContent =
-                (stats.offline_builders || 0) + ' offline';
-            document.getElementById('total-capacity').textContent = stats.total_capacity || 0;
-            document.getElementById('total-load-text').textContent =
-                (stats.total_load || 0) + ' in use';
+            document.getElementById('online-builders').textContent =
+                (stats.online_builders || 0) + ' / ' + (stats.offline_builders || 0) + ' offline';
+            document.getElementById('total-capacity').textContent =
+                (stats.total_load || 0) + ' / ' + (stats.total_capacity || 0);
             document.getElementById('success-rate').textContent =
-                formatPercentage(stats.success_rate);
-            document.getElementById('total-builds-text').textContent =
-                (stats.total_builds || 0) + ' total builds';
+                formatPercentage(stats.success_rate) + ' (' + (stats.total_builds || 0) + ' builds)';
 
-            // Render builders
-            const grid = document.getElementById('builders-grid');
+            // Render builders table
+            const tbody = document.getElementById('builders-tbody');
             if (builders.length === 0) {
-                grid.innerHTML = '<div class="no-builders">No builders registered</div>';
+                tbody.innerHTML = '<tr><td colspan="9" class="no-builders">No builders registered</td></tr>';
                 return;
             }
 
-            grid.innerHTML = builders.map(builder => {
-                const statusClass = builder.status === 'offline' ? 'offline' :
-                                  builder.status === 'busy' ? 'busy' : '';
-                const statusDotClass = builder.status === 'offline' ? 'status-offline' :
-                                      builder.status === 'busy' ? 'status-busy' : 'status-online';
-                const loadPercentage = builder.capacity > 0 ?
+            tbody.innerHTML = builders.map(builder => {
+                const statusClass = builder.status === 'offline' ? 'status-offline' :
+                                   builder.status === 'busy' ? 'status-busy' : 'status-online';
+                const loadPct = builder.capacity > 0 ?
                     (builder.current_load / builder.capacity * 100) : 0;
-                const successRate = builder.total_builds > 0 ?
-                    (builder.success_builds / builder.total_builds * 100) : 0;
 
-                return ` + "`" + `
-                    <div class="builder-card">
-                        <div class="builder-header ${statusClass}">
-                            <div class="builder-id">${builder.id}</div>
-                            <div class="builder-arch">Architecture: ${builder.architecture || 'unknown'}</div>
-                            <span class="builder-status">
-                                <span class="status-dot ${statusDotClass}"></span>
-                                ${builder.status}
-                                ${builder.enabled ? '' : ' (disabled)'}
-                            </span>
-                        </div>
-                        <div class="builder-body">
-                            <div class="metric">
-                                <span class="metric-label">Load</span>
-                                <span class="metric-value">${builder.current_load || 0} / ${builder.capacity || 0}</span>
-                            </div>
-                            <div class="progress-bar">
-                                <div class="progress-fill ${getProgressBarClass(loadPercentage)}"
-                                     style="width: ${loadPercentage}%"></div>
-                            </div>
-
-                            <div class="metric" style="margin-top: 15px;">
-                                <span class="metric-label">CPU Usage</span>
-                                <span class="metric-value">${formatPercentage(builder.cpu_usage)}</span>
-                            </div>
-                            <div class="progress-bar">
-                                <div class="progress-fill ${getProgressBarClass(builder.cpu_usage)}"
-                                     style="width: ${builder.cpu_usage || 0}%"></div>
-                            </div>
-
-                            <div class="metric">
-                                <span class="metric-label">Memory Usage</span>
-                                <span class="metric-value">${formatPercentage(builder.memory_usage)}</span>
-                            </div>
-                            <div class="progress-bar">
-                                <div class="progress-fill ${getProgressBarClass(builder.memory_usage)}"
-                                     style="width: ${builder.memory_usage || 0}%"></div>
-                            </div>
-
-                            <div class="metric">
-                                <span class="metric-label">Disk Usage</span>
-                                <span class="metric-value">${formatPercentage(builder.disk_usage)}</span>
-                            </div>
-                            <div class="progress-bar">
-                                <div class="progress-fill ${getProgressBarClass(builder.disk_usage)}"
-                                     style="width: ${builder.disk_usage || 0}%"></div>
-                            </div>
-
-                            <div class="build-stats">
-                                <div class="build-stat">
-                                    <div class="build-stat-value">${builder.total_builds || 0}</div>
-                                    <div class="build-stat-label">Total</div>
-                                </div>
-                                <div class="build-stat">
-                                    <div class="build-stat-value" style="color: #28a745;">${builder.success_builds || 0}</div>
-                                    <div class="build-stat-label">Success</div>
-                                </div>
-                                <div class="build-stat">
-                                    <div class="build-stat-value" style="color: #dc3545;">${builder.failed_builds || 0}</div>
-                                    <div class="build-stat-label">Failed</div>
-                                </div>
-                            </div>
-
-                            <div class="endpoint">
-                                <strong>Endpoint:</strong> ${builder.endpoint || 'N/A'}
-                            </div>
-                        </div>
-                    </div>
-                ` + "`" + `;
+                return ` + "`" + `<tr>
+                    <td><strong>${builder.id}</strong></td>
+                    <td class="${statusClass}">${builder.status}${builder.enabled ? '' : ' (disabled)'}</td>
+                    <td>${builder.architecture || 'unknown'}</td>
+                    <td>${builder.current_load || 0} / ${builder.capacity || 0}</td>
+                    <td>${renderProgressBar(builder.cpu_usage)}</td>
+                    <td>${renderProgressBar(builder.memory_usage)}</td>
+                    <td>${renderProgressBar(builder.disk_usage)}</td>
+                    <td class="build-counts">
+                        <span class="success">${builder.success_builds || 0}</span> /
+                        <span class="failed">${builder.failed_builds || 0}</span> /
+                        ${builder.total_builds || 0}
+                    </td>
+                    <td style="font-size:10px;">${builder.endpoint || 'N/A'}</td>
+                </tr>` + "`" + `;
             }).join('');
         }
 
@@ -1143,8 +1347,67 @@ const monitorHTML = `<!DOCTYPE html>
             }
         }
 
+        let autoRefreshEnabled = true;
+        let refreshIntervalId = null;
+
+        // Load auto-refresh preference from localStorage
+        const savedAutoRefresh = localStorage.getItem('monitor_auto_refresh');
+        if (savedAutoRefresh !== null) {
+            autoRefreshEnabled = savedAutoRefresh === 'true';
+            document.addEventListener('DOMContentLoaded', function() {
+                document.getElementById('auto-refresh-toggle').checked = autoRefreshEnabled;
+                updateRefreshInfo();
+            });
+        }
+
+        function toggleAutoRefresh() {
+            autoRefreshEnabled = document.getElementById('auto-refresh-toggle').checked;
+            localStorage.setItem('monitor_auto_refresh', autoRefreshEnabled);
+            updateRefreshInfo();
+            if (autoRefreshEnabled) {
+                startAutoRefresh();
+            } else {
+                stopAutoRefresh();
+            }
+        }
+
+        function updateRefreshInfo() {
+            const info = document.getElementById('refresh-info');
+            info.textContent = autoRefreshEnabled ? '5s' : 'off';
+            info.style.color = autoRefreshEnabled ? '#333' : '#999';
+        }
+
+        function startAutoRefresh() {
+            if (refreshIntervalId) {
+                clearInterval(refreshIntervalId);
+            }
+            refreshIntervalId = setInterval(updateBuildersStatus, 5000);
+        }
+
+        function stopAutoRefresh() {
+            if (refreshIntervalId) {
+                clearInterval(refreshIntervalId);
+                refreshIntervalId = null;
+            }
+        }
+
+        function manualRefresh() {
+            const btn = document.getElementById('refresh-btn');
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+            updateBuildersStatus().finally(() => {
+                btn.disabled = false;
+                btn.textContent = 'Refresh';
+            });
+        }
+
+        document.getElementById('auto-refresh-toggle').addEventListener('change', toggleAutoRefresh);
+
         updateBuildersStatus();
-        setInterval(updateBuildersStatus, 5000);
+        updateRefreshInfo();
+        if (autoRefreshEnabled) {
+            startAutoRefresh();
+        }
     </script>
 </body>
 </html>`

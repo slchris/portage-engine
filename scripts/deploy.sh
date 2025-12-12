@@ -46,7 +46,10 @@ check_connection() {
 
 # Build binaries
 build_binaries() {
-    log_info "Building binaries..."
+    log_info "Building binaries for Linux amd64 with static linking..."
+    export CGO_ENABLED=0
+    export GOOS=linux
+    export GOARCH=amd64
     make build
     log_info "Build complete"
 }
@@ -60,6 +63,8 @@ create_remote_dirs() {
         mkdir -p ${LOG_DIR}
         mkdir -p ${DATA_DIR}/{server,dashboard,builder}
         mkdir -p ${BINPKG_DIR}
+        mkdir -p /var/tmp/portage-builds
+        mkdir -p /var/tmp/portage-artifacts
 
         # Create portage user if not exists
         if ! id ${SERVICE_USER} >/dev/null 2>&1; then
@@ -70,6 +75,8 @@ create_remote_dirs() {
         chown -R ${SERVICE_USER}:${SERVICE_USER} ${LOG_DIR}
         chown -R ${SERVICE_USER}:${SERVICE_USER} ${DATA_DIR}
         chown -R ${SERVICE_USER}:${SERVICE_USER} ${BINPKG_DIR}
+        chown -R ${SERVICE_USER}:${SERVICE_USER} /var/tmp/portage-builds
+        chown -R ${SERVICE_USER}:${SERVICE_USER} /var/tmp/portage-artifacts
         chmod 755 ${INSTALL_DIR}
         chmod 755 ${CONFIG_DIR}
     '"
@@ -181,6 +188,8 @@ EOF
 '"
 
     # Builder service
+    # NOTE: PrivateTmp=false is required for builder because Docker containers
+    # write to /var/tmp and the service needs to access those files directly
     ssh "${REMOTE_USER}@${REMOTE_HOST}" "sudo bash -c 'cat > /etc/systemd/system/portage-builder.service << \"EOF\"
 [Unit]
 Description=Portage Engine Builder
@@ -199,7 +208,7 @@ StandardError=journal
 
 # Security settings
 NoNewPrivileges=true
-PrivateTmp=true
+PrivateTmp=false
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=${LOG_DIR} ${DATA_DIR} ${BINPKG_DIR} /var/tmp
