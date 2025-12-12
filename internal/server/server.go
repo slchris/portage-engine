@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -453,7 +454,8 @@ func (s *Server) fetchAllBuilderStatus() []BuilderStatusInfo {
 		go func(address string) {
 			defer wg.Done()
 
-			url := fmt.Sprintf("http://%s/api/v1/status", address)
+			baseURL := normalizeBuilderURL(address)
+			url := fmt.Sprintf("%s/api/v1/status", baseURL)
 			resp, err := client.Get(url)
 			if err != nil {
 				log.Printf("Failed to query builder %s: %v", address, err)
@@ -461,7 +463,7 @@ func (s *Server) fetchAllBuilderStatus() []BuilderStatusInfo {
 				mu.Lock()
 				builders = append(builders, BuilderStatusInfo{
 					ID:       address,
-					Endpoint: fmt.Sprintf("http://%s", address),
+					Endpoint: baseURL,
 					Status:   "offline",
 					Enabled:  false,
 				})
@@ -475,7 +477,7 @@ func (s *Server) fetchAllBuilderStatus() []BuilderStatusInfo {
 				mu.Lock()
 				builders = append(builders, BuilderStatusInfo{
 					ID:       address,
-					Endpoint: fmt.Sprintf("http://%s", address),
+					Endpoint: baseURL,
 					Status:   "error",
 					Enabled:  false,
 				})
@@ -497,7 +499,7 @@ func (s *Server) fetchAllBuilderStatus() []BuilderStatusInfo {
 
 			info := BuilderStatusInfo{
 				ID:            getStringValue(status, "instance_id", address),
-				Endpoint:      fmt.Sprintf("http://%s", address),
+				Endpoint:      baseURL,
 				Architecture:  getStringValue(status, "architecture", "unknown"),
 				Status:        getStringValue(status, "status", "online"),
 				Capacity:      getIntValue(status, "capacity", 0),
@@ -564,6 +566,15 @@ func calculateBuilderStats(builders []BuilderStatusInfo) map[string]interface{} 
 }
 
 // Helper functions for type conversion from map[string]interface{}
+
+// normalizeBuilderURL ensures the builder address has the correct URL format.
+// It handles cases where the address may or may not include the http:// prefix.
+func normalizeBuilderURL(address string) string {
+	if strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://") {
+		return address
+	}
+	return fmt.Sprintf("http://%s", address)
+}
 
 func getStringValue(m map[string]interface{}, key, defaultVal string) string {
 	if v, ok := m[key]; ok {
@@ -768,7 +779,7 @@ func (s *Server) getBuilderURLForJob(jobID string) (string, error) {
 	if len(builders) == 0 {
 		// Fall back to default builder from config (RemoteBuilders)
 		if len(s.config.RemoteBuilders) > 0 {
-			return s.config.RemoteBuilders[0], nil
+			return normalizeBuilderURL(s.config.RemoteBuilders[0]), nil
 		}
 		return "", fmt.Errorf("no builders registered and no default builder URL configured")
 	}
@@ -779,6 +790,8 @@ func (s *Server) getBuilderURLForJob(jobID string) (string, error) {
 		if builderURL == "" {
 			continue
 		}
+		// Ensure the URL is normalized
+		builderURL = normalizeBuilderURL(builderURL)
 		statusURL := fmt.Sprintf("%s/api/v1/jobs/%s", builderURL, jobID)
 
 		resp, err := http.Get(statusURL)
@@ -794,7 +807,7 @@ func (s *Server) getBuilderURLForJob(jobID string) (string, error) {
 
 	// Fall back to first remote builder
 	if len(s.config.RemoteBuilders) > 0 {
-		return s.config.RemoteBuilders[0], nil
+		return normalizeBuilderURL(s.config.RemoteBuilders[0]), nil
 	}
 
 	return "", fmt.Errorf("job not found on any registered builder: %s", jobID)
