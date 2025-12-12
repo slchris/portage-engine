@@ -67,6 +67,10 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/v1/builders/list", s.handleBuildersList)
 	mux.HandleFunc("/api/v1/builders/status", s.handleBuildersStatus)
 
+	// Artifact download proxy endpoints
+	mux.HandleFunc("/api/v1/artifacts/download/", s.handleArtifactDownload)
+	mux.HandleFunc("/api/v1/artifacts/info/", s.handleArtifactInfo)
+
 	// GPG endpoint
 	mux.HandleFunc("/api/v1/gpg/public-key", s.handleGPGPublicKey)
 
@@ -654,6 +658,146 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+// handleArtifactInfo returns artifact metadata for a job from a builder.
+func (s *Server) handleArtifactInfo(w http.ResponseWriter, r *http.Request) {
+	s.metrics.IncHTTPRequests()
+
+	if r.Method != http.MethodGet {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job ID from URL
+	jobID := r.URL.Path[len("/api/v1/artifacts/info/"):]
+	if jobID == "" {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Job ID required", http.StatusBadRequest)
+		return
+	}
+
+	// Get builder URL for this job
+	builderURL, err := s.getBuilderURLForJob(jobID)
+	if err != nil {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Proxy request to builder
+	infoURL := fmt.Sprintf("%s/api/v1/artifacts/info/%s", builderURL, jobID)
+	resp, err := http.Get(infoURL)
+	if err != nil {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, fmt.Sprintf("Failed to contact builder: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		http.Error(w, string(body), resp.StatusCode)
+		return
+	}
+
+	// Forward response
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// handleArtifactDownload proxies artifact download requests to the builder.
+func (s *Server) handleArtifactDownload(w http.ResponseWriter, r *http.Request) {
+	s.metrics.IncHTTPRequests()
+
+	if r.Method != http.MethodGet {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job ID from URL
+	jobID := r.URL.Path[len("/api/v1/artifacts/download/"):]
+	if jobID == "" {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Job ID required", http.StatusBadRequest)
+		return
+	}
+
+	// Get builder URL for this job
+	builderURL, err := s.getBuilderURLForJob(jobID)
+	if err != nil {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Proxy request to builder
+	downloadURL := fmt.Sprintf("%s/api/v1/artifacts/download/%s", builderURL, jobID)
+	resp, err := http.Get(downloadURL)
+	if err != nil {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, fmt.Sprintf("Failed to contact builder: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		http.Error(w, string(body), resp.StatusCode)
+		return
+	}
+
+	// Forward headers
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Stream the file
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// getBuilderURLForJob determines the builder URL that has the job.
+// It checks registered builders and returns the URL of the one that has the job.
+func (s *Server) getBuilderURLForJob(jobID string) (string, error) {
+	// First, try to get from registered builders
+	builders := s.builderRegistry.List()
+	if len(builders) == 0 {
+		// Fall back to default builder from config (RemoteBuilders)
+		if len(s.config.RemoteBuilders) > 0 {
+			return s.config.RemoteBuilders[0], nil
+		}
+		return "", fmt.Errorf("no builders registered and no default builder URL configured")
+	}
+
+	// Try each builder until we find the job
+	for _, b := range builders {
+		builderURL := b.Endpoint
+		if builderURL == "" {
+			continue
+		}
+		statusURL := fmt.Sprintf("%s/api/v1/jobs/%s", builderURL, jobID)
+
+		resp, err := http.Get(statusURL)
+		if err != nil {
+			continue
+		}
+		_ = resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			return builderURL, nil
+		}
+	}
+
+	// Fall back to first remote builder
+	if len(s.config.RemoteBuilders) > 0 {
+		return s.config.RemoteBuilders[0], nil
+	}
+
+	return "", fmt.Errorf("job not found on any registered builder: %s", jobID)
 }
 
 // handleGPGPublicKey serves the GPG public key for builders.

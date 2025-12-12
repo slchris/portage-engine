@@ -119,6 +119,63 @@ func main() {
 		_ = json.NewEncoder(w).Encode(jobs)
 	})
 
+	// Artifact info endpoint
+	mux.HandleFunc("/api/v1/artifacts/info/", func(w http.ResponseWriter, r *http.Request) {
+		jobID := r.URL.Path[len("/api/v1/artifacts/info/"):]
+		if jobID == "" {
+			http.Error(w, "Job ID required", http.StatusBadRequest)
+			return
+		}
+
+		info, err := bldr.GetArtifactInfo(jobID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(info)
+	})
+
+	// Artifact download endpoint
+	mux.HandleFunc("/api/v1/artifacts/download/", func(w http.ResponseWriter, r *http.Request) {
+		jobID := r.URL.Path[len("/api/v1/artifacts/download/"):]
+		if jobID == "" {
+			http.Error(w, "Job ID required", http.StatusBadRequest)
+			return
+		}
+
+		artifactPath, err := bldr.GetArtifactPath(jobID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		// Get file info for headers
+		fileInfo, err := os.Stat(artifactPath)
+		if err != nil {
+			http.Error(w, "Failed to get file info", http.StatusInternalServerError)
+			return
+		}
+
+		// Open the file
+		file, err := os.Open(artifactPath)
+		if err != nil {
+			http.Error(w, "Failed to open artifact file", http.StatusInternalServerError)
+			return
+		}
+		defer func() { _ = file.Close() }()
+
+		// Set headers for download
+		fileName := fileInfo.Name()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+
+		// Stream the file
+		http.ServeContent(w, r, fileName, fileInfo.ModTime(), file)
+	})
+
 	// Start HTTP server
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),

@@ -801,3 +801,74 @@ func (lb *LocalBuilder) sendNotification(job *BuildJob) {
 		log.Printf("Failed to send notification for job %s: %v", job.ID, err)
 	}
 }
+
+// GetArtifactPath returns the local file path of the artifact for a job.
+// Returns empty string if job not found or artifact not available.
+func (lb *LocalBuilder) GetArtifactPath(jobID string) (string, error) {
+	lb.jobsMutex.RLock()
+	job, exists := lb.jobs[jobID]
+	lb.jobsMutex.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("job not found: %s", jobID)
+	}
+
+	if job.Status != "success" {
+		return "", fmt.Errorf("job not completed successfully: status=%s", job.Status)
+	}
+
+	if job.ArtifactURL == "" {
+		return "", fmt.Errorf("no artifact available for job: %s", jobID)
+	}
+
+	// Check if ArtifactURL is a local file path
+	if _, err := os.Stat(job.ArtifactURL); err != nil {
+		return "", fmt.Errorf("artifact file not found: %s", job.ArtifactURL)
+	}
+
+	return job.ArtifactURL, nil
+}
+
+// ArtifactInfo contains metadata about a build artifact.
+type ArtifactInfo struct {
+	JobID       string `json:"job_id"`
+	FileName    string `json:"file_name"`
+	FilePath    string `json:"file_path"`
+	FileSize    int64  `json:"file_size"`
+	PackageName string `json:"package_name"`
+	Version     string `json:"version"`
+}
+
+// GetArtifactInfo returns metadata about the artifact for a job.
+func (lb *LocalBuilder) GetArtifactInfo(jobID string) (*ArtifactInfo, error) {
+	lb.jobsMutex.RLock()
+	job, exists := lb.jobs[jobID]
+	lb.jobsMutex.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("job not found: %s", jobID)
+	}
+
+	if job.Status != "success" {
+		return nil, fmt.Errorf("job not completed successfully: status=%s", job.Status)
+	}
+
+	if job.ArtifactURL == "" {
+		return nil, fmt.Errorf("no artifact available for job: %s", jobID)
+	}
+
+	// Get file info
+	fileInfo, err := os.Stat(job.ArtifactURL)
+	if err != nil {
+		return nil, fmt.Errorf("artifact file not found: %s", job.ArtifactURL)
+	}
+
+	return &ArtifactInfo{
+		JobID:       jobID,
+		FileName:    filepath.Base(job.ArtifactURL),
+		FilePath:    job.ArtifactURL,
+		FileSize:    fileInfo.Size(),
+		PackageName: job.Request.PackageName,
+		Version:     job.Request.Version,
+	}, nil
+}

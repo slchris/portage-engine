@@ -239,3 +239,133 @@ func TestBuildRequestSubmission(t *testing.T) {
 		t.Error("Expected 'job_id' in response")
 	}
 }
+
+func TestArtifactInfoEndpointMissingJobID(t *testing.T) {
+	cfg := &config.BuilderConfig{
+		Workers: 1,
+	}
+	bldr := builder.NewLocalBuilder(cfg.Workers, nil, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/info/", nil)
+	w := httptest.NewRecorder()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jobID := r.URL.Path[len("/api/v1/artifacts/info/"):]
+		if jobID == "" {
+			http.Error(w, "Job ID required", http.StatusBadRequest)
+			return
+		}
+
+		info, err := bldr.GetArtifactInfo(jobID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(info)
+	})
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status 400, got %d", w.Code)
+	}
+}
+
+func TestArtifactInfoEndpointNotFound(t *testing.T) {
+	cfg := &config.BuilderConfig{
+		Workers: 1,
+	}
+	bldr := builder.NewLocalBuilder(cfg.Workers, nil, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/info/non-existent-job", nil)
+	w := httptest.NewRecorder()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jobID := r.URL.Path[len("/api/v1/artifacts/info/"):]
+		if jobID == "" {
+			http.Error(w, "Job ID required", http.StatusBadRequest)
+			return
+		}
+
+		info, err := bldr.GetArtifactInfo(jobID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(info)
+	})
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Expected status 404, got %d", w.Code)
+	}
+}
+
+func TestArtifactDownloadEndpointMissingJobID(t *testing.T) {
+	cfg := &config.BuilderConfig{
+		Workers: 1,
+	}
+	bldr := builder.NewLocalBuilder(cfg.Workers, nil, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/download/", nil)
+	w := httptest.NewRecorder()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jobID := r.URL.Path[len("/api/v1/artifacts/download/"):]
+		if jobID == "" {
+			http.Error(w, "Job ID required", http.StatusBadRequest)
+			return
+		}
+
+		artifactPath, err := bldr.GetArtifactPath(jobID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		http.ServeFile(w, r, artifactPath)
+	})
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status 400, got %d", w.Code)
+	}
+}
+
+func TestArtifactDownloadEndpointNotFound(t *testing.T) {
+	cfg := &config.BuilderConfig{
+		Workers: 1,
+	}
+	bldr := builder.NewLocalBuilder(cfg.Workers, nil, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/download/non-existent-job", nil)
+	w := httptest.NewRecorder()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jobID := r.URL.Path[len("/api/v1/artifacts/download/"):]
+		if jobID == "" {
+			http.Error(w, "Job ID required", http.StatusBadRequest)
+			return
+		}
+
+		artifactPath, err := bldr.GetArtifactPath(jobID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		http.ServeFile(w, r, artifactPath)
+	})
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("Expected status 404, got %d", w.Code)
+	}
+}

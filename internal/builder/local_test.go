@@ -158,3 +158,81 @@ func TestLocalBuilderGetStatus(t *testing.T) {
 		t.Error("Expected total in status")
 	}
 }
+
+// TestLocalBuilderGetArtifactPath tests getting artifact path for a job.
+func TestLocalBuilderGetArtifactPath(t *testing.T) {
+	signer := gpg.NewSigner("/tmp/test-gpg", "test@example.com", false)
+	builder := NewLocalBuilder(1, signer, nil)
+
+	// Test non-existent job
+	_, err := builder.GetArtifactPath("non-existent-job")
+	if err == nil {
+		t.Error("Expected error for non-existent job")
+	}
+
+	// Submit a job
+	req := &LocalBuildRequest{
+		PackageName: "test-package",
+		Version:     "1.0",
+	}
+	jobID, err := builder.SubmitBuild(req)
+	if err != nil {
+		t.Fatalf("SubmitBuild failed: %v", err)
+	}
+
+	// Job is queued, not completed, should error
+	_, err = builder.GetArtifactPath(jobID)
+	if err == nil {
+		t.Error("Expected error for non-completed job")
+	}
+}
+
+// TestLocalBuilderGetArtifactInfo tests getting artifact info for a job.
+func TestLocalBuilderGetArtifactInfo(t *testing.T) {
+	signer := gpg.NewSigner("/tmp/test-gpg", "test@example.com", false)
+	builder := NewLocalBuilder(1, signer, nil)
+
+	// Test non-existent job
+	_, err := builder.GetArtifactInfo("non-existent-job")
+	if err == nil {
+		t.Error("Expected error for non-existent job")
+	}
+
+	// Submit a job
+	req := &LocalBuildRequest{
+		PackageName: "test-package",
+		Version:     "1.0",
+	}
+	jobID, err := builder.SubmitBuild(req)
+	if err != nil {
+		t.Fatalf("SubmitBuild failed: %v", err)
+	}
+
+	// Job is queued, not completed, should error
+	_, err = builder.GetArtifactInfo(jobID)
+	if err == nil {
+		t.Error("Expected error for non-completed job")
+	}
+}
+
+// TestArtifactInfo tests ArtifactInfo struct.
+func TestArtifactInfo(t *testing.T) {
+	info := &ArtifactInfo{
+		JobID:       "job-123",
+		FileName:    "test-1.0.tbz2",
+		FilePath:    "/tmp/artifacts/test-1.0.tbz2",
+		FileSize:    1024,
+		PackageName: "test-package",
+		Version:     "1.0",
+	}
+
+	if info.JobID != "job-123" {
+		t.Errorf("Expected JobID 'job-123', got '%s'", info.JobID)
+	}
+	if info.FileName != "test-1.0.tbz2" {
+		t.Errorf("Expected FileName 'test-1.0.tbz2', got '%s'", info.FileName)
+	}
+	if info.FileSize != 1024 {
+		t.Errorf("Expected FileSize 1024, got %d", info.FileSize)
+	}
+}

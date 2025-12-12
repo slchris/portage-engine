@@ -68,6 +68,10 @@ func (d *Dashboard) Router() http.Handler {
 	mux.HandleFunc("/api/scheduler/status", d.handleSchedulerStatus)
 	mux.HandleFunc("/api/builders/status", d.handleBuildersStatusAPI)
 
+	// Artifact download endpoints (proxy through server)
+	mux.HandleFunc("/api/artifacts/download/", d.handleArtifactDownload)
+	mux.HandleFunc("/api/artifacts/info/", d.handleArtifactInfo)
+
 	// Static files
 	mux.HandleFunc("/static/", d.handleStatic)
 
@@ -454,6 +458,82 @@ func (d *Dashboard) handleStatic(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, fullPath)
 }
 
+// handleArtifactInfo returns artifact metadata for a job (proxied through server).
+func (d *Dashboard) handleArtifactInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job ID from URL
+	jobID := strings.TrimPrefix(r.URL.Path, "/api/artifacts/info/")
+	if jobID == "" {
+		http.Error(w, "Job ID required", http.StatusBadRequest)
+		return
+	}
+
+	// Proxy request to server
+	infoURL := fmt.Sprintf("%s/api/v1/artifacts/info/%s", d.config.ServerURL, jobID)
+	resp, err := d.httpClient.Get(infoURL)
+	if err != nil {
+		log.Printf("Failed to get artifact info: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to contact server: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		http.Error(w, string(body), resp.StatusCode)
+		return
+	}
+
+	// Forward response
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// handleArtifactDownload proxies artifact download requests to the server.
+func (d *Dashboard) handleArtifactDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract job ID from URL
+	jobID := strings.TrimPrefix(r.URL.Path, "/api/artifacts/download/")
+	if jobID == "" {
+		http.Error(w, "Job ID required", http.StatusBadRequest)
+		return
+	}
+
+	// Proxy request to server
+	downloadURL := fmt.Sprintf("%s/api/v1/artifacts/download/%s", d.config.ServerURL, jobID)
+	resp, err := d.httpClient.Get(downloadURL)
+	if err != nil {
+		log.Printf("Failed to download artifact: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to contact server: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		http.Error(w, string(body), resp.StatusCode)
+		return
+	}
+
+	// Forward headers (Content-Type, Content-Disposition, Content-Length)
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Stream the file
+	_, _ = io.Copy(w, resp.Body)
+}
+
 // fetchClusterStatus fetches cluster status from the server.
 func (d *Dashboard) fetchClusterStatus() (*ClusterStatus, error) {
 	resp, err := d.httpClient.Get(fmt.Sprintf("%s/api/v1/cluster/status", d.config.ServerURL))
@@ -705,10 +785,11 @@ const dashboardHTML = `<!DOCTYPE html>
                     <th>Node</th>
                     <th>Job ID</th>
                     <th>Created</th>
+                    <th>Download</th>
                 </tr>
             </thead>
             <tbody id="builds-tbody">
-                <tr><td colspan="7">Loading...</td></tr>
+                <tr><td colspan="8">Loading...</td></tr>
             </tbody>
         </table>
     </div>
@@ -812,7 +893,7 @@ const dashboardHTML = `<!DOCTYPE html>
             filteredBuilds = sortBuilds(filteredBuilds);
 
             if (filteredBuilds.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7">No builds found</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8">No builds found</td></tr>';
                 return;
             }
 
@@ -821,6 +902,9 @@ const dashboardHTML = `<!DOCTYPE html>
                 const timeStr = createdDate.toLocaleString();
                 const shortId = build.job_id.substring(0, 8);
                 const nodeInfo = build.instance_id ? build.instance_id.split(':')[0] : '';
+                const downloadBtn = (build.status === 'success' || build.status === 'completed')
+                    ? '<a href="/api/artifacts/download/' + build.job_id + '" onclick="event.stopPropagation();" style="color:#0066cc;text-decoration:none;padding:4px 8px;background:#e7f3ff;border-radius:4px;font-size:12px;">⬇ Download</a>'
+                    : '-';
 
                 return '<tr onclick="window.location.href=\'/build/' + build.job_id + '\'">' +
                     '<td>' + (build.package_name || 'N/A') + '</td>' +
@@ -830,6 +914,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     '<td>' + (nodeInfo || '-') + '</td>' +
                     '<td>' + shortId + '</td>' +
                     '<td>' + timeStr + '</td>' +
+                    '<td>' + downloadBtn + '</td>' +
                     '</tr>';
             }).join('');
         }
@@ -930,6 +1015,10 @@ const buildDetailHTML = `<!DOCTYPE html>
                 const build = await resp.json();
 
                 const statusClass = 'status-' + build.status;
+                let downloadBtn = '';
+                if (build.status === 'success' || build.status === 'completed') {
+                    downloadBtn = '<div class="info-item"><div class="label">Artifact</div><div class="value"><a href="/api/artifacts/download/' + jobID + '" class="btn" style="margin-top:0;padding:6px 12px;font-size:12px;">⬇ Download Package</a></div></div>';
+                }
                 document.getElementById('build-info').innerHTML = ` + "`" + `
                     <div class="info-item"><div class="label">Job ID</div><div class="value">${build.job_id}</div></div>
                     <div class="info-item"><div class="label">Package</div><div class="value">${build.package_name}</div></div>
@@ -939,6 +1028,7 @@ const buildDetailHTML = `<!DOCTYPE html>
                     <div class="info-item"><div class="label">Builder Node</div><div class="value">${build.instance_id || 'Not assigned'}</div></div>
                     <div class="info-item"><div class="label">Created</div><div class="value">${new Date(build.created_at).toLocaleString()}</div></div>
                     <div class="info-item"><div class="label">Updated</div><div class="value">${new Date(build.updated_at).toLocaleString()}</div></div>
+                    ${downloadBtn}
                 ` + "`" + `;
             } catch (err) {
                 console.error('Failed to load build detail:', err);

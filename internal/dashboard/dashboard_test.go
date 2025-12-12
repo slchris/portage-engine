@@ -234,3 +234,69 @@ func TestAuthMiddleware(t *testing.T) {
 		t.Errorf("Expected status 401, got %d", resp.StatusCode)
 	}
 }
+
+// TestHandleArtifactInfo tests the artifact info endpoint.
+func TestHandleArtifactInfo(t *testing.T) {
+	cfg := &config.DashboardConfig{
+		ServerURL:      "http://localhost:8080",
+		AuthEnabled:    false,
+		AllowAnonymous: true,
+	}
+
+	dashboard := New(cfg)
+
+	// Test method not allowed
+	req := httptest.NewRequest(http.MethodPost, "/api/artifacts/info/test-job-id", nil)
+	w := httptest.NewRecorder()
+
+	dashboard.handleArtifactInfo(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("Expected status 405, got %d", resp.StatusCode)
+	}
+
+	// Test missing job ID
+	req = httptest.NewRequest(http.MethodGet, "/api/artifacts/info/", nil)
+	w = httptest.NewRecorder()
+
+	dashboard.handleArtifactInfo(w, req)
+
+	resp = w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected status 400 for missing job ID, got %d", resp.StatusCode)
+	}
+}
+
+// TestHandleArtifactDownload tests the artifact download endpoint.
+func TestHandleArtifactDownload(t *testing.T) {
+	cfg := &config.DashboardConfig{
+		ServerURL:      "http://localhost:8080",
+		AuthEnabled:    false,
+		AllowAnonymous: true,
+	}
+
+	dashboard := New(cfg)
+
+	// Test method not allowed
+	req := httptest.NewRequest(http.MethodPost, "/api/artifacts/download/test-job-id", nil)
+	w := httptest.NewRecorder()
+
+	dashboard.handleArtifactDownload(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("Expected status 405, got %d", resp.StatusCode)
+	}
+
+	// Test missing job ID
+	req = httptest.NewRequest(http.MethodGet, "/api/artifacts/download/", nil)
+	w = httptest.NewRecorder()
+
+	dashboard.handleArtifactDownload(w, req)
+
+	resp = w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected status 400 for missing job ID, got %d", resp.StatusCode)
+	}
+}

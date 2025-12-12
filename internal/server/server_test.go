@@ -778,3 +778,94 @@ func TestHandleGPGPublicKey(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleArtifactInfo tests the artifact info endpoint.
+func TestHandleArtifactInfo(t *testing.T) {
+	cfg := &config.ServerConfig{
+		BinpkgPath:     "/tmp/binpkgs",
+		RemoteBuilders: []string{"http://localhost:9090"},
+	}
+
+	server := New(cfg)
+
+	// Test method not allowed
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/artifacts/info/test-job-id", nil)
+	w := httptest.NewRecorder()
+
+	server.handleArtifactInfo(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("Expected status 405, got %d", resp.StatusCode)
+	}
+
+	// Test missing job ID
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/info/", nil)
+	w = httptest.NewRecorder()
+
+	server.handleArtifactInfo(w, req)
+
+	resp = w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected status 400 for missing job ID, got %d", resp.StatusCode)
+	}
+}
+
+// TestHandleArtifactDownload tests the artifact download endpoint.
+func TestHandleArtifactDownload(t *testing.T) {
+	cfg := &config.ServerConfig{
+		BinpkgPath:     "/tmp/binpkgs",
+		RemoteBuilders: []string{"http://localhost:9090"},
+	}
+
+	server := New(cfg)
+
+	// Test method not allowed
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/artifacts/download/test-job-id", nil)
+	w := httptest.NewRecorder()
+
+	server.handleArtifactDownload(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("Expected status 405, got %d", resp.StatusCode)
+	}
+
+	// Test missing job ID
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/download/", nil)
+	w = httptest.NewRecorder()
+
+	server.handleArtifactDownload(w, req)
+
+	resp = w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected status 400 for missing job ID, got %d", resp.StatusCode)
+	}
+}
+
+// TestGetBuilderURLForJob tests the getBuilderURLForJob helper.
+func TestGetBuilderURLForJob(t *testing.T) {
+	// Test with no builders and no remote builders configured
+	cfg := &config.ServerConfig{
+		BinpkgPath: "/tmp/binpkgs",
+	}
+
+	server := New(cfg)
+
+	_, err := server.getBuilderURLForJob("test-job")
+	if err == nil {
+		t.Error("Expected error when no builders configured")
+	}
+
+	// Test with remote builders configured
+	cfg.RemoteBuilders = []string{"http://builder1:9090", "http://builder2:9090"}
+	server = New(cfg)
+
+	url, err := server.getBuilderURLForJob("test-job")
+	if err != nil {
+		t.Errorf("Expected no error with remote builders, got: %v", err)
+	}
+	if url != "http://builder1:9090" {
+		t.Errorf("Expected first remote builder, got: %s", url)
+	}
+}
