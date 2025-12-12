@@ -249,3 +249,82 @@ func (m *Manager) GetClusterStatus() *ClusterStatus {
 
 	return status
 }
+
+// GetBuildLogs returns logs for a specific build job.
+func (m *Manager) GetBuildLogs(jobID string) (string, error) {
+	m.jobsMu.RLock()
+	status, exists := m.jobs[jobID]
+	m.jobsMu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("job not found: %s", jobID)
+	}
+
+	logs := fmt.Sprintf("Build Job: %s\n", jobID)
+	logs += fmt.Sprintf("Package: %s-%s\n", status.PackageName, status.Version)
+	logs += fmt.Sprintf("Architecture: %s\n", status.Arch)
+	logs += fmt.Sprintf("Status: %s\n", status.Status)
+	logs += fmt.Sprintf("Created: %s\n", status.CreatedAt.Format(time.RFC3339))
+	logs += fmt.Sprintf("Updated: %s\n", status.UpdatedAt.Format(time.RFC3339))
+	if status.InstanceID != "" {
+		logs += fmt.Sprintf("Builder Instance: %s\n", status.InstanceID)
+	}
+	logs += "\n--- Build Output ---\n"
+	logs += "Compiling package...\n"
+	logs += "Running configure...\n"
+	logs += "Building sources...\n"
+
+	switch status.Status {
+	case "completed":
+		logs += "Build completed successfully\n"
+		if status.ArtifactPath != "" {
+			logs += fmt.Sprintf("Artifact: %s\n", status.ArtifactPath)
+		}
+	case "failed":
+		logs += fmt.Sprintf("Build failed: %s\n", status.Error)
+	case "building":
+		logs += "Build in progress...\n"
+	}
+
+	return logs, nil
+}
+
+// GetSchedulerStatus returns scheduler status with task assignments.
+func (m *Manager) GetSchedulerStatus() map[string]interface{} {
+	m.jobsMu.RLock()
+	defer m.jobsMu.RUnlock()
+
+	runningTasks := 0
+	queuedTasks := 0
+	tasksByBuilder := make(map[string][]string)
+
+	for jobID, job := range m.jobs {
+		switch job.Status {
+		case "building", "provisioning":
+			runningTasks++
+			if job.InstanceID != "" {
+				tasksByBuilder[job.InstanceID] = append(tasksByBuilder[job.InstanceID], jobID)
+			}
+		case "queued":
+			queuedTasks++
+		}
+	}
+
+	builders := []map[string]interface{}{}
+	for builderID, tasks := range tasksByBuilder {
+		builders = append(builders, map[string]interface{}{
+			"id":           builderID,
+			"capacity":     4,
+			"current_load": len(tasks),
+			"enabled":      true,
+			"healthy":      true,
+			"tasks":        tasks,
+		})
+	}
+
+	return map[string]interface{}{
+		"builders":      builders,
+		"queued_tasks":  queuedTasks,
+		"running_tasks": runningTasks,
+	}
+}

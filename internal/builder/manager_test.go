@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -172,5 +173,140 @@ func TestBuildRequest(t *testing.T) {
 
 	if req.MachineSpec["machine_type"] != "n1-standard-4" {
 		t.Errorf("Expected machine_type=n1-standard-4, got %s", req.MachineSpec["machine_type"])
+	}
+}
+
+// TestGetBuildLogs tests retrieving build logs.
+func TestGetBuildLogs(t *testing.T) {
+	cfg := &config.ServerConfig{
+		MaxWorkers: 2,
+	}
+
+	mgr := NewManager(cfg)
+
+	req := &BuildRequest{
+		PackageName: "dev-lang/python",
+		Version:     "3.11",
+		Arch:        "amd64",
+	}
+
+	jobID, err := mgr.SubmitBuild(req)
+	if err != nil {
+		t.Fatalf("SubmitBuild failed: %v", err)
+	}
+
+	logs, err := mgr.GetBuildLogs(jobID)
+	if err != nil {
+		t.Fatalf("GetBuildLogs failed: %v", err)
+	}
+
+	if logs == "" {
+		t.Error("Logs should not be empty")
+	}
+
+	// Check that logs contain expected information
+	expectedStrings := []string{
+		"Build Job:",
+		"Package: dev-lang/python-3.11",
+		"Architecture: amd64",
+		"Status:",
+	}
+
+	for _, expected := range expectedStrings {
+		if !strings.Contains(logs, expected) {
+			t.Errorf("Expected logs to contain '%s'", expected)
+		}
+	}
+}
+
+// TestGetBuildLogsNotFound tests retrieving logs for non-existent job.
+func TestGetBuildLogsNotFound(t *testing.T) {
+	cfg := &config.ServerConfig{
+		MaxWorkers: 2,
+	}
+
+	mgr := NewManager(cfg)
+
+	_, err := mgr.GetBuildLogs("non-existent-job")
+	if err == nil {
+		t.Error("Expected error for non-existent job, got nil")
+	}
+}
+
+// TestGetSchedulerStatus tests retrieving scheduler status.
+func TestGetSchedulerStatus(t *testing.T) {
+	cfg := &config.ServerConfig{
+		MaxWorkers: 0, // Disable automatic processing
+	}
+
+	mgr := NewManager(cfg)
+
+	// Submit some builds
+	req1 := &BuildRequest{
+		PackageName: "dev-lang/python",
+		Version:     "3.11",
+		Arch:        "amd64",
+	}
+	jobID1, _ := mgr.SubmitBuild(req1)
+
+	req2 := &BuildRequest{
+		PackageName: "dev-lang/ruby",
+		Version:     "3.2",
+		Arch:        "amd64",
+	}
+	_, _ = mgr.SubmitBuild(req2)
+
+	// Simulate one job being assigned to a builder
+	mgr.jobsMu.Lock()
+	if job, exists := mgr.jobs[jobID1]; exists {
+		job.Status = "building"
+		job.InstanceID = "builder-1"
+	}
+	mgr.jobsMu.Unlock()
+
+	status := mgr.GetSchedulerStatus()
+	if status == nil {
+		t.Fatal("GetSchedulerStatus returned nil")
+	}
+
+	builders, ok := status["builders"].([]map[string]interface{})
+	if !ok {
+		t.Fatal("Expected builders to be an array")
+	}
+
+	queuedTasks, ok := status["queued_tasks"].(int)
+	if !ok {
+		t.Fatal("Expected queued_tasks to be an int")
+	}
+
+	runningTasks, ok := status["running_tasks"].(int)
+	if !ok {
+		t.Fatal("Expected running_tasks to be an int")
+	}
+
+	if runningTasks != 1 {
+		t.Errorf("Expected 1 running task, got %d", runningTasks)
+	}
+
+	if queuedTasks != 1 {
+		t.Errorf("Expected 1 queued task, got %d", queuedTasks)
+	}
+
+	if len(builders) != 1 {
+		t.Errorf("Expected 1 builder, got %d", len(builders))
+	}
+
+	if len(builders) > 0 {
+		builder := builders[0]
+		if builder["id"] != "builder-1" {
+			t.Errorf("Expected builder id=builder-1, got %s", builder["id"])
+		}
+		tasks, ok := builder["tasks"].([]string)
+		if !ok || len(tasks) != 1 {
+			t.Errorf("Expected builder to have 1 task")
+		}
+		if len(tasks) > 0 && tasks[0] != jobID1 {
+			t.Errorf("Expected task %s, got %s", jobID1, tasks[0])
+		}
 	}
 }

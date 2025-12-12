@@ -39,7 +39,9 @@ func (s *Server) Router() http.Handler {
 	// Build management endpoints
 	mux.HandleFunc("/api/v1/builds/list", s.handleBuildsList)
 	mux.HandleFunc("/api/v1/builds/submit", s.handleSubmitBuildWithConfig)
+	mux.HandleFunc("/api/v1/builds/logs", s.handleBuildLogs)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
+	mux.HandleFunc("/api/v1/scheduler/status", s.handleSchedulerStatus)
 
 	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
@@ -180,6 +182,46 @@ func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := s.builder.GetClusterStatus()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(status)
+}
+
+// handleBuildLogs returns logs for a specific build job.
+func (s *Server) handleBuildLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	jobID := r.URL.Query().Get("job_id")
+	if jobID == "" {
+		http.Error(w, "Missing job_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	logs, err := s.builder.GetBuildLogs(jobID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	response := map[string]interface{}{
+		"job_id": jobID,
+		"logs":   logs,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// handleSchedulerStatus returns scheduler status with task assignments.
+func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	status := s.builder.GetSchedulerStatus()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
 }
