@@ -1,7 +1,10 @@
 package iac
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestNewManager tests creating a new IaC manager.
@@ -20,151 +23,441 @@ func TestNewManager(t *testing.T) {
 	}
 }
 
-// TestProvision tests provisioning an instance.
-func TestProvision(t *testing.T) {
-	manager := NewManager()
-
-	req := &ProvisionRequest{
-		Provider: "aws",
-		Arch:     "amd64",
-		Spec: map[string]string{
-			"instance_type": "t3.medium",
-			"region":        "us-east-1",
+func TestGetOrDefault(t *testing.T) {
+	tests := []struct {
+		name         string
+		m            map[string]string
+		key          string
+		defaultValue string
+		want         string
+	}{
+		{
+			name:         "key exists",
+			m:            map[string]string{"region": "us-west-1"},
+			key:          "region",
+			defaultValue: "us-east-1",
+			want:         "us-west-1",
+		},
+		{
+			name:         "key missing",
+			m:            map[string]string{},
+			key:          "region",
+			defaultValue: "us-east-1",
+			want:         "us-east-1",
+		},
+		{
+			name:         "nil map",
+			m:            nil,
+			key:          "region",
+			defaultValue: "us-east-1",
+			want:         "us-east-1",
 		},
 	}
 
-	instance, err := manager.Provision(req)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getOrDefault(tt.m, tt.key, tt.defaultValue)
+			if got != tt.want {
+				t.Errorf("getOrDefault() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateHeartbeat(t *testing.T) {
+	manager := NewManager()
+
+	// Add a test instance
+	instanceID := "test-instance"
+	manager.instances[instanceID] = &Instance{
+		ID:            instanceID,
+		Provider:      "gcp",
+		Status:        "provisioning",
+		LastHeartbeat: time.Now().Add(-10 * time.Minute),
+	}
+
+	// Update heartbeat
+	err := manager.UpdateHeartbeat(instanceID)
 	if err != nil {
-		t.Fatalf("Provision failed: %v", err)
+		t.Errorf("UpdateHeartbeat() error = %v", err)
 	}
 
-	if instance == nil {
-		t.Fatal("Expected non-nil instance")
+	// Verify heartbeat was updated
+	instance := manager.instances[instanceID]
+	if time.Since(instance.LastHeartbeat) > 5*time.Second {
+		t.Error("LastHeartbeat not updated")
 	}
-
-	if instance.ID == "" {
-		t.Error("Instance ID should not be empty")
-	}
-
-	if instance.Provider != "aws" {
-		t.Errorf("Expected provider aws, got %s", instance.Provider)
-	}
-
 	if instance.Status != "running" {
-		t.Errorf("Expected status running, got %s", instance.Status)
+		t.Errorf("Status = %v, want running", instance.Status)
 	}
 
-	if instance.IPAddress == "" {
-		t.Error("Instance IP address should not be empty")
-	}
-}
-
-// TestTerminate tests terminating an instance.
-func TestTerminate(t *testing.T) {
-	manager := NewManager()
-
-	// Provision an instance first
-	req := &ProvisionRequest{
-		Provider: "gcp",
-		Arch:     "arm64",
-		Spec: map[string]string{
-			"machine_type": "e2-standard-2",
-		},
-	}
-
-	instance, err := manager.Provision(req)
-	if err != nil {
-		t.Fatalf("Provision failed: %v", err)
-	}
-
-	// Terminate the instance
-	err = manager.Terminate(instance.ID)
-	if err != nil {
-		t.Fatalf("Terminate failed: %v", err)
-	}
-
-	// Verify instance is removed
-	_, err = manager.GetInstance(instance.ID)
+	// Test non-existent instance
+	err = manager.UpdateHeartbeat("non-existent")
 	if err == nil {
-		t.Error("Expected error when getting terminated instance")
+		t.Error("UpdateHeartbeat() expected error for non-existent instance")
 	}
 }
 
-// TestGetInstance tests retrieving an instance.
-func TestGetInstance(t *testing.T) {
+func TestCheckStaleInstances(t *testing.T) {
 	manager := NewManager()
 
-	req := &ProvisionRequest{
-		Provider: "azure",
-		Arch:     "amd64",
+	// Add test instances
+	manager.instances["fresh"] = &Instance{
+		ID:            "fresh",
+		Provider:      "gcp",
+		Status:        "running",
+		LastHeartbeat: time.Now(),
+	}
+	manager.instances["stale"] = &Instance{
+		ID:            "stale",
+		Provider:      "gcp",
+		Status:        "running",
+		LastHeartbeat: time.Now().Add(-15 * time.Minute),
+	}
+	manager.instances["already-error"] = &Instance{
+		ID:            "already-error",
+		Provider:      "gcp",
+		Status:        "error",
+		LastHeartbeat: time.Now().Add(-20 * time.Minute),
 	}
 
-	instance, err := manager.Provision(req)
-	if err != nil {
-		t.Fatalf("Provision failed: %v", err)
+	// Check stale instances - should return all instances with LastHeartbeat > timeout
+	stale := manager.CheckStaleInstances(10 * time.Minute)
+	if len(stale) != 2 {
+		t.Errorf("CheckStaleInstances() returned %d instances, want 2", len(stale))
 	}
 
-	retrieved, err := manager.GetInstance(instance.ID)
-	if err != nil {
-		t.Fatalf("GetInstance failed: %v", err)
+	// Verify the returned instances are the stale ones
+	staleIDs := make(map[string]bool)
+	for _, inst := range stale {
+		staleIDs[inst.ID] = true
 	}
-
-	if retrieved.ID != instance.ID {
-		t.Errorf("Expected instance ID %s, got %s", instance.ID, retrieved.ID)
+	if !staleIDs["stale"] || !staleIDs["already-error"] {
+		t.Error("CheckStaleInstances() did not return expected stale instances")
 	}
 }
 
-// TestGetInstanceNotFound tests retrieving non-existent instance.
-func TestGetInstanceNotFound(t *testing.T) {
-	manager := NewManager()
-
-	_, err := manager.GetInstance("non-existent-id")
-	if err == nil {
-		t.Error("Expected error for non-existent instance")
-	}
-}
-
-// TestListInstances tests listing all instances.
 func TestListInstances(t *testing.T) {
 	manager := NewManager()
 
-	// Provision multiple instances
-	providers := []string{"aws", "gcp", "azure"}
-	for _, provider := range providers {
-		req := &ProvisionRequest{
-			Provider: provider,
-			Arch:     "amd64",
-		}
-		_, err := manager.Provision(req)
-		if err != nil {
-			t.Fatalf("Provision failed: %v", err)
-		}
+	// Test empty list
+	instances := manager.ListInstances()
+	if len(instances) != 0 {
+		t.Errorf("ListInstances() returned %d instances, want 0", len(instances))
 	}
 
-	instances := manager.ListInstances()
-	if len(instances) != 3 {
-		t.Errorf("Expected 3 instances, got %d", len(instances))
+	// Add test instances
+	manager.instances["test1"] = &Instance{
+		ID:       "test1",
+		Provider: "gcp",
+		Status:   "running",
+	}
+	manager.instances["test2"] = &Instance{
+		ID:       "test2",
+		Provider: "aws",
+		Status:   "provisioning",
+	}
+
+	instances = manager.ListInstances()
+	if len(instances) != 2 {
+		t.Errorf("ListInstances() returned %d instances, want 2", len(instances))
 	}
 }
 
-// TestProvisionWithDifferentArchs tests provisioning with different architectures.
-func TestProvisionWithDifferentArchs(t *testing.T) {
+func TestGenerateFirewallConfig(t *testing.T) {
 	manager := NewManager()
 
-	archs := []string{"amd64", "arm64"}
-	for _, arch := range archs {
-		req := &ProvisionRequest{
-			Provider: "aws",
-			Arch:     arch,
-		}
+	tests := []struct {
+		name string
+		req  *ProvisionRequest
+	}{
+		{
+			name: "aliyun firewall",
+			req: &ProvisionRequest{
+				Provider:        "aliyun",
+				AllowedIPRanges: []string{"0.0.0.0/0"},
+				BuilderPort:     8080,
+			},
+		},
+		{
+			name: "gcp firewall",
+			req: &ProvisionRequest{
+				Provider:        "gcp",
+				AllowedIPRanges: []string{"0.0.0.0/0"},
+				BuilderPort:     8080,
+			},
+		},
+		{
+			name: "aws firewall",
+			req: &ProvisionRequest{
+				Provider:        "aws",
+				AllowedIPRanges: []string{"0.0.0.0/0"},
+				BuilderPort:     8080,
+			},
+		},
+		{
+			name: "no ip ranges",
+			req: &ProvisionRequest{
+				Provider:    "gcp",
+				BuilderPort: 8080,
+			},
+		},
+	}
 
-		instance, err := manager.Provision(req)
-		if err != nil {
-			t.Fatalf("Provision failed for arch %s: %v", arch, err)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := manager.generateFirewallConfig(tt.req)
+			if len(tt.req.AllowedIPRanges) > 0 && len(config) == 0 {
+				t.Error("generateFirewallConfig() returned empty config when firewall rules configured")
+			}
+		})
+	}
+}
 
-		if instance.Arch != arch {
-			t.Errorf("Expected arch %s, got %s", arch, instance.Arch)
+func TestGenerateTerraformConfig(t *testing.T) {
+	manager := NewManager()
+
+	tests := []struct {
+		name      string
+		req       *ProvisionRequest
+		wantEmpty bool
+	}{
+		{
+			name: "aliyun config",
+			req: &ProvisionRequest{
+				Arch:     "amd64",
+				Provider: "aliyun",
+				Spec: map[string]string{
+					"region": "cn-hangzhou",
+				},
+				Credentials: &CloudCredentials{
+					AliyunAccessKey: "test-ak",
+					AliyunSecretKey: "test-sk",
+				},
+			},
+			wantEmpty: false,
+		},
+		{
+			name: "gcp config",
+			req: &ProvisionRequest{
+				Arch:     "amd64",
+				Provider: "gcp",
+				Spec: map[string]string{
+					"region":  "us-central1",
+					"project": "test-project",
+				},
+				Credentials: &CloudCredentials{
+					GCPKeyFile: "/path/to/key.json",
+				},
+			},
+			wantEmpty: false,
+		},
+		{
+			name: "aws config",
+			req: &ProvisionRequest{
+				Arch:     "arm64",
+				Provider: "aws",
+				Spec: map[string]string{
+					"region": "us-west-2",
+				},
+				Credentials: &CloudCredentials{
+					AWSAccessKey: "test-access",
+					AWSSecretKey: "test-secret",
+				},
+			},
+			wantEmpty: false,
+		},
+		{
+			name: "invalid provider",
+			req: &ProvisionRequest{
+				Provider: "invalid",
+			},
+			wantEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := manager.generateTerraformConfig(tt.req)
+			if !tt.wantEmpty && len(config) == 0 {
+				t.Error("generateTerraformConfig() returned empty config")
+			}
+			if tt.wantEmpty && len(config) > 0 {
+				t.Error("generateTerraformConfig() should return empty config for invalid provider")
+			}
+		})
+	}
+}
+
+func TestGenerateDeploymentScript(t *testing.T) {
+	manager := NewManager()
+
+	script := manager.generateDeploymentScript("http://localhost:8080/api/heartbeat", 9090)
+
+	if len(script) == 0 {
+		t.Error("generateDeploymentScript() returned empty script")
+	}
+}
+
+func TestPrepareEnvironment(t *testing.T) {
+	tests := []struct {
+		name    string
+		req     *ProvisionRequest
+		wantEnv []string
+	}{
+		{
+			name: "aliyun credentials",
+			req: &ProvisionRequest{
+				Provider: "aliyun",
+				Credentials: &CloudCredentials{
+					AliyunAccessKey: "test-ak",
+					AliyunSecretKey: "test-sk",
+				},
+			},
+			wantEnv: []string{
+				"ALICLOUD_ACCESS_KEY=test-ak",
+				"ALICLOUD_SECRET_KEY=test-sk",
+			},
+		},
+		{
+			name: "gcp credentials",
+			req: &ProvisionRequest{
+				Provider: "gcp",
+				Credentials: &CloudCredentials{
+					GCPKeyFile: "/path/to/key.json",
+				},
+			},
+			wantEnv: []string{
+				"GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json",
+			},
+		},
+		{
+			name: "aws credentials",
+			req: &ProvisionRequest{
+				Provider: "aws",
+				Credentials: &CloudCredentials{
+					AWSAccessKey: "test-access",
+					AWSSecretKey: "test-secret",
+				},
+			},
+			wantEnv: []string{
+				"AWS_ACCESS_KEY_ID=test-access",
+				"AWS_SECRET_ACCESS_KEY=test-secret",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := NewManager()
+
+			gotEnv := manager.prepareEnvironment(tt.req)
+			if len(gotEnv) != len(tt.wantEnv) {
+				t.Errorf("prepareEnvironment() returned %d env vars, want %d", len(gotEnv), len(tt.wantEnv))
+			}
+
+			// Convert to map for easier comparison
+			envMap := make(map[string]bool)
+			for _, e := range gotEnv {
+				envMap[e] = true
+			}
+
+			for _, want := range tt.wantEnv {
+				if !envMap[want] {
+					t.Errorf("prepareEnvironment() missing env var %s", want)
+				}
+			}
+		})
+	}
+}
+
+func TestProvisionWorkflow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	manager := NewManager()
+
+	req := &ProvisionRequest{
+		Arch:     "amd64",
+		Provider: "gcp",
+		Spec: map[string]string{
+			"region":  "us-central1",
+			"project": "test-project",
+		},
+		Credentials: &CloudCredentials{
+			GCPKeyFile: "/path/to/key.json",
+		},
+		SSH: &SSHConfig{
+			KeyPath: "/path/to/ssh/key",
+			User:    "root",
+		},
+		ServerCallback: "http://localhost:8080/api/heartbeat",
+	}
+
+	// Test config generation
+	config := manager.generateTerraformConfig(req)
+	if len(config) == 0 {
+		t.Error("Generated config is empty")
+	}
+
+	// Verify workspace directory creation
+	workspaceDir := manager.workspaceDir
+	configPath := filepath.Join(workspaceDir, "test-workspace", "main.tf")
+
+	// Create the config file to simulate what Provision() does
+	testWorkspace := filepath.Join(workspaceDir, "test-workspace")
+	if err := os.MkdirAll(testWorkspace, 0755); err == nil {
+		if err := os.WriteFile(configPath, []byte(config), 0644); err == nil {
+			// Verify file was created
+			if _, err := os.Stat(configPath); os.IsNotExist(err) {
+				t.Error("main.tf was not created")
+			}
+			// Clean up
+			_ = os.RemoveAll(testWorkspace)
+		}
+	}
+}
+
+func TestInstanceLifecycle(t *testing.T) {
+	manager := NewManager()
+
+	instanceID := "test-instance-lifecycle"
+
+	// Create instance
+	manager.instances[instanceID] = &Instance{
+		ID:              instanceID,
+		Provider:        "gcp",
+		Arch:            "amd64",
+		Status:          "provisioning",
+		LastHeartbeat:   time.Now(),
+		IPAddress:       "192.168.1.100",
+		BuilderEndpoint: "http://192.168.1.100:8080",
+	}
+
+	// Verify instance exists
+	instances := manager.ListInstances()
+	found := false
+	for _, inst := range instances {
+		if inst.ID == instanceID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Instance not found in list")
+	}
+
+	// Update heartbeat
+	if err := manager.UpdateHeartbeat(instanceID); err != nil {
+		t.Errorf("UpdateHeartbeat() error = %v", err)
+	}
+
+	// Check instance is not stale
+	stale := manager.CheckStaleInstances(10 * time.Minute)
+	for _, inst := range stale {
+		if inst.ID == instanceID {
+			t.Error("Instance should not be stale")
 		}
 	}
 }

@@ -27,11 +27,19 @@ type ServerConfig struct {
 	CloudProvider     string
 	CloudAliyunRegion string
 	CloudAliyunZone   string
+	CloudAliyunAK     string
+	CloudAliyunSK     string
 	CloudGCPProject   string
 	CloudGCPRegion    string
 	CloudGCPZone      string
+	CloudGCPKeyFile   string
 	CloudAWSRegion    string
 	CloudAWSZone      string
+	CloudAWSAccessKey string
+	CloudAWSSecretKey string
+	CloudSSHKeyPath   string
+	CloudSSHUser      string
+	ServerCallbackURL string
 	RemoteBuilders    []string
 }
 
@@ -175,11 +183,19 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	config.CloudProvider = getEnvString(env, "CLOUD_DEFAULT_PROVIDER", config.CloudProvider)
 	config.CloudAliyunRegion = getEnvString(env, "CLOUD_ALIYUN_REGION", "cn-hangzhou")
 	config.CloudAliyunZone = getEnvString(env, "CLOUD_ALIYUN_ZONE", "cn-hangzhou-a")
+	config.CloudAliyunAK = getEnvString(env, "CLOUD_ALIYUN_ACCESS_KEY", "")
+	config.CloudAliyunSK = getEnvString(env, "CLOUD_ALIYUN_SECRET_KEY", "")
 	config.CloudGCPProject = getEnvString(env, "CLOUD_GCP_PROJECT", config.CloudGCPProject)
 	config.CloudGCPRegion = getEnvString(env, "CLOUD_GCP_REGION", config.CloudGCPRegion)
 	config.CloudGCPZone = getEnvString(env, "CLOUD_GCP_ZONE", config.CloudGCPZone)
+	config.CloudGCPKeyFile = getEnvString(env, "CLOUD_GCP_KEY_FILE", "")
 	config.CloudAWSRegion = getEnvString(env, "CLOUD_AWS_REGION", "us-east-1")
 	config.CloudAWSZone = getEnvString(env, "CLOUD_AWS_ZONE", "us-east-1a")
+	config.CloudAWSAccessKey = getEnvString(env, "CLOUD_AWS_ACCESS_KEY", "")
+	config.CloudAWSSecretKey = getEnvString(env, "CLOUD_AWS_SECRET_KEY", "")
+	config.CloudSSHKeyPath = getEnvString(env, "CLOUD_SSH_KEY_PATH", "")
+	config.CloudSSHUser = getEnvString(env, "CLOUD_SSH_USER", "root")
+	config.ServerCallbackURL = getEnvString(env, "SERVER_CALLBACK_URL", "")
 
 	// Parse remote builders
 	if builders := getEnvString(env, "REMOTE_BUILDERS", ""); builders != "" {
