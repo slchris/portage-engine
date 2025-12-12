@@ -43,6 +43,7 @@ type ServerConfig struct {
 	CloudGCPPreemptible  bool
 	CloudGCPStateDir     string
 	CloudGCPAllowedIPs   []string
+	CloudInstanceTTL     int // Instance TTL in minutes, 0 means no auto-termination
 	CloudAWSRegion       string
 	CloudAWSZone         string
 	CloudAWSAccessKey    string
@@ -253,6 +254,7 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 			config.CloudGCPAllowedIPs[i] = strings.TrimSpace(config.CloudGCPAllowedIPs[i])
 		}
 	}
+	config.CloudInstanceTTL = getEnvInt(env, "CLOUD_INSTANCE_TTL", 60) // Default 60 minutes
 	config.CloudAWSRegion = getEnvString(env, "CLOUD_AWS_REGION", "us-east-1")
 	config.CloudAWSZone = getEnvString(env, "CLOUD_AWS_ZONE", "us-east-1a")
 	config.CloudAWSAccessKey = getEnvString(env, "CLOUD_AWS_ACCESS_KEY", "")

@@ -34,12 +34,14 @@ type GCPConfig struct {
 	Region            string   `json:"region"`
 	Zone              string   `json:"zone"`
 	CredentialsFile   string   `json:"credentials_file"`
+	CredentialsJSON   string   `json:"credentials_json"` // Inline JSON credentials
 	StateDir          string   `json:"state_dir"`
 	SSHKeyPath        string   `json:"ssh_key_path"`
 	SSHUser           string   `json:"ssh_user"`
 	AllowedIPRanges   []string `json:"allowed_ip_ranges"`
 	BuilderPort       int      `json:"builder_port"`
 	ServerCallbackURL string   `json:"server_callback_url"`
+	InstanceTTL       int      `json:"instance_ttl"` // TTL in minutes, 0 means no auto-termination
 }
 
 // DefaultGCPInstanceSpec returns the default GCP instance specification.

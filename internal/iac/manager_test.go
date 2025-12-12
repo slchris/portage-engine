@@ -461,3 +461,138 @@ func TestInstanceLifecycle(t *testing.T) {
 		}
 	}
 }
+
+func TestManagerWithTTL(t *testing.T) {
+	ttl := 30 * time.Minute
+	manager := NewManager(WithDefaultTTL(ttl))
+
+	if manager.defaultTTL != ttl {
+		t.Errorf("defaultTTL = %v, want %v", manager.defaultTTL, ttl)
+	}
+}
+
+func TestManagerWithCleanupInterval(t *testing.T) {
+	interval := 10 * time.Minute
+	manager := NewManager(WithCleanupInterval(interval))
+
+	if manager.cleanupInterval != interval {
+		t.Errorf("cleanupInterval = %v, want %v", manager.cleanupInterval, interval)
+	}
+}
+
+func TestUpdateInstanceActivity(t *testing.T) {
+	manager := NewManager()
+
+	instanceID := "test-activity-instance"
+	oldTime := time.Now().Add(-1 * time.Hour)
+
+	manager.instances[instanceID] = &Instance{
+		ID:           instanceID,
+		Provider:     "gcp",
+		Status:       "running",
+		LastActivity: oldTime,
+	}
+
+	manager.UpdateInstanceActivity(instanceID)
+
+	inst := manager.instances[instanceID]
+	if inst.LastActivity.Before(oldTime) || inst.LastActivity.Equal(oldTime) {
+		t.Error("LastActivity was not updated")
+	}
+}
+
+func TestSetInstanceActiveTasks(t *testing.T) {
+	manager := NewManager()
+
+	instanceID := "test-tasks-instance"
+	manager.instances[instanceID] = &Instance{
+		ID:          instanceID,
+		Provider:    "gcp",
+		Status:      "running",
+		ActiveTasks: 0,
+	}
+
+	manager.SetInstanceActiveTasks(instanceID, 5)
+
+	inst := manager.instances[instanceID]
+	if inst.ActiveTasks != 5 {
+		t.Errorf("ActiveTasks = %d, want 5", inst.ActiveTasks)
+	}
+}
+
+func TestGetExpiredInstances(t *testing.T) {
+	manager := NewManager()
+
+	// Instance with no TTL (no auto-termination)
+	manager.instances["no-ttl"] = &Instance{
+		ID:           "no-ttl",
+		Provider:     "gcp",
+		Status:       "running",
+		TTL:          0,
+		LastActivity: time.Now().Add(-2 * time.Hour),
+		ActiveTasks:  0,
+	}
+
+	// Instance with TTL but has active tasks
+	manager.instances["active-tasks"] = &Instance{
+		ID:           "active-tasks",
+		Provider:     "gcp",
+		Status:       "running",
+		TTL:          30 * time.Minute,
+		LastActivity: time.Now().Add(-1 * time.Hour),
+		ActiveTasks:  1,
+	}
+
+	// Expired instance
+	manager.instances["expired"] = &Instance{
+		ID:           "expired",
+		Provider:     "gcp",
+		Status:       "running",
+		TTL:          30 * time.Minute,
+		LastActivity: time.Now().Add(-1 * time.Hour),
+		ActiveTasks:  0,
+	}
+
+	// Not yet expired instance
+	manager.instances["not-expired"] = &Instance{
+		ID:           "not-expired",
+		Provider:     "gcp",
+		Status:       "running",
+		TTL:          2 * time.Hour,
+		LastActivity: time.Now().Add(-1 * time.Hour),
+		ActiveTasks:  0,
+	}
+
+	expired := manager.GetExpiredInstances()
+
+	if len(expired) != 1 {
+		t.Errorf("Expected 1 expired instance, got %d", len(expired))
+	}
+
+	if len(expired) > 0 && expired[0].ID != "expired" {
+		t.Errorf("Expected expired instance ID 'expired', got '%s'", expired[0].ID)
+	}
+}
+
+func TestInstanceTTLFields(t *testing.T) {
+	now := time.Now()
+	inst := &Instance{
+		ID:           "test-ttl",
+		Provider:     "gcp",
+		Status:       "running",
+		CreatedAt:    now,
+		TTL:          60 * time.Minute,
+		LastActivity: now,
+		ActiveTasks:  0,
+	}
+
+	if inst.TTL != 60*time.Minute {
+		t.Errorf("TTL = %v, want 60m", inst.TTL)
+	}
+	if inst.CreatedAt != now {
+		t.Errorf("CreatedAt mismatch")
+	}
+	if inst.ActiveTasks != 0 {
+		t.Errorf("ActiveTasks = %d, want 0", inst.ActiveTasks)
+	}
+}

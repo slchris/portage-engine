@@ -43,6 +43,7 @@ type ProvisionRequest struct {
 	ServerCallback  string            `json:"server_callback"`
 	BuilderPort     int               `json:"builder_port"`
 	AllowedIPRanges []string          `json:"allowed_ip_ranges"`
+	TTL             time.Duration     `json:"ttl"` // Instance TTL, 0 uses default
 }
 
 // Instance represents a provisioned instance.
@@ -59,24 +60,161 @@ type Instance struct {
 	SSHUser         string            `json:"ssh_user"`
 	BuilderEndpoint string            `json:"builder_endpoint"`
 	LastHeartbeat   time.Time         `json:"last_heartbeat"`
+	CreatedAt       time.Time         `json:"created_at"`
+	TTL             time.Duration     `json:"ttl"`           // Time to live, 0 means no auto-termination
+	LastActivity    time.Time         `json:"last_activity"` // Last time the instance had activity
+	ActiveTasks     int               `json:"active_tasks"`  // Number of active tasks on this instance
 }
 
 // Manager manages infrastructure provisioning using Terraform.
 type Manager struct {
-	instances    map[string]*Instance
-	mu           sync.RWMutex
-	workspaceDir string
+	instances       map[string]*Instance
+	mu              sync.RWMutex
+	workspaceDir    string
+	defaultTTL      time.Duration
+	stopChan        chan struct{}
+	cleanupInterval time.Duration
+}
+
+// ManagerOption is a functional option for configuring the Manager.
+type ManagerOption func(*Manager)
+
+// WithDefaultTTL sets the default TTL for instances.
+func WithDefaultTTL(ttl time.Duration) ManagerOption {
+	return func(m *Manager) {
+		m.defaultTTL = ttl
+	}
+}
+
+// WithCleanupInterval sets the interval for checking and cleaning up expired instances.
+func WithCleanupInterval(interval time.Duration) ManagerOption {
+	return func(m *Manager) {
+		m.cleanupInterval = interval
+	}
 }
 
 // NewManager creates a new IaC manager.
-func NewManager() *Manager {
+func NewManager(opts ...ManagerOption) *Manager {
 	workspaceDir := filepath.Join(os.TempDir(), "portage-terraform")
 	_ = os.MkdirAll(workspaceDir, 0750)
 
-	return &Manager{
-		instances:    make(map[string]*Instance),
-		workspaceDir: workspaceDir,
+	m := &Manager{
+		instances:       make(map[string]*Instance),
+		workspaceDir:    workspaceDir,
+		defaultTTL:      60 * time.Minute, // Default 1 hour
+		stopChan:        make(chan struct{}),
+		cleanupInterval: 5 * time.Minute,
 	}
+
+	for _, opt := range opts {
+		opt(m)
+	}
+
+	return m
+}
+
+// StartCleanupRoutine starts the background cleanup routine for expired instances.
+func (m *Manager) StartCleanupRoutine() {
+	go m.cleanupRoutine()
+}
+
+// StopCleanupRoutine stops the background cleanup routine.
+func (m *Manager) StopCleanupRoutine() {
+	close(m.stopChan)
+}
+
+// cleanupRoutine periodically checks and terminates expired instances.
+func (m *Manager) cleanupRoutine() {
+	ticker := time.NewTicker(m.cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.cleanupExpiredInstances()
+		case <-m.stopChan:
+			return
+		}
+	}
+}
+
+// cleanupExpiredInstances terminates instances that have exceeded their TTL without activity.
+func (m *Manager) cleanupExpiredInstances() {
+	m.mu.RLock()
+	var expiredIDs []string
+	now := time.Now()
+
+	for id, inst := range m.instances {
+		// Skip if TTL is 0 (no auto-termination)
+		if inst.TTL == 0 {
+			continue
+		}
+
+		// Skip if instance has active tasks
+		if inst.ActiveTasks > 0 {
+			continue
+		}
+
+		// Check if instance has exceeded TTL since last activity
+		if now.Sub(inst.LastActivity) > inst.TTL {
+			expiredIDs = append(expiredIDs, id)
+		}
+	}
+	m.mu.RUnlock()
+
+	// Terminate expired instances
+	for _, id := range expiredIDs {
+		fmt.Printf("Auto-terminating expired instance: %s\n", id)
+		if err := m.Terminate(id); err != nil {
+			fmt.Printf("Failed to terminate expired instance %s: %v\n", id, err)
+		}
+	}
+}
+
+// UpdateInstanceActivity updates the last activity time for an instance.
+func (m *Manager) UpdateInstanceActivity(instanceID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if inst, ok := m.instances[instanceID]; ok {
+		inst.LastActivity = time.Now()
+	}
+}
+
+// SetInstanceActiveTasks sets the number of active tasks for an instance.
+func (m *Manager) SetInstanceActiveTasks(instanceID string, count int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if inst, ok := m.instances[instanceID]; ok {
+		inst.ActiveTasks = count
+		if count > 0 {
+			inst.LastActivity = time.Now()
+		}
+	}
+}
+
+// GetExpiredInstances returns a list of instances that have exceeded their TTL.
+func (m *Manager) GetExpiredInstances() []*Instance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var expired []*Instance
+	now := time.Now()
+
+	for _, inst := range m.instances {
+		if inst.TTL == 0 {
+			continue
+		}
+		if inst.ActiveTasks > 0 {
+			continue
+		}
+		if now.Sub(inst.LastActivity) > inst.TTL {
+			expired = append(expired, inst)
+		}
+	}
+
+	return expired
 }
 
 // Provision provisions a new instance using Terraform.
@@ -133,6 +271,13 @@ func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
 
 	privateIP, _ := m.getTerraformOutput(terraformDir, env, "private_ip")
 
+	// Determine TTL
+	ttl := req.TTL
+	if ttl == 0 {
+		ttl = m.defaultTTL
+	}
+
+	now := time.Now()
 	instance := &Instance{
 		ID:              instanceID,
 		Provider:        req.Provider,
@@ -145,7 +290,11 @@ func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
 		TerraformDir:    terraformDir,
 		SSHUser:         req.SSH.User,
 		BuilderEndpoint: fmt.Sprintf("http://%s:%d", ipAddress, req.BuilderPort),
-		LastHeartbeat:   time.Now(),
+		LastHeartbeat:   now,
+		CreatedAt:       now,
+		TTL:             ttl,
+		LastActivity:    now,
+		ActiveTasks:     0,
 	}
 
 	m.mu.Lock()

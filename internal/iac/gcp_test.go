@@ -935,3 +935,47 @@ func TestGCPInstanceSpecFromServerConfig_Defaults(t *testing.T) {
 		t.Errorf("Network = %s, want default", spec.Network)
 	}
 }
+
+func TestGCPConfigWithCredentials(t *testing.T) {
+	t.Parallel()
+
+	config := &GCPConfig{
+		Project:           "my-project",
+		Region:            "us-central1",
+		Zone:              "us-central1-a",
+		CredentialsFile:   "/path/to/key.json",
+		CredentialsJSON:   "",
+		StateDir:          "/tmp/terraform",
+		BuilderPort:       9090,
+		InstanceTTL:       60,
+		AllowedIPRanges:   []string{"10.0.0.0/8"},
+		ServerCallbackURL: "http://server:8080",
+	}
+
+	if config.CredentialsFile != "/path/to/key.json" {
+		t.Errorf("CredentialsFile = %s", config.CredentialsFile)
+	}
+	if config.InstanceTTL != 60 {
+		t.Errorf("InstanceTTL = %d, want 60", config.InstanceTTL)
+	}
+}
+
+func TestGCPConfigWithInlineCredentials(t *testing.T) {
+	t.Parallel()
+
+	jsonCreds := `{"type":"service_account","project_id":"test"}`
+	config := &GCPConfig{
+		Project:         "my-project",
+		Region:          "us-central1",
+		Zone:            "us-central1-a",
+		CredentialsJSON: jsonCreds,
+		InstanceTTL:     30,
+	}
+
+	if config.CredentialsJSON != jsonCreds {
+		t.Errorf("CredentialsJSON mismatch")
+	}
+	if config.InstanceTTL != 30 {
+		t.Errorf("InstanceTTL = %d, want 30", config.InstanceTTL)
+	}
+}
