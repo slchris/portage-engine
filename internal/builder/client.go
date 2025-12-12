@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/slchris/portage-engine/internal/metrics"
 )
 
 // HeartbeatRequest represents a heartbeat request from builder to server.
@@ -33,6 +35,7 @@ type Client struct {
 	httpClient    *http.Client
 	heartbeatStop chan struct{}
 	heartbeatWg   sync.WaitGroup
+	metrics       *metrics.Metrics
 }
 
 // NewBuilderClient creates a new builder client
@@ -43,13 +46,31 @@ func NewBuilderClient(baseURL string) *Client {
 			Timeout: 30 * time.Second,
 		},
 		heartbeatStop: make(chan struct{}),
+		metrics:       metrics.New(&metrics.Config{Enabled: false}),
+	}
+}
+
+// NewBuilderClientWithMetrics creates a new builder client with metrics enabled
+func NewBuilderClientWithMetrics(baseURL string, m *metrics.Metrics) *Client {
+	return &Client{
+		baseURL: baseURL,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		heartbeatStop: make(chan struct{}),
+		metrics:       m,
 	}
 }
 
 // SubmitBuild sends a build request to the remote builder
 func (bc *Client) SubmitBuild(req *LocalBuildRequest) (string, error) {
+	start := time.Now()
+	bc.metrics.IncHTTPRequests()
+	bc.metrics.IncBuildsTotal()
+
 	data, err := json.Marshal(req)
 	if err != nil {
+		bc.metrics.IncHTTPRequestErrors()
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
@@ -59,6 +80,7 @@ func (bc *Client) SubmitBuild(req *LocalBuildRequest) (string, error) {
 		bytes.NewReader(data),
 	)
 	if err != nil {
+		bc.metrics.IncHTTPRequestErrors()
 		return "", fmt.Errorf("failed to send request: %w", err)
 	}
 	defer func() {
@@ -66,20 +88,25 @@ func (bc *Client) SubmitBuild(req *LocalBuildRequest) (string, error) {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
+		bc.metrics.IncHTTPRequestErrors()
+		bc.metrics.IncBuildsFailed()
 		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("build submission failed: %s", string(body))
 	}
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		bc.metrics.IncHTTPRequestErrors()
 		return "", fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	jobID, ok := result["job_id"].(string)
 	if !ok {
+		bc.metrics.IncHTTPRequestErrors()
 		return "", fmt.Errorf("invalid response: missing job_id")
 	}
 
+	bc.metrics.RecordHTTPLatency("/api/v1/build", time.Since(start))
 	return jobID, nil
 }
 
@@ -168,8 +195,13 @@ func (bc *Client) WaitForCompletion(jobID string, timeout time.Duration) (*Build
 
 // SendHeartbeat sends a single heartbeat to the server.
 func (bc *Client) SendHeartbeat(req *HeartbeatRequest) error {
+	bc.metrics.IncHTTPRequests()
+	bc.metrics.IncHeartbeatsTotal()
+
 	data, err := json.Marshal(req)
 	if err != nil {
+		bc.metrics.IncHTTPRequestErrors()
+		bc.metrics.IncHeartbeatsFailed()
 		return fmt.Errorf("failed to marshal heartbeat: %w", err)
 	}
 
@@ -179,6 +211,8 @@ func (bc *Client) SendHeartbeat(req *HeartbeatRequest) error {
 		bytes.NewReader(data),
 	)
 	if err != nil {
+		bc.metrics.IncHTTPRequestErrors()
+		bc.metrics.IncHeartbeatsFailed()
 		return fmt.Errorf("failed to send heartbeat: %w", err)
 	}
 	defer func() {
@@ -186,16 +220,21 @@ func (bc *Client) SendHeartbeat(req *HeartbeatRequest) error {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
+		bc.metrics.IncHTTPRequestErrors()
+		bc.metrics.IncHeartbeatsFailed()
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("heartbeat failed: %s", string(body))
 	}
 
 	var result HeartbeatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		bc.metrics.IncHTTPRequestErrors()
+		bc.metrics.IncHeartbeatsFailed()
 		return fmt.Errorf("failed to decode heartbeat response: %w", err)
 	}
 
 	if !result.Success {
+		bc.metrics.IncHeartbeatsFailed()
 		return fmt.Errorf("heartbeat rejected: %s", result.Message)
 	}
 

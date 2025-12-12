@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"runtime"
+	"time"
 
 	"github.com/slchris/portage-engine/internal/binpkg"
 	"github.com/slchris/portage-engine/internal/builder"
+	"github.com/slchris/portage-engine/internal/metrics"
 	"github.com/slchris/portage-engine/pkg/config"
 )
 
@@ -16,14 +19,21 @@ type Server struct {
 	config      *config.ServerConfig
 	binpkgStore *binpkg.Store
 	builder     *builder.Manager
+	metrics     *metrics.Metrics
 }
 
 // New creates a new Server instance.
 func New(cfg *config.ServerConfig) *Server {
+	metricsCfg := &metrics.Config{
+		Enabled: cfg.MetricsEnabled,
+		Port:    cfg.MetricsPort,
+	}
+
 	return &Server{
 		config:      cfg,
 		binpkgStore: binpkg.NewStore(cfg.BinpkgPath),
 		builder:     builder.NewManager(cfg),
+		metrics:     metrics.New(metricsCfg),
 	}
 }
 
@@ -46,6 +56,11 @@ func (s *Server) Router() http.Handler {
 	// Heartbeat endpoint
 	mux.HandleFunc("/api/v1/heartbeat", s.handleHeartbeat)
 
+	// Metrics endpoint
+	if s.metrics.IsEnabled() {
+		mux.Handle("/metrics", s.metrics.Handler())
+	}
+
 	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
 
@@ -54,18 +69,24 @@ func (s *Server) Router() http.Handler {
 
 // handlePackageQuery handles package availability queries.
 func (s *Server) handlePackageQuery(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	s.metrics.IncHTTPRequests()
+
 	if r.Method != http.MethodPost {
+		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req binpkg.QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	// Query binpkg store
+	s.metrics.IncStorageReads()
 	pkg, found := s.binpkgStore.Query(&req)
 
 	response := binpkg.QueryResponse{
@@ -73,29 +94,39 @@ func (s *Server) handlePackageQuery(w http.ResponseWriter, r *http.Request) {
 		Package: pkg,
 	}
 
+	s.metrics.RecordHTTPLatency("/api/v1/packages/query", time.Since(start))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
 }
 
 // handleBuildRequest handles build requests for missing packages.
 func (s *Server) handleBuildRequest(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	s.metrics.IncHTTPRequests()
+
 	if r.Method != http.MethodPost {
+		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req builder.BuildRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	// Submit build request
+	s.metrics.IncBuildsTotal()
 	jobID, err := s.builder.SubmitBuild(&req)
 	if err != nil {
+		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	s.metrics.RecordHTTPLatency("/api/v1/packages/request-build", time.Since(start))
 
 	response := builder.BuildResponse{
 		JobID:  jobID,
@@ -109,13 +140,17 @@ func (s *Server) handleBuildRequest(w http.ResponseWriter, r *http.Request) {
 
 // handleBuildStatus handles build status queries.
 func (s *Server) handleBuildStatus(w http.ResponseWriter, r *http.Request) {
+	s.metrics.IncHTTPRequests()
+
 	if r.Method != http.MethodGet {
+		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	jobID := r.URL.Query().Get("job_id")
 	if jobID == "" {
+		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, "Missing job_id parameter", http.StatusBadRequest)
 		return
 	}
@@ -231,19 +266,26 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleHeartbeat handles builder heartbeat requests.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	s.metrics.IncHTTPRequests()
+	s.metrics.IncHeartbeatsTotal()
+
 	if r.Method != http.MethodPost {
+		s.metrics.IncHTTPRequestErrors()
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req builder.HeartbeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.metrics.IncHTTPRequestErrors()
+		s.metrics.IncHeartbeatsFailed()
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
 	// Update builder heartbeat in the scheduler
 	if err := s.builder.UpdateBuilderHeartbeat(&req); err != nil {
+		s.metrics.IncHeartbeatsFailed()
 		response := builder.HeartbeatResponse{
 			Success: false,
 			Message: err.Error(),
@@ -265,6 +307,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s %s", r.Method, r.RequestURI, r.RemoteAddr)
+		s.metrics.UpdateGoroutines(int64(runtime.NumGoroutine()))
 		next.ServeHTTP(w, r)
 	})
 }

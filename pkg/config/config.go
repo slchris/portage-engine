@@ -41,6 +41,8 @@ type ServerConfig struct {
 	CloudSSHUser      string
 	ServerCallbackURL string
 	RemoteBuilders    []string
+	MetricsEnabled    bool
+	MetricsPort       string
 }
 
 // DashboardConfig represents the dashboard configuration.
@@ -50,6 +52,8 @@ type DashboardConfig struct {
 	AuthEnabled    bool
 	JWTSecret      string
 	AllowAnonymous bool
+	MetricsEnabled bool
+	MetricsPort    string
 }
 
 // BuilderConfig represents the builder configuration.
@@ -70,6 +74,8 @@ type BuilderConfig struct {
 	StorageS3Prefix string
 	StorageHTTPBase string
 	NotifyConfig    string
+	MetricsEnabled  bool
+	MetricsPort     string
 }
 
 // loadEnvFile loads key=value pairs from a .conf file.
@@ -197,6 +203,9 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	config.CloudSSHUser = getEnvString(env, "CLOUD_SSH_USER", "root")
 	config.ServerCallbackURL = getEnvString(env, "SERVER_CALLBACK_URL", "")
 
+	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
+	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
+
 	// Parse remote builders
 	if builders := getEnvString(env, "REMOTE_BUILDERS", ""); builders != "" {
 		config.RemoteBuilders = strings.Split(builders, ",")
@@ -235,6 +244,9 @@ func LoadDashboardConfig(path string) (*DashboardConfig, error) {
 	config.AuthEnabled = getEnvBool(env, "AUTH_ENABLED", config.AuthEnabled)
 	config.JWTSecret = getEnvString(env, "JWT_SECRET", config.JWTSecret)
 	config.AllowAnonymous = getEnvBool(env, "ALLOW_ANONYMOUS", config.AllowAnonymous)
+
+	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
+	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
 
 	return config, nil
 }
@@ -284,6 +296,9 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.StorageHTTPBase = getEnvString(env, "STORAGE_HTTP_BASE", "")
 
 	config.NotifyConfig = getEnvString(env, "NOTIFY_CONFIG", "")
+
+	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
+	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
 
 	return config, nil
 }
