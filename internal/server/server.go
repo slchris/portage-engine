@@ -16,10 +16,11 @@ import (
 
 // Server represents the Portage Engine server.
 type Server struct {
-	config      *config.ServerConfig
-	binpkgStore *binpkg.Store
-	builder     *builder.Manager
-	metrics     *metrics.Metrics
+	config          *config.ServerConfig
+	binpkgStore     *binpkg.Store
+	builder         *builder.Manager
+	builderRegistry *builder.Registry
+	metrics         *metrics.Metrics
 }
 
 // New creates a new Server instance.
@@ -31,10 +32,11 @@ func New(cfg *config.ServerConfig) *Server {
 	}
 
 	return &Server{
-		config:      cfg,
-		binpkgStore: binpkg.NewStore(cfg.BinpkgPath),
-		builder:     builder.NewManager(cfg),
-		metrics:     metrics.New(metricsCfg),
+		config:          cfg,
+		binpkgStore:     binpkg.NewStore(cfg.BinpkgPath),
+		builder:         builder.NewManager(cfg),
+		builderRegistry: builder.NewRegistry(60*time.Second, 30*time.Second),
+		metrics:         metrics.New(metricsCfg),
 	}
 }
 
@@ -53,6 +55,11 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/v1/builds/logs", s.handleBuildLogs)
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/scheduler/status", s.handleSchedulerStatus)
+
+	// Builder endpoints
+	mux.HandleFunc("/api/v1/builders/register", s.handleBuilderRegister)
+	mux.HandleFunc("/api/v1/builders/list", s.handleBuildersList)
+	mux.HandleFunc("/api/v1/builders/status", s.handleBuildersStatus)
 
 	// Heartbeat endpoint
 	mux.HandleFunc("/api/v1/heartbeat", s.handleHeartbeat)
@@ -265,6 +272,70 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(status)
 }
 
+// handleBuilderRegister handles builder registration requests.
+func (s *Server) handleBuilderRegister(w http.ResponseWriter, r *http.Request) {
+	s.metrics.IncHTTPRequests()
+
+	if r.Method != http.MethodPost {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var info builder.BuilderInfo
+	if err := json.NewDecoder(r.Body).Decode(&info); err != nil {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Register the builder
+	s.builderRegistry.Register(&info)
+
+	response := map[string]interface{}{
+		"success": true,
+		"message": "Builder registered successfully",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// handleBuildersList returns the list of all registered builders.
+func (s *Server) handleBuildersList(w http.ResponseWriter, r *http.Request) {
+	s.metrics.IncHTTPRequests()
+
+	if r.Method != http.MethodGet {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	builders := s.builderRegistry.List()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(builders)
+}
+
+// handleBuildersStatus returns aggregate status and statistics for all builders.
+func (s *Server) handleBuildersStatus(w http.ResponseWriter, r *http.Request) {
+	s.metrics.IncHTTPRequests()
+
+	if r.Method != http.MethodGet {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	stats := s.builderRegistry.GetStats()
+	builders := s.builderRegistry.List()
+
+	response := map[string]interface{}{
+		"stats":    stats,
+		"builders": builders,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
 // handleHeartbeat handles builder heartbeat requests.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	s.metrics.IncHTTPRequests()
@@ -283,6 +354,16 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
+
+	// Update builder registry with heartbeat info
+	builderInfo := &builder.BuilderInfo{
+		ID:          req.BuilderID,
+		Endpoint:    req.Endpoint,
+		Status:      req.Status,
+		Capacity:    req.Capacity,
+		CurrentLoad: req.ActiveJobs,
+	}
+	s.builderRegistry.Register(builderInfo)
 
 	// Update builder heartbeat in the scheduler
 	if err := s.builder.UpdateBuilderHeartbeat(&req); err != nil {

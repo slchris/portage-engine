@@ -37,6 +37,7 @@ func New(cfg *config.DashboardConfig) *Dashboard {
 	tmpl := template.Must(template.New("dashboard").Parse(dashboardHTML))
 	template.Must(tmpl.New("build-detail").Parse(buildDetailHTML))
 	template.Must(tmpl.New("logs").Parse(logsHTML))
+	template.Must(tmpl.New("monitor").Parse(monitorHTML))
 
 	return &Dashboard{
 		config:     cfg,
@@ -55,6 +56,7 @@ func (d *Dashboard) Router() http.Handler {
 	mux.HandleFunc("/builds", d.handleBuildsPage)
 	mux.HandleFunc("/build/", d.handleBuildDetail)
 	mux.HandleFunc("/logs/", d.handleBuildLogs)
+	mux.HandleFunc("/monitor", d.handleBuildersMonitor)
 
 	// API endpoints
 	mux.HandleFunc("/api/status", d.handleStatus)
@@ -63,6 +65,7 @@ func (d *Dashboard) Router() http.Handler {
 	mux.HandleFunc("/api/builds/logs", d.handleBuildLogsAPI)
 	mux.HandleFunc("/api/instances", d.handleInstances)
 	mux.HandleFunc("/api/scheduler/status", d.handleSchedulerStatus)
+	mux.HandleFunc("/api/builders/status", d.handleBuildersStatusAPI)
 
 	// Static files
 	mux.HandleFunc("/static/", d.handleStatic)
@@ -266,6 +269,91 @@ func (d *Dashboard) handleBuildLogsAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(sampleLogs)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// handleBuildersMonitor serves the builders status monitor page.
+func (d *Dashboard) handleBuildersMonitor(w http.ResponseWriter, _ *http.Request) {
+	data := map[string]interface{}{
+		"Title":     "Builders Monitor",
+		"ServerURL": d.config.ServerURL,
+	}
+	if err := d.templates.ExecuteTemplate(w, "monitor", data); err != nil {
+		http.Error(w, "Failed to render template", http.StatusInternalServerError)
+	}
+}
+
+// handleBuildersStatusAPI returns builders status from the server.
+func (d *Dashboard) handleBuildersStatusAPI(w http.ResponseWriter, _ *http.Request) {
+	url := fmt.Sprintf("%s/api/v1/builders/status", d.config.ServerURL)
+	resp, err := d.httpClient.Get(url)
+	if err != nil {
+		log.Printf("Failed to query builders status: %v", err)
+		// Return sample data on error
+		sampleData := map[string]interface{}{
+			"stats": map[string]interface{}{
+				"total_builders":   3,
+				"online_builders":  2,
+				"offline_builders": 1,
+				"total_capacity":   10,
+				"total_load":       5,
+				"success_rate":     92.5,
+			},
+			"builders": []map[string]interface{}{
+				{
+					"id":             "builder-1",
+					"endpoint":       "http://localhost:9090",
+					"architecture":   "amd64",
+					"status":         "online",
+					"capacity":       4,
+					"current_load":   2,
+					"enabled":        true,
+					"cpu_usage":      45.2,
+					"memory_usage":   62.8,
+					"disk_usage":     55.3,
+					"total_builds":   150,
+					"success_builds": 142,
+					"failed_builds":  8,
+				},
+				{
+					"id":             "builder-2",
+					"endpoint":       "http://localhost:9091",
+					"architecture":   "arm64",
+					"status":         "online",
+					"capacity":       2,
+					"current_load":   1,
+					"enabled":        true,
+					"cpu_usage":      30.5,
+					"memory_usage":   48.2,
+					"disk_usage":     42.7,
+					"total_builds":   85,
+					"success_builds": 80,
+					"failed_builds":  5,
+				},
+				{
+					"id":             "builder-3",
+					"endpoint":       "http://localhost:9092",
+					"architecture":   "amd64",
+					"status":         "offline",
+					"capacity":       4,
+					"current_load":   0,
+					"enabled":        false,
+					"cpu_usage":      0.0,
+					"memory_usage":   0.0,
+					"disk_usage":     0.0,
+					"total_builds":   200,
+					"success_builds": 185,
+					"failed_builds":  15,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(sampleData)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -824,6 +912,239 @@ const logsHTML = `<!DOCTYPE html>
 
         loadLogs();
         setInterval(loadLogs, 2000);
+    </script>
+</body>
+</html>`
+
+// monitorHTML is the HTML page for builders status monitor (similar to OpenBuildService).
+const monitorHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <title>{{.Title}} - Portage Engine</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; }
+        .header { background: #24292e; color: white; padding: 15px 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+        .header h1 { font-size: 24px; margin-bottom: 5px; }
+        .header .subtitle { font-size: 14px; color: #959da5; }
+        .nav { background: white; padding: 10px 20px; border-bottom: 1px solid #e1e4e8; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+        .nav a { color: #0366d6; text-decoration: none; margin-right: 20px; font-size: 14px; }
+        .nav a:hover { text-decoration: underline; }
+        .container { max-width: 1400px; margin: 20px auto; padding: 0 20px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); border-left: 4px solid #0366d6; }
+        .stat-card .label { font-size: 12px; color: #586069; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+        .stat-card .value { font-size: 32px; font-weight: bold; color: #24292e; }
+        .stat-card .subvalue { font-size: 14px; color: #586069; margin-top: 5px; }
+        .section-title { font-size: 18px; font-weight: 600; color: #24292e; margin-bottom: 15px; padding-bottom: 8px; border-bottom: 2px solid #e1e4e8; }
+        .builders-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }
+        .builder-card { background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); overflow: hidden; transition: box-shadow 0.2s; }
+        .builder-card:hover { box-shadow: 0 4px 8px rgba(0,0,0,0.15); }
+        .builder-header { padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+        .builder-header.offline { background: linear-gradient(135deg, #868e96 0%, #495057 100%); }
+        .builder-header.busy { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
+        .builder-id { font-size: 16px; font-weight: 600; margin-bottom: 5px; }
+        .builder-arch { font-size: 13px; opacity: 0.9; }
+        .builder-status { display: inline-block; padding: 3px 10px; background: rgba(255,255,255,0.25); border-radius: 12px; font-size: 11px; margin-top: 8px; }
+        .builder-body { padding: 15px; }
+        .metric { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .metric-label { font-size: 13px; color: #586069; }
+        .metric-value { font-size: 14px; font-weight: 600; color: #24292e; }
+        .progress-bar { width: 100%; height: 8px; background: #e1e4e8; border-radius: 4px; overflow: hidden; margin-top: 5px; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #0366d6 0%, #00a8e8 100%); transition: width 0.3s ease; }
+        .progress-fill.high { background: linear-gradient(90deg, #f5576c 0%, #f093fb 100%); }
+        .progress-fill.warning { background: linear-gradient(90deg, #f39c12 0%, #f1c40f 100%); }
+        .endpoint { font-size: 11px; color: #959da5; word-break: break-all; margin-top: 8px; padding-top: 8px; border-top: 1px solid #e1e4e8; }
+        .build-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #e1e4e8; }
+        .build-stat { text-align: center; }
+        .build-stat-value { font-size: 18px; font-weight: bold; color: #24292e; }
+        .build-stat-label { font-size: 10px; color: #586069; text-transform: uppercase; margin-top: 2px; }
+        .refresh-indicator { float: right; font-size: 12px; color: #586069; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+        .status-online { background: #28a745; }
+        .status-offline { background: #dc3545; }
+        .status-busy { background: #ffc107; }
+        .no-builders { text-align: center; padding: 60px 20px; background: white; border-radius: 8px; color: #586069; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>{{.Title}}</h1>
+        <p class="subtitle">Builders Status Monitor - OpenBuildService Style</p>
+    </div>
+
+    <div class="nav">
+        <a href="/">← Dashboard</a>
+        <a href="/builds">Build Jobs</a>
+        <a href="/monitor">Builders Monitor</a>
+    </div>
+
+    <div class="container">
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="label">Total Builders</div>
+                <div class="value" id="total-builders">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Online</div>
+                <div class="value" id="online-builders">-</div>
+                <div class="subvalue" id="offline-builders-text">- offline</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total Capacity</div>
+                <div class="value" id="total-capacity">-</div>
+                <div class="subvalue" id="total-load-text">- in use</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Success Rate</div>
+                <div class="value" id="success-rate">-</div>
+                <div class="subvalue" id="total-builds-text">- total builds</div>
+            </div>
+        </div>
+
+        <div class="section-title">
+            Builders
+            <span class="refresh-indicator" id="refresh-info">Auto-refresh: 5s</span>
+        </div>
+
+        <div class="builders-grid" id="builders-grid">
+            <div class="no-builders">Loading builders...</div>
+        </div>
+    </div>
+
+    <script>
+        const serverURL = "{{.ServerURL}}";
+
+        function getProgressBarClass(value) {
+            if (value >= 80) return 'high';
+            if (value >= 60) return 'warning';
+            return '';
+        }
+
+        function formatPercentage(value) {
+            return value ? value.toFixed(1) + '%' : '0%';
+        }
+
+        function renderBuilders(data) {
+            const stats = data.stats || {};
+            const builders = data.builders || [];
+
+            // Update stats
+            document.getElementById('total-builders').textContent = stats.total_builders || 0;
+            document.getElementById('online-builders').textContent = stats.online_builders || 0;
+            document.getElementById('offline-builders-text').textContent =
+                (stats.offline_builders || 0) + ' offline';
+            document.getElementById('total-capacity').textContent = stats.total_capacity || 0;
+            document.getElementById('total-load-text').textContent =
+                (stats.total_load || 0) + ' in use';
+            document.getElementById('success-rate').textContent =
+                formatPercentage(stats.success_rate);
+            document.getElementById('total-builds-text').textContent =
+                (stats.total_builds || 0) + ' total builds';
+
+            // Render builders
+            const grid = document.getElementById('builders-grid');
+            if (builders.length === 0) {
+                grid.innerHTML = '<div class="no-builders">No builders registered</div>';
+                return;
+            }
+
+            grid.innerHTML = builders.map(builder => {
+                const statusClass = builder.status === 'offline' ? 'offline' :
+                                  builder.status === 'busy' ? 'busy' : '';
+                const statusDotClass = builder.status === 'offline' ? 'status-offline' :
+                                      builder.status === 'busy' ? 'status-busy' : 'status-online';
+                const loadPercentage = builder.capacity > 0 ?
+                    (builder.current_load / builder.capacity * 100) : 0;
+                const successRate = builder.total_builds > 0 ?
+                    (builder.success_builds / builder.total_builds * 100) : 0;
+
+                return ` + "`" + `
+                    <div class="builder-card">
+                        <div class="builder-header ${statusClass}">
+                            <div class="builder-id">${builder.id}</div>
+                            <div class="builder-arch">Architecture: ${builder.architecture || 'unknown'}</div>
+                            <span class="builder-status">
+                                <span class="status-dot ${statusDotClass}"></span>
+                                ${builder.status}
+                                ${builder.enabled ? '' : ' (disabled)'}
+                            </span>
+                        </div>
+                        <div class="builder-body">
+                            <div class="metric">
+                                <span class="metric-label">Load</span>
+                                <span class="metric-value">${builder.current_load || 0} / ${builder.capacity || 0}</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div class="progress-fill ${getProgressBarClass(loadPercentage)}"
+                                     style="width: ${loadPercentage}%"></div>
+                            </div>
+
+                            <div class="metric" style="margin-top: 15px;">
+                                <span class="metric-label">CPU Usage</span>
+                                <span class="metric-value">${formatPercentage(builder.cpu_usage)}</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div class="progress-fill ${getProgressBarClass(builder.cpu_usage)}"
+                                     style="width: ${builder.cpu_usage || 0}%"></div>
+                            </div>
+
+                            <div class="metric">
+                                <span class="metric-label">Memory Usage</span>
+                                <span class="metric-value">${formatPercentage(builder.memory_usage)}</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div class="progress-fill ${getProgressBarClass(builder.memory_usage)}"
+                                     style="width: ${builder.memory_usage || 0}%"></div>
+                            </div>
+
+                            <div class="metric">
+                                <span class="metric-label">Disk Usage</span>
+                                <span class="metric-value">${formatPercentage(builder.disk_usage)}</span>
+                            </div>
+                            <div class="progress-bar">
+                                <div class="progress-fill ${getProgressBarClass(builder.disk_usage)}"
+                                     style="width: ${builder.disk_usage || 0}%"></div>
+                            </div>
+
+                            <div class="build-stats">
+                                <div class="build-stat">
+                                    <div class="build-stat-value">${builder.total_builds || 0}</div>
+                                    <div class="build-stat-label">Total</div>
+                                </div>
+                                <div class="build-stat">
+                                    <div class="build-stat-value" style="color: #28a745;">${builder.success_builds || 0}</div>
+                                    <div class="build-stat-label">Success</div>
+                                </div>
+                                <div class="build-stat">
+                                    <div class="build-stat-value" style="color: #dc3545;">${builder.failed_builds || 0}</div>
+                                    <div class="build-stat-label">Failed</div>
+                                </div>
+                            </div>
+
+                            <div class="endpoint">
+                                <strong>Endpoint:</strong> ${builder.endpoint || 'N/A'}
+                            </div>
+                        </div>
+                    </div>
+                ` + "`" + `;
+            }).join('');
+        }
+
+        async function updateBuildersStatus() {
+            try {
+                const resp = await fetch('/api/builders/status');
+                const data = await resp.json();
+                renderBuilders(data);
+            } catch (err) {
+                console.error('Failed to fetch builders status:', err);
+            }
+        }
+
+        updateBuildersStatus();
+        setInterval(updateBuildersStatus, 5000);
     </script>
 </body>
 </html>`
