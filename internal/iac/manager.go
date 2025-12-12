@@ -593,6 +593,43 @@ func (m *Manager) generateGCPConfig(req *ProvisionRequest, region, zone string) 
 		zone = region + "-a"
 	}
 
+	// Create GCPInstanceSpec from request
+	spec := GCPInstanceSpecFromMap(req.Spec)
+
+	// Override with request values if empty in spec
+	if spec.Region == "" || spec.Region == "us-central1" {
+		spec.Region = region
+	}
+	if spec.Zone == "" || spec.Zone == "us-central1-a" {
+		spec.Zone = zone
+	}
+
+	// Create GCP config
+	gcpConfig := &GCPConfig{
+		Project:     spec.Project,
+		Region:      spec.Region,
+		Zone:        spec.Zone,
+		StateDir:    m.workspaceDir,
+		BuilderPort: req.BuilderPort,
+	}
+
+	if req.SSH != nil {
+		gcpConfig.SSHKeyPath = req.SSH.KeyPath
+		gcpConfig.SSHUser = req.SSH.User
+	}
+
+	provisioner, err := NewGCPProvisioner(gcpConfig)
+	if err != nil {
+		// Fallback to basic config on error
+		return m.generateBasicGCPConfig(req, region, zone)
+	}
+
+	instanceName := fmt.Sprintf("portage-builder-%s-%d", req.Arch, time.Now().Unix())
+	return provisioner.GenerateMainTF(spec, instanceName)
+}
+
+// generateBasicGCPConfig generates basic GCP Terraform config (fallback).
+func (m *Manager) generateBasicGCPConfig(req *ProvisionRequest, region, zone string) string {
 	project := getOrDefault(req.Spec, "project", "portage-engine")
 
 	return fmt.Sprintf(`
@@ -600,7 +637,7 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = "~> 4.0"
+      version = "~> 5.0"
     }
   }
 }
@@ -617,8 +654,8 @@ resource "google_compute_instance" "portage_builder" {
 
   boot_disk {
     initialize_params {
-      image = "ubuntu-os-cloud/ubuntu-2004-lts"
-      size  = 50
+      image = "ubuntu-os-cloud/ubuntu-2204-lts"
+      size  = 100
     }
   }
 
@@ -646,6 +683,27 @@ output "private_ip" {
 
 // generateGCPFirewall generates GCP firewall rules.
 func (m *Manager) generateGCPFirewall(req *ProvisionRequest, allowedIPs []string) string {
+	gcpConfig := &GCPConfig{
+		Project:         getOrDefault(req.Spec, "project", "portage-engine"),
+		Region:          getOrDefault(req.Spec, "region", "us-central1"),
+		Zone:            getOrDefault(req.Spec, "zone", "us-central1-a"),
+		StateDir:        m.workspaceDir,
+		BuilderPort:     req.BuilderPort,
+		AllowedIPRanges: allowedIPs,
+	}
+
+	provisioner, err := NewGCPProvisioner(gcpConfig)
+	if err != nil {
+		// Fallback to basic firewall config
+		return m.generateBasicGCPFirewall(req, allowedIPs)
+	}
+
+	instanceName := fmt.Sprintf("portage-builder-%s-%d", req.Arch, time.Now().Unix())
+	return provisioner.GenerateFirewallTF(instanceName)
+}
+
+// generateBasicGCPFirewall generates basic GCP firewall rules (fallback).
+func (m *Manager) generateBasicGCPFirewall(req *ProvisionRequest, allowedIPs []string) string {
 	return fmt.Sprintf(`
 resource "google_compute_firewall" "portage_ssh" {
   name    = "portage-builder-ssh-%d"

@@ -11,47 +11,57 @@ import (
 
 // ServerConfig represents the server configuration.
 type ServerConfig struct {
-	Port              int
-	BinpkgPath        string
-	MaxWorkers        int
-	BuildMode         string
-	StorageType       string
-	StorageLocalDir   string
-	StorageS3Bucket   string
-	StorageS3Region   string
-	StorageS3Prefix   string
-	StorageHTTPBase   string
-	GPGEnabled        bool
-	GPGKeyID          string
-	GPGKeyPath        string
-	CloudProvider     string
-	CloudAliyunRegion string
-	CloudAliyunZone   string
-	CloudAliyunAK     string
-	CloudAliyunSK     string
-	CloudGCPProject   string
-	CloudGCPRegion    string
-	CloudGCPZone      string
-	CloudGCPKeyFile   string
-	CloudAWSRegion    string
-	CloudAWSZone      string
-	CloudAWSAccessKey string
-	CloudAWSSecretKey string
-	CloudSSHKeyPath   string
-	CloudSSHUser      string
-	ServerCallbackURL string
-	RemoteBuilders    []string
-	MetricsEnabled    bool
-	MetricsPort       string
-	MetricsPassword   string
-	LogEnabled        bool
-	LogLevel          string
-	LogDir            string
-	LogMaxSizeMB      int
-	LogMaxAgeDays     int
-	LogMaxBackups     int
-	LogEnableConsole  bool
-	LogEnableFile     bool
+	Port                 int
+	BinpkgPath           string
+	MaxWorkers           int
+	BuildMode            string
+	StorageType          string
+	StorageLocalDir      string
+	StorageS3Bucket      string
+	StorageS3Region      string
+	StorageS3Prefix      string
+	StorageHTTPBase      string
+	GPGEnabled           bool
+	GPGKeyID             string
+	GPGKeyPath           string
+	CloudProvider        string
+	CloudAliyunRegion    string
+	CloudAliyunZone      string
+	CloudAliyunAK        string
+	CloudAliyunSK        string
+	CloudGCPProject      string
+	CloudGCPRegion       string
+	CloudGCPZone         string
+	CloudGCPKeyFile      string
+	CloudGCPMachineType  string
+	CloudGCPDiskSizeGB   int
+	CloudGCPDiskType     string
+	CloudGCPImageFamily  string
+	CloudGCPImageProject string
+	CloudGCPNetwork      string
+	CloudGCPSubnetwork   string
+	CloudGCPPreemptible  bool
+	CloudGCPStateDir     string
+	CloudGCPAllowedIPs   []string
+	CloudAWSRegion       string
+	CloudAWSZone         string
+	CloudAWSAccessKey    string
+	CloudAWSSecretKey    string
+	CloudSSHKeyPath      string
+	CloudSSHUser         string
+	ServerCallbackURL    string
+	RemoteBuilders       []string
+	MetricsEnabled       bool
+	MetricsPort          string
+	MetricsPassword      string
+	LogEnabled           bool
+	LogLevel             string
+	LogDir               string
+	LogMaxSizeMB         int
+	LogMaxAgeDays        int
+	LogMaxBackups        int
+	LogEnableConsole     bool
+	LogEnableFile        bool
 }
 
 // DashboardConfig represents the dashboard configuration.
@@ -228,6 +238,21 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	config.CloudGCPRegion = getEnvString(env, "CLOUD_GCP_REGION", config.CloudGCPRegion)
 	config.CloudGCPZone = getEnvString(env, "CLOUD_GCP_ZONE", config.CloudGCPZone)
 	config.CloudGCPKeyFile = getEnvString(env, "CLOUD_GCP_KEY_FILE", "")
+	config.CloudGCPMachineType = getEnvString(env, "CLOUD_GCP_MACHINE_TYPE", "n1-standard-4")
+	config.CloudGCPDiskSizeGB = getEnvInt(env, "CLOUD_GCP_DISK_SIZE_GB", 100)
+	config.CloudGCPDiskType = getEnvString(env, "CLOUD_GCP_DISK_TYPE", "pd-ssd")
+	config.CloudGCPImageFamily = getEnvString(env, "CLOUD_GCP_IMAGE_FAMILY", "ubuntu-2204-lts")
+	config.CloudGCPImageProject = getEnvString(env, "CLOUD_GCP_IMAGE_PROJECT", "ubuntu-os-cloud")
+	config.CloudGCPNetwork = getEnvString(env, "CLOUD_GCP_NETWORK", "default")
+	config.CloudGCPSubnetwork = getEnvString(env, "CLOUD_GCP_SUBNETWORK", "")
+	config.CloudGCPPreemptible = getEnvBool(env, "CLOUD_GCP_PREEMPTIBLE", false)
+	config.CloudGCPStateDir = getEnvString(env, "CLOUD_GCP_STATE_DIR", "")
+	if allowedIPs := getEnvString(env, "CLOUD_GCP_ALLOWED_IPS", ""); allowedIPs != "" {
+		config.CloudGCPAllowedIPs = strings.Split(allowedIPs, ",")
+		for i := range config.CloudGCPAllowedIPs {
+			config.CloudGCPAllowedIPs[i] = strings.TrimSpace(config.CloudGCPAllowedIPs[i])
+		}
+	}
 	config.CloudAWSRegion = getEnvString(env, "CLOUD_AWS_REGION", "us-east-1")
 	config.CloudAWSZone = getEnvString(env, "CLOUD_AWS_ZONE", "us-east-1a")
 	config.CloudAWSAccessKey = getEnvString(env, "CLOUD_AWS_ACCESS_KEY", "")
