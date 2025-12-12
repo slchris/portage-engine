@@ -37,7 +37,7 @@ func TestStatusEndpoint(t *testing.T) {
 	cfg := &config.BuilderConfig{
 		Workers: 2,
 	}
-	bldr := builder.NewLocalBuilder(cfg.Workers, nil)
+	bldr := builder.NewLocalBuilder(cfg.Workers, nil, cfg)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
 	w := httptest.NewRecorder()
@@ -173,7 +173,7 @@ func TestBuildRequestSubmission(t *testing.T) {
 	cfg := &config.BuilderConfig{
 		Workers: 2,
 	}
-	bldr := builder.NewLocalBuilder(cfg.Workers, nil)
+	bldr := builder.NewLocalBuilder(cfg.Workers, nil, cfg)
 
 	buildReq := &builder.LocalBuildRequest{
 		PackageName: "app-editors/vim",

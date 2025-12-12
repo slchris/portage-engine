@@ -48,7 +48,7 @@ func main() {
 	}
 
 	// Create builder instance
-	bldr := builder.NewLocalBuilder(cfg.Workers, signer)
+	bldr := builder.NewLocalBuilder(cfg.Workers, signer, cfg)
 
 	// Setup HTTP server
 	mux := http.NewServeMux()

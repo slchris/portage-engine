@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/slchris/portage-engine/internal/binpkg"
@@ -645,5 +647,87 @@ func TestBuilderRegistryIntegration(t *testing.T) {
 
 	if !found {
 		t.Error("Builder not found in status response")
+	}
+}
+
+// TestHandleGPGPublicKey tests the GPG public key endpoint.
+func TestHandleGPGPublicKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	keyPath := filepath.Join(tmpDir, "test-key.asc")
+	keyContent := "-----BEGIN PGP PUBLIC KEY BLOCK-----\ntest key\n-----END PGP PUBLIC KEY BLOCK-----\n"
+
+	if err := os.WriteFile(keyPath, []byte(keyContent), 0600); err != nil {
+		t.Fatalf("failed to create test key file: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		method         string
+		gpgEnabled     bool
+		gpgKeyPath     string
+		expectedStatus int
+		checkContent   bool
+	}{
+		{
+			name:           "valid request",
+			method:         http.MethodGet,
+			gpgEnabled:     true,
+			gpgKeyPath:     keyPath,
+			expectedStatus: http.StatusOK,
+			checkContent:   true,
+		},
+		{
+			name:           "method not allowed",
+			method:         http.MethodPost,
+			gpgEnabled:     true,
+			gpgKeyPath:     keyPath,
+			expectedStatus: http.StatusMethodNotAllowed,
+			checkContent:   false,
+		},
+		{
+			name:           "gpg not enabled",
+			method:         http.MethodGet,
+			gpgEnabled:     false,
+			gpgKeyPath:     keyPath,
+			expectedStatus: http.StatusNotFound,
+			checkContent:   false,
+		},
+		{
+			name:           "key path not configured",
+			method:         http.MethodGet,
+			gpgEnabled:     true,
+			gpgKeyPath:     "",
+			expectedStatus: http.StatusInternalServerError,
+			checkContent:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.ServerConfig{
+				BinpkgPath: "/tmp/binpkgs",
+				GPGEnabled: tt.gpgEnabled,
+				GPGKeyPath: tt.gpgKeyPath,
+			}
+
+			server := New(cfg)
+
+			req := httptest.NewRequest(tt.method, "/api/v1/gpg/public-key", nil)
+			w := httptest.NewRecorder()
+
+			server.handleGPGPublicKey(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tt.expectedStatus {
+				t.Errorf("Expected status %d, got %d", tt.expectedStatus, resp.StatusCode)
+			}
+
+			if tt.checkContent {
+				body := w.Body.String()
+				if body != keyContent {
+					t.Errorf("Expected content %q, got %q", keyContent, body)
+				}
+			}
+		})
 	}
 }

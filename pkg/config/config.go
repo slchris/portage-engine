@@ -91,6 +91,7 @@ type BuilderConfig struct {
 	StorageS3Region  string
 	StorageS3Prefix  string
 	StorageHTTPBase  string
+	ServerURL        string
 	NotifyConfig     string
 	MetricsEnabled   bool
 	MetricsPort      string
@@ -342,6 +343,7 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.StorageS3Prefix = getEnvString(env, "STORAGE_S3_PREFIX", "")
 	config.StorageHTTPBase = getEnvString(env, "STORAGE_HTTP_BASE", "")
 
+	config.ServerURL = getEnvString(env, "SERVER_URL", "")
 	config.NotifyConfig = getEnvString(env, "NOTIFY_CONFIG", "")
 
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)

@@ -15,6 +15,7 @@ import (
 
 	"github.com/slchris/portage-engine/internal/gpg"
 	"github.com/slchris/portage-engine/internal/notification"
+	"github.com/slchris/portage-engine/pkg/config"
 )
 
 // LocalBuildRequest represents a local package build request.
@@ -47,6 +48,8 @@ type LocalBuilder struct {
 	jobs           map[string]*BuildJob
 	jobsMutex      sync.RWMutex
 	signer         *gpg.Signer
+	gpgClient      *GPGKeyClient
+	storageUpload  *StorageUploader
 	workDir        string
 	artifactDir    string
 	useDocker      bool
@@ -57,21 +60,37 @@ type LocalBuilder struct {
 }
 
 // NewLocalBuilder creates a new local builder instance.
-func NewLocalBuilder(workers int, signer *gpg.Signer) *LocalBuilder {
+func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig) *LocalBuilder {
 	workDir := os.Getenv("BUILD_WORK_DIR")
 	if workDir == "" {
-		workDir = "/var/tmp/portage-builds"
+		if cfg != nil && cfg.WorkDir != "" {
+			workDir = cfg.WorkDir
+		} else {
+			workDir = "/var/tmp/portage-builds"
+		}
 	}
 
 	artifactDir := os.Getenv("BUILD_ARTIFACT_DIR")
 	if artifactDir == "" {
-		artifactDir = "/var/tmp/portage-artifacts"
+		if cfg != nil && cfg.ArtifactDir != "" {
+			artifactDir = cfg.ArtifactDir
+		} else {
+			artifactDir = "/var/tmp/portage-artifacts"
+		}
 	}
 
 	useDocker := os.Getenv("USE_DOCKER") == "true"
+	if cfg != nil && cfg.UseDocker {
+		useDocker = cfg.UseDocker
+	}
+
 	dockerImage := os.Getenv("DOCKER_IMAGE")
 	if dockerImage == "" {
-		dockerImage = "gentoo/stage3:latest"
+		if cfg != nil && cfg.DockerImage != "" {
+			dockerImage = cfg.DockerImage
+		} else {
+			dockerImage = "gentoo/stage3:latest"
+		}
 	}
 
 	_ = os.MkdirAll(workDir, 0750)
@@ -81,7 +100,11 @@ func NewLocalBuilder(workers int, signer *gpg.Signer) *LocalBuilder {
 	var notifier *notification.Notifier
 	notifyConfigPath := os.Getenv("NOTIFY_CONFIG")
 	if notifyConfigPath == "" {
-		notifyConfigPath = "configs/notification.json"
+		if cfg != nil && cfg.NotifyConfig != "" {
+			notifyConfigPath = cfg.NotifyConfig
+		} else {
+			notifyConfigPath = "configs/notification.json"
+		}
 	}
 	notifyConfig, err := notification.LoadConfig(notifyConfigPath)
 	if err == nil {
@@ -91,11 +114,44 @@ func NewLocalBuilder(workers int, signer *gpg.Signer) *LocalBuilder {
 		log.Printf("Notification config not loaded (optional): %v", err)
 	}
 
+	// Initialize GPG key client if server URL is configured
+	var gpgClient *GPGKeyClient
+	if cfg != nil && cfg.ServerURL != "" {
+		gpgClient = NewGPGKeyClient(cfg.ServerURL)
+		log.Printf("GPG key client initialized with server URL: %s", cfg.ServerURL)
+	}
+
+	// Initialize storage uploader
+	var storageUpload *StorageUploader
+	if cfg != nil {
+		storageType := cfg.StorageType
+		if storageType == "" {
+			storageType = "local"
+		}
+
+		uploader, err := NewStorageUploader(
+			storageType,
+			cfg.StorageLocalDir,
+			cfg.StorageS3Bucket,
+			cfg.StorageS3Region,
+			cfg.StorageS3Prefix,
+			cfg.StorageHTTPBase,
+		)
+		if err != nil {
+			log.Printf("Failed to initialize storage uploader: %v", err)
+		} else {
+			storageUpload = uploader
+			log.Printf("Storage uploader initialized with type: %s, enabled: %v", storageType, storageUpload.IsEnabled())
+		}
+	}
+
 	lb := &LocalBuilder{
 		workers:        workers,
 		jobQueue:       make(chan *BuildJob, 100),
 		jobs:           make(map[string]*BuildJob),
 		signer:         signer,
+		gpgClient:      gpgClient,
+		storageUpload:  storageUpload,
 		workDir:        workDir,
 		artifactDir:    artifactDir,
 		useDocker:      useDocker,
@@ -111,6 +167,7 @@ func NewLocalBuilder(workers int, signer *gpg.Signer) *LocalBuilder {
 	}
 
 	return lb
+
 }
 
 // SubmitBuild submits a new build job.
@@ -361,6 +418,19 @@ cp /var/cache/binpkgs/*.tbz2 /output/ 2>/dev/null || true
 		}
 	}
 
+	// Upload to storage if configured
+	if lb.storageUpload != nil && lb.storageUpload.IsEnabled() {
+		remotePath := artifactName
+		if err := lb.storageUpload.Upload(destPath, remotePath); err != nil {
+			log.Printf("Warning: failed to upload artifact to storage: %v", err)
+		} else {
+			uploadedURL, _ := lb.storageUpload.GetURL(remotePath)
+			job.ArtifactURL = uploadedURL
+			job.Metadata["uploaded"] = true
+			log.Printf("Artifact uploaded to storage: %s", uploadedURL)
+		}
+	}
+
 	return nil
 }
 
@@ -432,6 +502,19 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 		} else {
 			job.Metadata["signed"] = true
 			log.Printf("Package signed: %s", destPath)
+		}
+	}
+
+	// Upload to storage if configured
+	if lb.storageUpload != nil && lb.storageUpload.IsEnabled() {
+		remotePath := artifactName
+		if err := lb.storageUpload.Upload(destPath, remotePath); err != nil {
+			log.Printf("Warning: failed to upload artifact to storage: %v", err)
+		} else {
+			uploadedURL, _ := lb.storageUpload.GetURL(remotePath)
+			job.ArtifactURL = uploadedURL
+			job.Metadata["uploaded"] = true
+			log.Printf("Artifact uploaded to storage: %s", uploadedURL)
 		}
 	}
 

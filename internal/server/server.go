@@ -61,6 +61,9 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/v1/builders/list", s.handleBuildersList)
 	mux.HandleFunc("/api/v1/builders/status", s.handleBuildersStatus)
 
+	// GPG endpoint
+	mux.HandleFunc("/api/v1/gpg/public-key", s.handleGPGPublicKey)
+
 	// Heartbeat endpoint
 	mux.HandleFunc("/api/v1/heartbeat", s.handleHeartbeat)
 
@@ -383,6 +386,32 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+// handleGPGPublicKey serves the GPG public key for builders.
+func (s *Server) handleGPGPublicKey(w http.ResponseWriter, r *http.Request) {
+	s.metrics.IncHTTPRequests()
+
+	if r.Method != http.MethodGet {
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check if GPG is enabled
+	if !s.config.GPGEnabled {
+		http.Error(w, "GPG not enabled on server", http.StatusNotFound)
+		return
+	}
+
+	// Check if key file exists
+	if s.config.GPGKeyPath == "" {
+		http.Error(w, "GPG key path not configured", http.StatusInternalServerError)
+		return
+	}
+
+	// Read and serve the public key file
+	http.ServeFile(w, r, s.config.GPGKeyPath)
 }
 
 // loggingMiddleware provides request logging.

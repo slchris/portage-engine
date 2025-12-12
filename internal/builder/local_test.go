@@ -11,7 +11,7 @@ import (
 func TestNewLocalBuilder(t *testing.T) {
 	signer := gpg.NewSigner("/tmp/test-gpg", "test@example.com", false)
 
-	builder := NewLocalBuilder(2, signer)
+	builder := NewLocalBuilder(2, signer, nil)
 	if builder == nil {
 		t.Fatal("NewLocalBuilder returned nil")
 	}
@@ -37,7 +37,7 @@ func TestNewLocalBuilder(t *testing.T) {
 func TestLocalBuilderSubmitBuild(t *testing.T) {
 	signer := gpg.NewSigner("/tmp/test-gpg", "test@example.com", false)
 
-	builder := NewLocalBuilder(1, signer)
+	builder := NewLocalBuilder(1, signer, nil)
 
 	req := &LocalBuildRequest{
 		PackageName: "dev-lang/python",
@@ -77,7 +77,7 @@ func TestLocalBuilderSubmitBuild(t *testing.T) {
 func TestLocalBuilderGetJobStatus(t *testing.T) {
 	signer := gpg.NewSigner("/tmp/test-gpg", "test@example.com", false)
 
-	builder := NewLocalBuilder(1, signer)
+	builder := NewLocalBuilder(1, signer, nil)
 
 	req := &LocalBuildRequest{
 		PackageName: "app-editors/vim",
@@ -107,7 +107,7 @@ func TestLocalBuilderGetJobStatus(t *testing.T) {
 func TestLocalBuilderGetJobStatusNotFound(t *testing.T) {
 	signer := gpg.NewSigner("/tmp/test-gpg", "test@example.com", false)
 
-	builder := NewLocalBuilder(1, signer)
+	builder := NewLocalBuilder(1, signer, nil)
 
 	_, err := builder.GetJobStatus("non-existent-job-id")
 	if err == nil {
@@ -119,7 +119,7 @@ func TestLocalBuilderGetJobStatusNotFound(t *testing.T) {
 func TestLocalBuilderListJobs(t *testing.T) {
 	signer := gpg.NewSigner("/tmp/test-gpg", "test@example.com", false)
 
-	builder := NewLocalBuilder(1, signer)
+	builder := NewLocalBuilder(1, signer, nil)
 
 	// Submit multiple jobs
 	for i := 0; i < 3; i++ {
@@ -143,7 +143,7 @@ func TestLocalBuilderListJobs(t *testing.T) {
 func TestLocalBuilderGetStatus(t *testing.T) {
 	signer := gpg.NewSigner("/tmp/test-gpg", "test@example.com", false)
 
-	builder := NewLocalBuilder(2, signer)
+	builder := NewLocalBuilder(2, signer, nil)
 
 	status := builder.GetStatus()
 	if status == nil {
