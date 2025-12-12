@@ -5,13 +5,14 @@ BINARY_SERVER=bin/portage-server
 BINARY_DASHBOARD=bin/portage-dashboard
 BINARY_BUILDER=bin/portage-builder
 BINARY_CLIENT=bin/portage-client
+BINARY_WRAPPER=bin/emerge-wrapper
 GO=go
 GOFLAGS=-v
 
 all: build
 
 # Build all binaries
-build: build-server build-dashboard build-builder build-client
+build: build-server build-dashboard build-builder build-client build-wrapper
 
 # Build server
 build-server:
@@ -36,6 +37,22 @@ build-client:
 	@echo "Building Portage Engine Client..."
 	@mkdir -p bin
 	$(GO) build $(GOFLAGS) -o $(BINARY_CLIENT) cmd/client/main.go
+
+# Build emerge wrapper
+build-wrapper:
+	@echo "Building Emerge Wrapper..."
+	@mkdir -p bin
+	$(GO) build $(GOFLAGS) -o $(BINARY_WRAPPER) cmd/emerge-wrapper/main.go
+
+# Install emerge wrapper (requires root)
+install-wrapper:
+	@echo "Installing emerge wrapper..."
+	@bash scripts/install-wrapper.sh
+
+# Uninstall emerge wrapper (requires root)
+uninstall-wrapper:
+	@echo "Uninstalling emerge wrapper..."
+	@bash scripts/uninstall-wrapper.sh
 
 # Clean build artifacts
 clean:
