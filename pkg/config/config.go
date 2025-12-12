@@ -44,41 +44,65 @@ type ServerConfig struct {
 	MetricsEnabled    bool
 	MetricsPort       string
 	MetricsPassword   string
+	LogEnabled        bool
+	LogLevel          string
+	LogDir            string
+	LogMaxSizeMB      int
+	LogMaxAgeDays     int
+	LogMaxBackups     int
+	LogEnableConsole  bool
+	LogEnableFile     bool
 }
 
 // DashboardConfig represents the dashboard configuration.
 type DashboardConfig struct {
-	Port            int
-	ServerURL       string
-	AuthEnabled     bool
-	JWTSecret       string
-	AllowAnonymous  bool
-	MetricsEnabled  bool
-	MetricsPort     string
-	MetricsPassword string
+	Port             int
+	ServerURL        string
+	AuthEnabled      bool
+	JWTSecret        string
+	AllowAnonymous   bool
+	MetricsEnabled   bool
+	MetricsPort      string
+	MetricsPassword  string
+	LogEnabled       bool
+	LogLevel         string
+	LogDir           string
+	LogMaxSizeMB     int
+	LogMaxAgeDays    int
+	LogMaxBackups    int
+	LogEnableConsole bool
+	LogEnableFile    bool
 }
 
 // BuilderConfig represents the builder configuration.
 type BuilderConfig struct {
-	Port            int
-	Workers         int
-	UseDocker       bool
-	DockerImage     string
-	WorkDir         string
-	ArtifactDir     string
-	GPGEnabled      bool
-	GPGKeyID        string
-	GPGKeyPath      string
-	StorageType     string
-	StorageLocalDir string
-	StorageS3Bucket string
-	StorageS3Region string
-	StorageS3Prefix string
-	StorageHTTPBase string
-	NotifyConfig    string
-	MetricsEnabled  bool
-	MetricsPort     string
-	MetricsPassword string
+	Port             int
+	Workers          int
+	UseDocker        bool
+	DockerImage      string
+	WorkDir          string
+	ArtifactDir      string
+	GPGEnabled       bool
+	GPGKeyID         string
+	GPGKeyPath       string
+	StorageType      string
+	StorageLocalDir  string
+	StorageS3Bucket  string
+	StorageS3Region  string
+	StorageS3Prefix  string
+	StorageHTTPBase  string
+	NotifyConfig     string
+	MetricsEnabled   bool
+	MetricsPort      string
+	MetricsPassword  string
+	LogEnabled       bool
+	LogLevel         string
+	LogDir           string
+	LogMaxSizeMB     int
+	LogMaxAgeDays    int
+	LogMaxBackups    int
+	LogEnableConsole bool
+	LogEnableFile    bool
 }
 
 // loadEnvFile loads key=value pairs from a .conf file.
@@ -210,6 +234,15 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
 	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
 
+	config.LogEnabled = getEnvBool(env, "LOG_ENABLED", true)
+	config.LogLevel = getEnvString(env, "LOG_LEVEL", "INFO")
+	config.LogDir = getEnvString(env, "LOG_DIR", "/var/log/portage-engine")
+	config.LogMaxSizeMB = getEnvInt(env, "LOG_MAX_SIZE_MB", 100)
+	config.LogMaxAgeDays = getEnvInt(env, "LOG_MAX_AGE_DAYS", 30)
+	config.LogMaxBackups = getEnvInt(env, "LOG_MAX_BACKUPS", 10)
+	config.LogEnableConsole = getEnvBool(env, "LOG_ENABLE_CONSOLE", true)
+	config.LogEnableFile = getEnvBool(env, "LOG_ENABLE_FILE", true)
+
 	// Parse remote builders
 	if builders := getEnvString(env, "REMOTE_BUILDERS", ""); builders != "" {
 		config.RemoteBuilders = strings.Split(builders, ",")
@@ -252,6 +285,15 @@ func LoadDashboardConfig(path string) (*DashboardConfig, error) {
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
 	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
+
+	config.LogEnabled = getEnvBool(env, "LOG_ENABLED", true)
+	config.LogLevel = getEnvString(env, "LOG_LEVEL", "INFO")
+	config.LogDir = getEnvString(env, "LOG_DIR", "/var/log/portage-engine")
+	config.LogMaxSizeMB = getEnvInt(env, "LOG_MAX_SIZE_MB", 100)
+	config.LogMaxAgeDays = getEnvInt(env, "LOG_MAX_AGE_DAYS", 30)
+	config.LogMaxBackups = getEnvInt(env, "LOG_MAX_BACKUPS", 10)
+	config.LogEnableConsole = getEnvBool(env, "LOG_ENABLE_CONSOLE", true)
+	config.LogEnableFile = getEnvBool(env, "LOG_ENABLE_FILE", true)
 
 	return config, nil
 }
@@ -305,6 +347,15 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
 	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
+
+	config.LogEnabled = getEnvBool(env, "LOG_ENABLED", true)
+	config.LogLevel = getEnvString(env, "LOG_LEVEL", "INFO")
+	config.LogDir = getEnvString(env, "LOG_DIR", "/var/log/portage-engine")
+	config.LogMaxSizeMB = getEnvInt(env, "LOG_MAX_SIZE_MB", 100)
+	config.LogMaxAgeDays = getEnvInt(env, "LOG_MAX_AGE_DAYS", 30)
+	config.LogMaxBackups = getEnvInt(env, "LOG_MAX_BACKUPS", 10)
+	config.LogEnableConsole = getEnvBool(env, "LOG_ENABLE_CONSOLE", true)
+	config.LogEnableFile = getEnvBool(env, "LOG_ENABLE_FILE", true)
 
 	return config, nil
 }
