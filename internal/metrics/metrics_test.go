@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -173,32 +174,77 @@ func TestHandler(t *testing.T) {
 	tests := []struct {
 		name           string
 		enabled        bool
+		password       string
+		authHeader     string
 		expectedStatus int
 	}{
 		{
-			name:           "enabled handler",
+			name:           "enabled handler no password",
 			enabled:        true,
+			password:       "",
+			authHeader:     "",
 			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "enabled handler with password valid auth",
+			enabled:        true,
+			password:       "secret123",
+			authHeader:     "Basic " + base64.StdEncoding.EncodeToString([]byte("metrics:secret123")),
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "enabled handler with password no auth",
+			enabled:        true,
+			password:       "secret123",
+			authHeader:     "",
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "enabled handler with password wrong password",
+			enabled:        true,
+			password:       "secret123",
+			authHeader:     "Basic " + base64.StdEncoding.EncodeToString([]byte("metrics:wrongpass")),
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "enabled handler with password wrong username",
+			enabled:        true,
+			password:       "secret123",
+			authHeader:     "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:secret123")),
+			expectedStatus: http.StatusUnauthorized,
 		},
 		{
 			name:           "disabled handler",
 			enabled:        false,
+			password:       "",
+			authHeader:     "",
 			expectedStatus: http.StatusNotFound,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := New(&Config{Enabled: tt.enabled})
+			m := New(&Config{Enabled: tt.enabled, Password: tt.password})
 			handler := m.Handler()
 
 			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
 			w := httptest.NewRecorder()
 
 			handler.ServeHTTP(w, req)
 
 			if w.Code != tt.expectedStatus {
 				t.Errorf("Expected status %v, got %v", tt.expectedStatus, w.Code)
+			}
+
+			// Check WWW-Authenticate header for unauthorized responses
+			if tt.expectedStatus == http.StatusUnauthorized {
+				authHeader := w.Header().Get("WWW-Authenticate")
+				if authHeader == "" {
+					t.Error("Expected WWW-Authenticate header for unauthorized response")
+				}
 			}
 		})
 	}
@@ -278,5 +324,103 @@ func TestGetSnapshotStructure(t *testing.T) {
 		if _, ok := snapshot[field]; !ok {
 			t.Errorf("Missing required field: %s", field)
 		}
+	}
+}
+
+func TestPasswordUpdate(t *testing.T) {
+	// Create metrics with no password
+	m := New(&Config{Enabled: true, Password: ""})
+
+	// Test without password
+	handler := m.Handler()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %v without password, got %v", http.StatusOK, w.Code)
+	}
+
+	// Update metrics with password
+	m = New(&Config{Enabled: true, Password: "newpass"})
+
+	// Test with wrong password
+	handler = m.Handler()
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status %v without auth, got %v", http.StatusUnauthorized, w.Code)
+	}
+
+	// Test with correct password
+	handler = m.Handler()
+	req = httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("metrics:newpass")))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %v with correct password, got %v", http.StatusOK, w.Code)
+	}
+}
+
+func TestPasswordEdgeCases(t *testing.T) {
+	tests := []struct {
+		name           string
+		password       string
+		auth           string
+		expectedStatus int
+	}{
+		{
+			name:           "empty password empty auth",
+			password:       "",
+			auth:           "",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "password with spaces",
+			password:       "pass word",
+			auth:           "Basic " + base64.StdEncoding.EncodeToString([]byte("metrics:pass word")),
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "password with special chars",
+			password:       "p@ss!w0rd#123",
+			auth:           "Basic " + base64.StdEncoding.EncodeToString([]byte("metrics:p@ss!w0rd#123")),
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "malformed auth header",
+			password:       "secret",
+			auth:           "Bearer token123",
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "invalid base64 auth",
+			password:       "secret",
+			auth:           "Basic invalid!!!",
+			expectedStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New(&Config{Enabled: true, Password: tt.password})
+			handler := m.Handler()
+
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			if tt.auth != "" {
+				req.Header.Set("Authorization", tt.auth)
+			}
+			w := httptest.NewRecorder()
+
+			handler.ServeHTTP(w, req)
+
+			if w.Code != tt.expectedStatus {
+				t.Errorf("Expected status %v, got %v", tt.expectedStatus, w.Code)
+			}
+		})
 	}
 }

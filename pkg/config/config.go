@@ -43,17 +43,19 @@ type ServerConfig struct {
 	RemoteBuilders    []string
 	MetricsEnabled    bool
 	MetricsPort       string
+	MetricsPassword   string
 }
 
 // DashboardConfig represents the dashboard configuration.
 type DashboardConfig struct {
-	Port           int
-	ServerURL      string
-	AuthEnabled    bool
-	JWTSecret      string
-	AllowAnonymous bool
-	MetricsEnabled bool
-	MetricsPort    string
+	Port            int
+	ServerURL       string
+	AuthEnabled     bool
+	JWTSecret       string
+	AllowAnonymous  bool
+	MetricsEnabled  bool
+	MetricsPort     string
+	MetricsPassword string
 }
 
 // BuilderConfig represents the builder configuration.
@@ -76,6 +78,7 @@ type BuilderConfig struct {
 	NotifyConfig    string
 	MetricsEnabled  bool
 	MetricsPort     string
+	MetricsPassword string
 }
 
 // loadEnvFile loads key=value pairs from a .conf file.
@@ -205,6 +208,7 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
+	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
 
 	// Parse remote builders
 	if builders := getEnvString(env, "REMOTE_BUILDERS", ""); builders != "" {
@@ -247,6 +251,7 @@ func LoadDashboardConfig(path string) (*DashboardConfig, error) {
 
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
+	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
 
 	return config, nil
 }
@@ -299,6 +304,7 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
+	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
 
 	return config, nil
 }

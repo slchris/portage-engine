@@ -25,8 +25,9 @@ type Server struct {
 // New creates a new Server instance.
 func New(cfg *config.ServerConfig) *Server {
 	metricsCfg := &metrics.Config{
-		Enabled: cfg.MetricsEnabled,
-		Port:    cfg.MetricsPort,
+		Enabled:  cfg.MetricsEnabled,
+		Port:     cfg.MetricsPort,
+		Password: cfg.MetricsPassword,
 	}
 
 	return &Server{

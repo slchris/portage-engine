@@ -15,14 +15,16 @@ var (
 
 // Config holds metrics configuration.
 type Config struct {
-	Enabled bool
-	Port    string
+	Enabled  bool
+	Port     string
+	Password string
 }
 
 // Metrics collects various system metrics.
 type Metrics struct {
-	enabled bool
-	mu      sync.RWMutex
+	enabled  bool
+	password string
+	mu       sync.RWMutex
 
 	// Build metrics
 	buildsTotal     *expvar.Int
@@ -63,6 +65,7 @@ func New(cfg *Config) *Metrics {
 	once.Do(func() {
 		registry = &Metrics{
 			enabled:           cfg.Enabled,
+			password:          cfg.Password,
 			buildsTotal:       new(expvar.Int),
 			buildsSucceeded:   new(expvar.Int),
 			buildsFailed:      new(expvar.Int),
@@ -116,6 +119,13 @@ func New(cfg *Config) *Metrics {
 	if registry.enabled != cfg.Enabled {
 		registry.mu.Lock()
 		registry.enabled = cfg.Enabled
+		registry.mu.Unlock()
+	}
+
+	// Update password if different
+	if registry.password != cfg.Password {
+		registry.mu.Lock()
+		registry.password = cfg.Password
 		registry.mu.Unlock()
 	}
 
@@ -288,7 +298,22 @@ func (m *Metrics) Handler() http.Handler {
 			http.Error(w, "Metrics disabled", http.StatusNotFound)
 		})
 	}
-	return expvar.Handler()
+
+	// If password is not set, return expvar handler directly
+	if m.password == "" {
+		return expvar.Handler()
+	}
+
+	// Wrap expvar handler with basic auth
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if !ok || username != "metrics" || password != m.password {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Metrics"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		expvar.Handler().ServeHTTP(w, r)
+	})
 }
 
 // GetSnapshot returns a snapshot of current metrics.
