@@ -43,6 +43,9 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/v1/cluster/status", s.handleClusterStatus)
 	mux.HandleFunc("/api/v1/scheduler/status", s.handleSchedulerStatus)
 
+	// Heartbeat endpoint
+	mux.HandleFunc("/api/v1/heartbeat", s.handleHeartbeat)
+
 	// Health check
 	mux.HandleFunc("/health", s.handleHealth)
 
@@ -224,6 +227,38 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 	status := s.builder.GetSchedulerStatus()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+// handleHeartbeat handles builder heartbeat requests.
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req builder.HeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Update builder heartbeat in the scheduler
+	if err := s.builder.UpdateBuilderHeartbeat(&req); err != nil {
+		response := builder.HeartbeatResponse{
+			Success: false,
+			Message: err.Error(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(response)
+		return
+	}
+
+	response := builder.HeartbeatResponse{
+		Success: true,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 // loggingMiddleware provides request logging.

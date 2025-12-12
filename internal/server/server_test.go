@@ -196,3 +196,103 @@ func TestHandleBuildStatus(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
 	}
 }
+
+// TestHandleHeartbeat tests the heartbeat endpoint.
+func TestHandleHeartbeat(t *testing.T) {
+	cfg := &config.ServerConfig{
+		BinpkgPath: "/tmp/binpkgs",
+		MaxWorkers: 2,
+	}
+
+	server := New(cfg)
+
+	tests := []struct {
+		name           string
+		method         string
+		body           interface{}
+		expectedStatus int
+	}{
+		{
+			name:   "valid heartbeat",
+			method: http.MethodPost,
+			body: builder.HeartbeatRequest{
+				BuilderID:  "builder-1",
+				Status:     "healthy",
+				Endpoint:   "http://localhost:9090",
+				Capacity:   4,
+				ActiveJobs: 2,
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "method not allowed",
+			method:         http.MethodGet,
+			body:           nil,
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:   "missing builder_id",
+			method: http.MethodPost,
+			body: builder.HeartbeatRequest{
+				Status: "healthy",
+			},
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:   "missing status",
+			method: http.MethodPost,
+			body: builder.HeartbeatRequest{
+				BuilderID: "builder-1",
+			},
+			expectedStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body []byte
+			if tt.body != nil {
+				body, _ = json.Marshal(tt.body)
+			}
+
+			req := httptest.NewRequest(tt.method, "/api/v1/heartbeat", bytes.NewReader(body))
+			w := httptest.NewRecorder()
+
+			server.handleHeartbeat(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tt.expectedStatus {
+				t.Errorf("Expected status %d, got %d", tt.expectedStatus, resp.StatusCode)
+			}
+
+			if tt.expectedStatus == http.StatusOK {
+				var heartbeatResp builder.HeartbeatResponse
+				_ = json.NewDecoder(resp.Body).Decode(&heartbeatResp)
+
+				if !heartbeatResp.Success {
+					t.Error("Expected success=true")
+				}
+			}
+		})
+	}
+}
+
+// TestHandleHeartbeatInvalidJSON tests heartbeat with invalid JSON.
+func TestHandleHeartbeatInvalidJSON(t *testing.T) {
+	cfg := &config.ServerConfig{
+		BinpkgPath: "/tmp/binpkgs",
+		MaxWorkers: 2,
+	}
+
+	server := New(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/heartbeat", bytes.NewReader([]byte("invalid json")))
+	w := httptest.NewRecorder()
+
+	server.handleHeartbeat(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Expected status 400, got %d", resp.StatusCode)
+	}
+}

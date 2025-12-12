@@ -2,17 +2,37 @@ package builder
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
+// HeartbeatRequest represents a heartbeat request from builder to server.
+type HeartbeatRequest struct {
+	BuilderID  string    `json:"builder_id"`
+	Status     string    `json:"status"`
+	Endpoint   string    `json:"endpoint"`
+	Capacity   int       `json:"capacity"`
+	ActiveJobs int       `json:"active_jobs"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+// HeartbeatResponse represents the server's response to a heartbeat.
+type HeartbeatResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+}
+
 // Client communicates with remote builder services
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL       string
+	httpClient    *http.Client
+	heartbeatStop chan struct{}
+	heartbeatWg   sync.WaitGroup
 }
 
 // NewBuilderClient creates a new builder client
@@ -22,6 +42,7 @@ func NewBuilderClient(baseURL string) *Client {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		heartbeatStop: make(chan struct{}),
 	}
 }
 
@@ -143,4 +164,73 @@ func (bc *Client) WaitForCompletion(jobID string, timeout time.Duration) (*Build
 	}
 
 	return nil, fmt.Errorf("build timeout after %v", timeout)
+}
+
+// SendHeartbeat sends a single heartbeat to the server.
+func (bc *Client) SendHeartbeat(req *HeartbeatRequest) error {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("failed to marshal heartbeat: %w", err)
+	}
+
+	resp, err := bc.httpClient.Post(
+		bc.baseURL+"/api/v1/heartbeat",
+		"application/json",
+		bytes.NewReader(data),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to send heartbeat: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("heartbeat failed: %s", string(body))
+	}
+
+	var result HeartbeatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("failed to decode heartbeat response: %w", err)
+	}
+
+	if !result.Success {
+		return fmt.Errorf("heartbeat rejected: %s", result.Message)
+	}
+
+	return nil
+}
+
+// StartHeartbeat starts sending periodic heartbeats to the server.
+func (bc *Client) StartHeartbeat(ctx context.Context, req *HeartbeatRequest, interval time.Duration) {
+	bc.heartbeatWg.Add(1)
+	go func() {
+		defer bc.heartbeatWg.Done()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-bc.heartbeatStop:
+				return
+			case <-ticker.C:
+				// Update timestamp before sending
+				req.Timestamp = time.Now()
+				if err := bc.SendHeartbeat(req); err != nil {
+					// Log error but continue
+					_ = err
+				}
+			}
+		}
+	}()
+}
+
+// StopHeartbeat stops the heartbeat goroutine.
+func (bc *Client) StopHeartbeat() {
+	close(bc.heartbeatStop)
+	bc.heartbeatWg.Wait()
 }

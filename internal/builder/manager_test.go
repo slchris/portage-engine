@@ -310,3 +310,88 @@ func TestGetSchedulerStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestUpdateBuilderHeartbeat tests updating builder heartbeat.
+func TestUpdateBuilderHeartbeat(t *testing.T) {
+	cfg := &config.ServerConfig{
+		MaxWorkers: 2,
+	}
+
+	mgr := NewManager(cfg)
+
+	tests := []struct {
+		name      string
+		req       *HeartbeatRequest
+		wantError bool
+	}{
+		{
+			name: "valid heartbeat",
+			req: &HeartbeatRequest{
+				BuilderID:  "builder-1",
+				Status:     "healthy",
+				Endpoint:   "http://localhost:9090",
+				Capacity:   4,
+				ActiveJobs: 2,
+				Timestamp:  time.Now(),
+			},
+			wantError: false,
+		},
+		{
+			name: "missing builder_id",
+			req: &HeartbeatRequest{
+				Status:    "healthy",
+				Timestamp: time.Now(),
+			},
+			wantError: true,
+		},
+		{
+			name: "missing status",
+			req: &HeartbeatRequest{
+				BuilderID: "builder-1",
+				Timestamp: time.Now(),
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mgr.UpdateBuilderHeartbeat(tt.req)
+			if (err != nil) != tt.wantError {
+				t.Errorf("UpdateBuilderHeartbeat() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
+	}
+}
+
+// TestUpdateBuilderHeartbeatConcurrent tests concurrent heartbeat updates.
+func TestUpdateBuilderHeartbeatConcurrent(_ *testing.T) {
+	cfg := &config.ServerConfig{
+		MaxWorkers: 2,
+	}
+
+	mgr := NewManager(cfg)
+
+	// Send heartbeats from multiple goroutines
+	numGoroutines := 10
+	done := make(chan bool, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			req := &HeartbeatRequest{
+				BuilderID:  "builder-1",
+				Status:     "healthy",
+				Capacity:   4,
+				ActiveJobs: id,
+				Timestamp:  time.Now(),
+			}
+			_ = mgr.UpdateBuilderHeartbeat(req)
+			done <- true
+		}(i)
+	}
+
+	// Wait for all goroutines to complete
+	for i := 0; i < numGoroutines; i++ {
+		<-done
+	}
+}

@@ -328,3 +328,18 @@ func (m *Manager) GetSchedulerStatus() map[string]interface{} {
 		"running_tasks": runningTasks,
 	}
 }
+
+// UpdateBuilderHeartbeat updates builder heartbeat information.
+func (m *Manager) UpdateBuilderHeartbeat(req *HeartbeatRequest) error {
+	if req.BuilderID == "" {
+		return fmt.Errorf("builder_id is required")
+	}
+
+	// For now, just validate the request
+	// In the future, this could update scheduler state
+	if req.Status == "" {
+		return fmt.Errorf("status is required")
+	}
+
+	return nil
+}
