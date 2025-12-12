@@ -152,7 +152,8 @@ func (m *Manager) fetchRemoteJobStatus(jobID string) *BuildStatus {
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	for _, builderAddr := range m.config.RemoteBuilders {
-		url := fmt.Sprintf("http://%s/api/v1/jobs/%s", builderAddr, jobID)
+		baseURL := normalizeBuilderURL(builderAddr)
+		url := fmt.Sprintf("%s/api/v1/jobs/%s", baseURL, jobID)
 		resp, err := client.Get(url)
 		if err != nil {
 			continue
@@ -301,7 +302,8 @@ func (m *Manager) submitToRemoteBuilder(jobID string, req *BuildRequest) {
 	}
 
 	builder := m.config.RemoteBuilders[0]
-	builderURL := fmt.Sprintf("http://%s/api/v1/build", builder)
+	baseURL := normalizeBuilderURL(builder)
+	builderURL := fmt.Sprintf("%s/api/v1/build", baseURL)
 
 	m.updateStatus(jobID, "forwarding", "", "")
 
@@ -361,7 +363,8 @@ func (m *Manager) submitToRemoteBuilder(jobID string, req *BuildRequest) {
 
 // pollRemoteBuilder polls remote builder for job status.
 func (m *Manager) pollRemoteBuilder(localJobID, builderAddr, remoteJobID string) {
-	statusURL := fmt.Sprintf("http://%s/api/v1/jobs/%s", builderAddr, remoteJobID)
+	baseURL := normalizeBuilderURL(builderAddr)
+	statusURL := fmt.Sprintf("%s/api/v1/jobs/%s", baseURL, remoteJobID)
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -476,7 +479,8 @@ func (m *Manager) fetchRemoteBuilderJobs() []*BuildStatus {
 		go func(builderAddr string) {
 			defer wg.Done()
 
-			url := fmt.Sprintf("http://%s/api/v1/jobs", builderAddr)
+			baseURL := normalizeBuilderURL(builderAddr)
+			url := fmt.Sprintf("%s/api/v1/jobs", baseURL)
 			resp, err := client.Get(url)
 			if err != nil {
 				return
@@ -617,7 +621,8 @@ func (m *Manager) fetchRemoteBuilderStats() *ClusterStatus {
 		go func(addr string) {
 			defer wg.Done()
 
-			url := fmt.Sprintf("http://%s/api/v1/status", addr)
+			baseURL := normalizeBuilderURL(addr)
+			url := fmt.Sprintf("%s/api/v1/status", baseURL)
 			resp, err := client.Get(url)
 			if err != nil {
 				return
@@ -725,7 +730,8 @@ func (m *Manager) fetchRemoteBuilderLogs(jobID string) (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	for _, builder := range m.config.RemoteBuilders {
-		url := fmt.Sprintf("http://%s/api/v1/jobs/%s", builder, jobID)
+		baseURL := normalizeBuilderURL(builder)
+		url := fmt.Sprintf("%s/api/v1/jobs/%s", baseURL, jobID)
 		resp, err := client.Get(url)
 		if err != nil {
 			continue
@@ -836,4 +842,13 @@ func (m *Manager) UpdateBuilderHeartbeat(req *HeartbeatRequest) error {
 	}
 
 	return nil
+}
+
+// normalizeBuilderURL ensures the builder address has the correct URL format.
+// It handles cases where the address may or may not include the http:// prefix.
+func normalizeBuilderURL(address string) string {
+	if strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://") {
+		return address
+	}
+	return fmt.Sprintf("http://%s", address)
 }
