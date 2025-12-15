@@ -1,0 +1,568 @@
+package iac
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestDefaultPVEInstanceSpec(t *testing.T) {
+	t.Parallel()
+
+	spec := DefaultPVEInstanceSpec()
+
+	if spec == nil {
+		t.Fatal("DefaultPVEInstanceSpec returned nil")
+	}
+
+	if spec.Node != "pve" {
+		t.Errorf("Node = %s, want pve", spec.Node)
+	}
+	if spec.Cores != 4 {
+		t.Errorf("Cores = %d, want 4", spec.Cores)
+	}
+	if spec.Sockets != 1 {
+		t.Errorf("Sockets = %d, want 1", spec.Sockets)
+	}
+	if spec.MemoryMB != 8192 {
+		t.Errorf("MemoryMB = %d, want 8192", spec.MemoryMB)
+	}
+	if spec.DiskSizeGB != 50 {
+		t.Errorf("DiskSizeGB = %d, want 50", spec.DiskSizeGB)
+	}
+	if spec.DiskType != "scsi" {
+		t.Errorf("DiskType = %s, want scsi", spec.DiskType)
+	}
+	if spec.Storage != "local-lvm" {
+		t.Errorf("Storage = %s, want local-lvm", spec.Storage)
+	}
+	if spec.Network != "vmbr0" {
+		t.Errorf("Network = %s, want vmbr0", spec.Network)
+	}
+	if spec.OSType != "l26" {
+		t.Errorf("OSType = %s, want l26", spec.OSType)
+	}
+	if !spec.Agent {
+		t.Error("Agent should be true by default")
+	}
+	if !spec.StartOnBoot {
+		t.Error("StartOnBoot should be true by default")
+	}
+	if !spec.CloudInit {
+		t.Error("CloudInit should be true by default")
+	}
+	if len(spec.Tags) != 1 || spec.Tags[0] != "portage-builder" {
+		t.Errorf("Tags = %v, want [portage-builder]", spec.Tags)
+	}
+}
+
+func TestPVEInstanceSpecFromMap(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		input    map[string]string
+		validate func(*testing.T, *PVEInstanceSpec)
+	}{
+		{
+			name:  "empty map returns defaults",
+			input: map[string]string{},
+			validate: func(t *testing.T, spec *PVEInstanceSpec) {
+				if spec.Node != "pve" {
+					t.Errorf("Node = %s, want pve", spec.Node)
+				}
+				if spec.Cores != 4 {
+					t.Errorf("Cores = %d, want 4", spec.Cores)
+				}
+			},
+		},
+		{
+			name: "custom node and cores",
+			input: map[string]string{
+				"node":  "pve-node1",
+				"cores": "8",
+			},
+			validate: func(t *testing.T, spec *PVEInstanceSpec) {
+				if spec.Node != "pve-node1" {
+					t.Errorf("Node = %s, want pve-node1", spec.Node)
+				}
+				if spec.Cores != 8 {
+					t.Errorf("Cores = %d, want 8", spec.Cores)
+				}
+			},
+		},
+		{
+			name: "custom memory and disk",
+			input: map[string]string{
+				"memory_mb":    "16384",
+				"disk_size_gb": "100",
+				"disk_type":    "virtio",
+			},
+			validate: func(t *testing.T, spec *PVEInstanceSpec) {
+				if spec.MemoryMB != 16384 {
+					t.Errorf("MemoryMB = %d, want 16384", spec.MemoryMB)
+				}
+				if spec.DiskSizeGB != 100 {
+					t.Errorf("DiskSizeGB = %d, want 100", spec.DiskSizeGB)
+				}
+				if spec.DiskType != "virtio" {
+					t.Errorf("DiskType = %s, want virtio", spec.DiskType)
+				}
+			},
+		},
+		{
+			name: "network configuration",
+			input: map[string]string{
+				"network":    "vmbr1",
+				"vlan":       "100",
+				"ip_config":  "192.168.1.100/24",
+				"gateway":    "192.168.1.1",
+				"nameserver": "8.8.8.8",
+			},
+			validate: func(t *testing.T, spec *PVEInstanceSpec) {
+				if spec.Network != "vmbr1" {
+					t.Errorf("Network = %s, want vmbr1", spec.Network)
+				}
+				if spec.VLAN != 100 {
+					t.Errorf("VLAN = %d, want 100", spec.VLAN)
+				}
+				if spec.IPConfig != "192.168.1.100/24" {
+					t.Errorf("IPConfig = %s, want 192.168.1.100/24", spec.IPConfig)
+				}
+				if spec.Gateway != "192.168.1.1" {
+					t.Errorf("Gateway = %s, want 192.168.1.1", spec.Gateway)
+				}
+				if spec.Nameserver != "8.8.8.8" {
+					t.Errorf("Nameserver = %s, want 8.8.8.8", spec.Nameserver)
+				}
+			},
+		},
+		{
+			name: "vmid and pool",
+			input: map[string]string{
+				"vmid": "200",
+				"pool": "builders",
+			},
+			validate: func(t *testing.T, spec *PVEInstanceSpec) {
+				if spec.VMID != 200 {
+					t.Errorf("VMID = %d, want 200", spec.VMID)
+				}
+				if spec.Pool != "builders" {
+					t.Errorf("Pool = %s, want builders", spec.Pool)
+				}
+			},
+		},
+		{
+			name: "boolean values",
+			input: map[string]string{
+				"cloud_init": "false",
+				"agent":      "0",
+			},
+			validate: func(t *testing.T, spec *PVEInstanceSpec) {
+				if spec.CloudInit {
+					t.Error("CloudInit should be false")
+				}
+				if spec.Agent {
+					t.Error("Agent should be false")
+				}
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			spec := PVEInstanceSpecFromMap(tc.input)
+			if spec == nil {
+				t.Fatal("PVEInstanceSpecFromMap returned nil")
+			}
+			tc.validate(t, spec)
+		})
+	}
+}
+
+func TestNewPVEProvisioner(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	if provisioner == nil {
+		t.Fatal("NewPVEProvisioner returned nil")
+	}
+
+	if provisioner.stateDir != tmpDir {
+		t.Errorf("stateDir = %s, want %s", provisioner.stateDir, tmpDir)
+	}
+}
+
+func TestNewPVEProvisioner_NilConfig(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewPVEProvisioner(nil)
+	if err == nil {
+		t.Error("Expected error for nil config")
+	}
+}
+
+func TestNewPVEProvisioner_MissingEndpoint(t *testing.T) {
+	t.Parallel()
+
+	config := &PVEConfig{
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+	}
+
+	_, err := NewPVEProvisioner(config)
+	if err == nil {
+		t.Error("Expected error for missing endpoint")
+	}
+}
+
+func TestNewPVEProvisioner_DefaultStateDir(t *testing.T) {
+	t.Parallel()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	expectedDir := filepath.Join(os.TempDir(), "portage-terraform", "pve")
+	if provisioner.stateDir != expectedDir {
+		t.Errorf("stateDir = %s, want %s", provisioner.stateDir, expectedDir)
+	}
+}
+
+func TestPVEProvisioner_GenerateMainTF(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+		SSHUser:     "root",
+		Insecure:    true,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	spec := &PVEInstanceSpec{
+		Node:        "pve-node1",
+		Cores:       4,
+		Sockets:     1,
+		MemoryMB:    8192,
+		DiskSizeGB:  50,
+		DiskType:    "scsi",
+		Storage:     "local-lvm",
+		Template:    "debian-12-template",
+		OSType:      "l26",
+		Network:     "vmbr0",
+		Tags:        []string{"portage-builder", "test"},
+		Agent:       true,
+		StartOnBoot: true,
+		CloudInit:   true,
+		IPConfig:    "dhcp",
+	}
+
+	tf := provisioner.GenerateMainTF(spec, "test-builder")
+
+	// Verify key components
+	expectedStrings := []string{
+		`required_providers`,
+		`proxmox`,
+		`telmate/proxmox`,
+		`pm_api_url`,
+		`https://pve.example.com:8006/api2/json`,
+		`pm_tls_insecure = true`,
+		`pm_api_token_id`,
+		`pm_api_token_secret`,
+		`proxmox_vm_qemu`,
+		`name        = "test-builder"`,
+		`target_node = "pve-node1"`,
+		`cores       = 4`,
+		`sockets     = 1`,
+		`memory      = 8192`,
+		`agent       = 1`,
+		`clone       = "debian-12-template"`,
+		`storage = "local-lvm"`,
+		`size    = "50G"`,
+		`type    = "scsi"`,
+		`bridge = "vmbr0"`,
+		`tags = "portage-builder,test"`,
+		`output "instance_name"`,
+		`output "vmid"`,
+		`output "ip_address"`,
+		`output "node"`,
+	}
+
+	for _, expected := range expectedStrings {
+		if !strings.Contains(tf, expected) {
+			t.Errorf("Generated TF missing expected string: %s", expected)
+		}
+	}
+}
+
+func TestPVEProvisioner_GenerateMainTF_WithVMID(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	spec := DefaultPVEInstanceSpec()
+	spec.VMID = 200
+	spec.Pool = "builders"
+
+	tf := provisioner.GenerateMainTF(spec, "test-builder")
+
+	if !strings.Contains(tf, "vmid = 200") {
+		t.Error("Generated TF missing vmid")
+	}
+	if !strings.Contains(tf, `pool = "builders"`) {
+		t.Error("Generated TF missing pool")
+	}
+}
+
+func TestPVEProvisioner_GenerateMainTF_WithVLAN(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	spec := DefaultPVEInstanceSpec()
+	spec.VLAN = 100
+
+	tf := provisioner.GenerateMainTF(spec, "test-builder")
+
+	if !strings.Contains(tf, "tag = 100") {
+		t.Error("Generated TF missing VLAN tag")
+	}
+}
+
+func TestPVEProvisioner_GenerateMainTF_WithStaticIP(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+		SSHUser:     "admin",
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	spec := DefaultPVEInstanceSpec()
+	spec.IPConfig = "192.168.1.100/24"
+	spec.Gateway = "192.168.1.1"
+	spec.Nameserver = "8.8.8.8"
+
+	tf := provisioner.GenerateMainTF(spec, "test-builder")
+
+	if !strings.Contains(tf, `ip=192.168.1.100/24,gw=192.168.1.1`) {
+		t.Error("Generated TF missing static IP configuration")
+	}
+	if !strings.Contains(tf, `nameserver = "8.8.8.8"`) {
+		t.Error("Generated TF missing nameserver")
+	}
+	if !strings.Contains(tf, `ciuser = "admin"`) {
+		t.Error("Generated TF missing ciuser")
+	}
+}
+
+func TestPVEProvisioner_GenerateMainTF_PasswordAuth(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		Username:    "root@pam",
+		Password:    "password123",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	tf := provisioner.GenerateMainTF(nil, "test-builder")
+
+	if !strings.Contains(tf, `pm_user     = "root@pam"`) {
+		t.Error("Generated TF missing pm_user")
+	}
+	if !strings.Contains(tf, `pm_password = "password123"`) {
+		t.Error("Generated TF missing pm_password")
+	}
+}
+
+func TestPVEProvisioner_GenerateMainTF_DefaultSpec(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		Storage:     "ceph-pool",
+		Network:     "vmbr1",
+		Template:    "my-template",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	// Pass nil spec to use defaults with config overrides
+	tf := provisioner.GenerateMainTF(nil, "test-builder")
+
+	if !strings.Contains(tf, `target_node = "pve-node1"`) {
+		t.Error("Generated TF should use config node")
+	}
+	if !strings.Contains(tf, `storage = "ceph-pool"`) {
+		t.Error("Generated TF should use config storage")
+	}
+	if !strings.Contains(tf, `bridge = "vmbr1"`) {
+		t.Error("Generated TF should use config network")
+	}
+	if !strings.Contains(tf, `clone       = "my-template"`) {
+		t.Error("Generated TF should use config template")
+	}
+}
+
+func TestPVEProvisioner_GenerateVariablesTF(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: "secret-token",
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	spec := &PVEInstanceSpec{
+		Node:       "pve-node1",
+		Cores:      8,
+		MemoryMB:   16384,
+		DiskSizeGB: 100,
+		Storage:    "ceph-pool",
+		Network:    "vmbr1",
+	}
+
+	tf := provisioner.GenerateVariablesTF(spec)
+
+	expectedStrings := []string{
+		`variable "pve_endpoint"`,
+		`variable "pve_node"`,
+		`variable "vm_cores"`,
+		`variable "vm_memory"`,
+		`variable "vm_disk_size"`,
+		`variable "vm_storage"`,
+		`variable "vm_network"`,
+		`default     = "https://pve.example.com:8006"`,
+		`default     = "pve-node1"`,
+		`default     = 8`,
+		`default     = 16384`,
+		`default     = 100`,
+		`default     = "ceph-pool"`,
+		`default     = "vmbr1"`,
+	}
+
+	for _, expected := range expectedStrings {
+		if !strings.Contains(tf, expected) {
+			t.Errorf("Generated variables TF missing expected string: %s", expected)
+		}
+	}
+}
+
+func TestBoolToInt(t *testing.T) {
+	t.Parallel()
+
+	if boolToInt(true) != 1 {
+		t.Error("boolToInt(true) should return 1")
+	}
+	if boolToInt(false) != 0 {
+		t.Error("boolToInt(false) should return 0")
+	}
+}

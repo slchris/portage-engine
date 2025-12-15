@@ -48,21 +48,31 @@ type ServerConfig struct {
 	CloudAWSZone         string
 	CloudAWSAccessKey    string
 	CloudAWSSecretKey    string
-	CloudSSHKeyPath      string
-	CloudSSHUser         string
-	ServerCallbackURL    string
-	RemoteBuilders       []string
-	MetricsEnabled       bool
-	MetricsPort          string
-	MetricsPassword      string
-	LogEnabled           bool
-	LogLevel             string
-	LogDir               string
-	LogMaxSizeMB         int
-	LogMaxAgeDays        int
-	LogMaxBackups        int
-	LogEnableConsole     bool
-	LogEnableFile        bool
+	// PVE (Proxmox VE) configuration
+	CloudPVEEndpoint    string   // PVE API endpoint (e.g., https://pve.example.com:8006)
+	CloudPVENode        string   // Default PVE node name
+	CloudPVETokenID     string   // API token ID (user@realm!tokenname)
+	CloudPVETokenSecret string   // API token secret
+	CloudPVEInsecure    bool     // Skip TLS verification
+	CloudPVEStorage     string   // Default storage pool
+	CloudPVENetwork     string   // Default network bridge
+	CloudPVETemplate    string   // Default VM template
+	CloudPVEAllowedIPs  []string // Allowed IP ranges for firewall
+	CloudSSHKeyPath     string
+	CloudSSHUser        string
+	ServerCallbackURL   string
+	RemoteBuilders      []string
+	MetricsEnabled      bool
+	MetricsPort         string
+	MetricsPassword     string
+	LogEnabled          bool
+	LogLevel            string
+	LogDir              string
+	LogMaxSizeMB        int
+	LogMaxAgeDays       int
+	LogMaxBackups       int
+	LogEnableConsole    bool
+	LogEnableFile       bool
 }
 
 // DashboardConfig represents the dashboard configuration.
@@ -268,6 +278,23 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	config.CloudAWSZone = getEnvString(env, "CLOUD_AWS_ZONE", "us-east-1a")
 	config.CloudAWSAccessKey = getEnvString(env, "CLOUD_AWS_ACCESS_KEY", "")
 	config.CloudAWSSecretKey = getEnvString(env, "CLOUD_AWS_SECRET_KEY", "")
+
+	// PVE (Proxmox VE) configuration
+	config.CloudPVEEndpoint = getEnvString(env, "CLOUD_PVE_ENDPOINT", "")
+	config.CloudPVENode = getEnvString(env, "CLOUD_PVE_NODE", "pve")
+	config.CloudPVETokenID = getEnvString(env, "CLOUD_PVE_TOKEN_ID", "")
+	config.CloudPVETokenSecret = getEnvString(env, "CLOUD_PVE_TOKEN_SECRET", "")
+	config.CloudPVEInsecure = getEnvBool(env, "CLOUD_PVE_INSECURE", false)
+	config.CloudPVEStorage = getEnvString(env, "CLOUD_PVE_STORAGE", "local-lvm")
+	config.CloudPVENetwork = getEnvString(env, "CLOUD_PVE_NETWORK", "vmbr0")
+	config.CloudPVETemplate = getEnvString(env, "CLOUD_PVE_TEMPLATE", "")
+	if allowedIPs := getEnvString(env, "CLOUD_PVE_ALLOWED_IPS", ""); allowedIPs != "" {
+		config.CloudPVEAllowedIPs = strings.Split(allowedIPs, ",")
+		for i := range config.CloudPVEAllowedIPs {
+			config.CloudPVEAllowedIPs[i] = strings.TrimSpace(config.CloudPVEAllowedIPs[i])
+		}
+	}
+
 	config.CloudSSHKeyPath = getEnvString(env, "CLOUD_SSH_KEY_PATH", "")
 	config.CloudSSHUser = getEnvString(env, "CLOUD_SSH_USER", "root")
 	config.ServerCallbackURL = getEnvString(env, "SERVER_CALLBACK_URL", "")

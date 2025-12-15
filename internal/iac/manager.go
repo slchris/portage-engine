@@ -25,6 +25,12 @@ type CloudCredentials struct {
 	// AWS
 	AWSAccessKey string
 	AWSSecretKey string
+
+	// PVE (Proxmox VE)
+	PVETokenID     string
+	PVETokenSecret string
+	PVEUsername    string
+	PVEPassword    string
 }
 
 // SSHConfig holds SSH configuration for instance setup.
@@ -462,6 +468,14 @@ func (m *Manager) prepareEnvironment(req *ProvisionRequest) []string {
 			env = append(env, "AWS_ACCESS_KEY_ID="+req.Credentials.AWSAccessKey)
 			env = append(env, "AWS_SECRET_ACCESS_KEY="+req.Credentials.AWSSecretKey)
 		}
+	case "pve":
+		if req.Credentials.PVETokenID != "" {
+			env = append(env, "PM_API_TOKEN_ID="+req.Credentials.PVETokenID)
+			env = append(env, "PM_API_TOKEN_SECRET="+req.Credentials.PVETokenSecret)
+		} else if req.Credentials.PVEUsername != "" {
+			env = append(env, "PM_USER="+req.Credentials.PVEUsername)
+			env = append(env, "PM_PASS="+req.Credentials.PVEPassword)
+		}
 	}
 
 	return env
@@ -589,6 +603,8 @@ func (m *Manager) generateTerraformConfig(req *ProvisionRequest) string {
 		return m.generateGCPConfig(req, region, zone)
 	case "aws":
 		return m.generateAWSConfig(req, region, zone)
+	case "pve":
+		return m.generatePVEConfig(req)
 	default:
 		return ""
 	}
@@ -608,6 +624,8 @@ func (m *Manager) generateFirewallConfig(req *ProvisionRequest) string {
 		return m.generateGCPFirewall(req, allowedIPs)
 	case "aws":
 		return m.generateAWSFirewall(req, allowedIPs)
+	case "pve":
+		return "" // PVE uses Proxmox's built-in firewall, configured via API
 	default:
 		return ""
 	}
@@ -990,4 +1008,47 @@ resource "aws_security_group" "portage" {
   }
 }
 `, ingressRules)
+}
+
+// generatePVEConfig generates PVE-specific Terraform config.
+func (m *Manager) generatePVEConfig(req *ProvisionRequest) string {
+	spec := PVEInstanceSpecFromMap(req.Spec)
+
+	endpoint := getOrDefault(req.Spec, "endpoint", "")
+	if endpoint == "" {
+		return ""
+	}
+
+	// Create PVE config
+	pveConfig := &PVEConfig{
+		Endpoint:    endpoint,
+		Node:        spec.Node,
+		StateDir:    m.workspaceDir,
+		BuilderPort: req.BuilderPort,
+		Insecure:    getOrDefault(req.Spec, "insecure", "false") == "true",
+	}
+
+	// Set authentication
+	if req.Credentials != nil {
+		if req.Credentials.PVETokenID != "" {
+			pveConfig.TokenID = req.Credentials.PVETokenID
+			pveConfig.TokenSecret = req.Credentials.PVETokenSecret
+		} else if req.Credentials.PVEUsername != "" {
+			pveConfig.Username = req.Credentials.PVEUsername
+			pveConfig.Password = req.Credentials.PVEPassword
+		}
+	}
+
+	if req.SSH != nil {
+		pveConfig.SSHKeyPath = req.SSH.KeyPath
+		pveConfig.SSHUser = req.SSH.User
+	}
+
+	provisioner, err := NewPVEProvisioner(pveConfig)
+	if err != nil {
+		return ""
+	}
+
+	instanceName := fmt.Sprintf("portage-builder-%s-%d", req.Arch, time.Now().Unix())
+	return provisioner.GenerateMainTF(spec, instanceName)
 }
