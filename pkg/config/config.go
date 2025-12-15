@@ -85,16 +85,6 @@ type DashboardConfig struct {
 	LogEnableFile    bool
 }
 
-// OSType represents the host operating system type.
-type OSType string
-
-const (
-	// OSTypeGentoo represents Gentoo Linux.
-	OSTypeGentoo OSType = "gentoo"
-	// OSTypeDebian represents Debian-based systems.
-	OSTypeDebian OSType = "debian"
-)
-
 // BuilderConfig represents the builder configuration.
 type BuilderConfig struct {
 	Port               int
@@ -102,7 +92,7 @@ type BuilderConfig struct {
 	InstanceID         string
 	Architecture       string
 	UseDocker          bool
-	DockerImage        string
+	DockerImage        string // Docker image for builds (e.g., gentoo/stage3:latest)
 	WorkDir            string
 	ArtifactDir        string
 	DataDir            string
@@ -131,20 +121,14 @@ type BuilderConfig struct {
 	LogEnableConsole   bool
 	LogEnableFile      bool
 
-	// Multi-distro support
-	HostOSType      OSType // Host OS type: gentoo, debian
-	SyncMirror      string // Mirror URL for portage/apt sync
+	// Portage mirror settings (for Gentoo builds in Docker)
+	SyncMirror      string // Mirror URL for portage sync (rsync or git)
 	DistfilesMirror string // Mirror URL for distfiles download
 
-	// Gentoo-specific settings
+	// Portage paths on host (mounted into Docker container)
 	PortageReposPath string // Path to portage repos (default: /var/db/repos)
 	PortageConfPath  string // Path to portage config (default: /etc/portage)
 	MakeConfPath     string // Path to make.conf (default: /etc/portage/make.conf)
-
-	// Debian-specific settings
-	AptSourcesPath string // Path to apt sources (default: /etc/apt)
-	AptCachePath   string // Path to apt cache (default: /var/cache/apt)
-	DebianCodename string // Debian codename (e.g., bookworm, bullseye)
 }
 
 // loadEnvFile loads key=value pairs from a .conf file.
@@ -372,14 +356,10 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 		GPGEnabled:         false,
 		StorageType:        "local",
 		StorageLocalDir:    "/var/binpkgs",
-		// Multi-distro defaults
-		HostOSType:       OSTypeGentoo,
+		// Portage defaults
 		PortageReposPath: "/var/db/repos",
 		PortageConfPath:  "/etc/portage",
 		MakeConfPath:     "/etc/portage/make.conf",
-		AptSourcesPath:   "/etc/apt",
-		AptCachePath:     "/var/cache/apt",
-		DebianCodename:   "bookworm",
 	}
 
 	// If config file doesn't exist, return defaults
@@ -419,22 +399,14 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.ServerURL = getEnvString(env, "SERVER_URL", "")
 	config.NotifyConfig = getEnvString(env, "NOTIFY_CONFIG", "")
 
-	// Multi-distro settings
-	if osType := getEnvString(env, "HOST_OS_TYPE", ""); osType != "" {
-		config.HostOSType = OSType(strings.ToLower(osType))
-	}
+	// Portage mirror settings
 	config.SyncMirror = getEnvString(env, "SYNC_MIRROR", config.SyncMirror)
 	config.DistfilesMirror = getEnvString(env, "DISTFILES_MIRROR", config.DistfilesMirror)
 
-	// Gentoo-specific settings
+	// Portage path settings
 	config.PortageReposPath = getEnvString(env, "PORTAGE_REPOS_PATH", config.PortageReposPath)
 	config.PortageConfPath = getEnvString(env, "PORTAGE_CONF_PATH", config.PortageConfPath)
 	config.MakeConfPath = getEnvString(env, "MAKE_CONF_PATH", config.MakeConfPath)
-
-	// Debian-specific settings
-	config.AptSourcesPath = getEnvString(env, "APT_SOURCES_PATH", config.AptSourcesPath)
-	config.AptCachePath = getEnvString(env, "APT_CACHE_PATH", config.AptCachePath)
-	config.DebianCodename = getEnvString(env, "DEBIAN_CODENAME", config.DebianCodename)
 
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")

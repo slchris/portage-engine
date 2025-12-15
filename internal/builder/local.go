@@ -232,7 +232,6 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 	// Ensure cfg is not nil for PackageManager
 	if cfg == nil {
 		cfg = &config.BuilderConfig{
-			HostOSType:       config.OSTypeGentoo,
 			PortageReposPath: "/var/db/repos",
 			PortageConfPath:  "/etc/portage",
 			MakeConfPath:     "/etc/portage/make.conf",
@@ -506,24 +505,8 @@ func (lb *LocalBuilder) executeConfigBundleBuild(job *BuildJob) error {
 	return err
 }
 
-// generateBuildScript creates a build script based on the OS type.
+// generateBuildScript creates a Gentoo build script for Docker container.
 func (lb *LocalBuilder) generateBuildScript(pkgAtom string, useFlags string) string {
-	if lb.cfg == nil || lb.cfg.HostOSType == config.OSTypeGentoo || lb.cfg.HostOSType == "" {
-		return lb.generateGentooScript(pkgAtom, useFlags)
-	}
-
-	switch lb.cfg.HostOSType {
-	case config.OSTypeGentoo:
-		return lb.generateGentooScript(pkgAtom, useFlags)
-	case config.OSTypeDebian:
-		return lb.generateDebianScript(pkgAtom)
-	default:
-		return lb.generateGentooScript(pkgAtom, useFlags)
-	}
-}
-
-// generateGentooScript creates a Gentoo build script.
-func (lb *LocalBuilder) generateGentooScript(pkgAtom string, useFlags string) string {
 	return fmt.Sprintf(`#!/bin/bash
 set -e
 export USE="%s"
@@ -534,33 +517,6 @@ echo "Build completed, copying artifacts..."
 find /var/cache/binpkgs -type f -name '*.gpkg.tar' -exec cp {} /output/ \; 2>/dev/null || find /var/cache/binpkgs -type f -name '*.tbz2' -exec cp {} /output/ \; 2>/dev/null || true
 ls -lh /output/
 `, useFlags, pkgAtom, pkgAtom)
-}
-
-// generateDebianScript creates a Debian build script.
-func (lb *LocalBuilder) generateDebianScript(pkgName string) string {
-	return fmt.Sprintf(`#!/bin/bash
-set -e
-export DEBIAN_FRONTEND=noninteractive
-echo "Starting Debian package build for %s"
-
-# Update package lists
-apt-get update
-
-# Install build dependencies
-apt-get build-dep -y %s || echo "Warning: Could not install build dependencies"
-
-# Get source and build
-mkdir -p /tmp/build
-cd /tmp/build
-apt-get source %s
-cd %s-*
-dpkg-buildpackage -us -uc -b
-
-# Copy artifacts to output
-echo "Build completed, copying artifacts..."
-find /tmp/build -maxdepth 1 -type f -name '*.deb' -exec cp {} /output/ \; 2>/dev/null || true
-ls -lh /output/
-`, pkgName, pkgName, pkgName, pkgName)
 }
 
 // executeDockerBuild performs the build using Docker container.

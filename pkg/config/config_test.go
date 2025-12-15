@@ -246,11 +246,11 @@ EMPTY_KEY=
 	}
 }
 
-// TestLoadBuilderConfigMultiDistro tests loading multi-distro configuration.
-func TestLoadBuilderConfigMultiDistro(t *testing.T) {
-	t.Run("gentoo config", func(t *testing.T) {
-		tmpFile := "/tmp/test-builder-gentoo.conf"
-		configData := `HOST_OS_TYPE=gentoo
+// TestLoadBuilderConfigPortageSettings tests loading portage mirror configuration.
+func TestLoadBuilderConfigPortageSettings(t *testing.T) {
+	t.Run("portage mirror config", func(t *testing.T) {
+		tmpFile := "/tmp/test-builder-portage.conf"
+		configData := `DOCKER_IMAGE=hub.example.com/gentoo/stage3:latest
 SYNC_MIRROR=rsync://rsync.example.com/gentoo-portage
 DISTFILES_MIRROR=https://mirrors.example.com/gentoo
 PORTAGE_REPOS_PATH=/custom/repos
@@ -268,8 +268,8 @@ MAKE_CONF_PATH=/custom/make.conf
 			t.Fatalf("LoadBuilderConfig failed: %v", err)
 		}
 
-		if cfg.HostOSType != OSTypeGentoo {
-			t.Errorf("Expected HostOSType=gentoo, got %s", cfg.HostOSType)
+		if cfg.DockerImage != "hub.example.com/gentoo/stage3:latest" {
+			t.Errorf("Expected DockerImage=hub.example.com/gentoo/stage3:latest, got %s", cfg.DockerImage)
 		}
 
 		if cfg.SyncMirror != "rsync://rsync.example.com/gentoo-portage" {
@@ -293,50 +293,8 @@ MAKE_CONF_PATH=/custom/make.conf
 		}
 	})
 
-	t.Run("debian config", func(t *testing.T) {
-		tmpFile := "/tmp/test-builder-debian.conf"
-		configData := `HOST_OS_TYPE=debian
-DOCKER_IMAGE=debian:bookworm
-SYNC_MIRROR=http://deb.debian.org/debian
-DISTFILES_MIRROR=http://mirrors.example.com/debian
-APT_SOURCES_PATH=/custom/apt
-APT_CACHE_PATH=/custom/cache
-DEBIAN_CODENAME=sid
-`
-
-		if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
-			t.Fatalf("Failed to create test config: %v", err)
-		}
-		defer func() { _ = os.Remove(tmpFile) }()
-
-		cfg, err := LoadBuilderConfig(tmpFile)
-		if err != nil {
-			t.Fatalf("LoadBuilderConfig failed: %v", err)
-		}
-
-		if cfg.HostOSType != OSTypeDebian {
-			t.Errorf("Expected HostOSType=debian, got %s", cfg.HostOSType)
-		}
-
-		if cfg.DockerImage != "debian:bookworm" {
-			t.Errorf("Expected DockerImage=debian:bookworm, got %s", cfg.DockerImage)
-		}
-
-		if cfg.AptSourcesPath != "/custom/apt" {
-			t.Errorf("Expected AptSourcesPath=/custom/apt, got %s", cfg.AptSourcesPath)
-		}
-
-		if cfg.AptCachePath != "/custom/cache" {
-			t.Errorf("Expected AptCachePath=/custom/cache, got %s", cfg.AptCachePath)
-		}
-
-		if cfg.DebianCodename != "sid" {
-			t.Errorf("Expected DebianCodename=sid, got %s", cfg.DebianCodename)
-		}
-	})
-
-	t.Run("default os type", func(t *testing.T) {
-		tmpFile := "/tmp/test-builder-default.conf"
+	t.Run("default paths", func(t *testing.T) {
+		tmpFile := "/tmp/test-builder-defaults.conf"
 		configData := `BUILDER_PORT=9090
 `
 
@@ -350,30 +308,22 @@ DEBIAN_CODENAME=sid
 			t.Fatalf("LoadBuilderConfig failed: %v", err)
 		}
 
-		// Default should be gentoo
-		if cfg.HostOSType != OSTypeGentoo {
-			t.Errorf("Expected default HostOSType=gentoo, got %s", cfg.HostOSType)
-		}
-
 		// Default Gentoo paths
 		if cfg.PortageReposPath != "/var/db/repos" {
 			t.Errorf("Expected default PortageReposPath=/var/db/repos, got %s", cfg.PortageReposPath)
 		}
 
-		// Default Debian paths should also be set
-		if cfg.AptSourcesPath != "/etc/apt" {
-			t.Errorf("Expected default AptSourcesPath=/etc/apt, got %s", cfg.AptSourcesPath)
+		if cfg.PortageConfPath != "/etc/portage" {
+			t.Errorf("Expected default PortageConfPath=/etc/portage, got %s", cfg.PortageConfPath)
+		}
+
+		if cfg.MakeConfPath != "/etc/portage/make.conf" {
+			t.Errorf("Expected default MakeConfPath=/etc/portage/make.conf, got %s", cfg.MakeConfPath)
+		}
+
+		// Default Docker image
+		if cfg.DockerImage != "gentoo/stage3:latest" {
+			t.Errorf("Expected default DockerImage=gentoo/stage3:latest, got %s", cfg.DockerImage)
 		}
 	})
-}
-
-// TestOSTypeConstants tests the OS type constants.
-func TestOSTypeConstants(t *testing.T) {
-	if OSTypeGentoo != "gentoo" {
-		t.Errorf("OSTypeGentoo should be 'gentoo', got %s", OSTypeGentoo)
-	}
-
-	if OSTypeDebian != "debian" {
-		t.Errorf("OSTypeDebian should be 'debian', got %s", OSTypeDebian)
-	}
 }

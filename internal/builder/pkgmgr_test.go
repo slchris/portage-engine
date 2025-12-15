@@ -9,44 +9,18 @@ import (
 )
 
 func TestNewPackageManager(t *testing.T) {
-	tests := []struct {
-		name     string
-		osType   config.OSType
-		wantName string
-	}{
-		{
-			name:     "gentoo package manager",
-			osType:   config.OSTypeGentoo,
-			wantName: "portage",
-		},
-		{
-			name:     "debian package manager",
-			osType:   config.OSTypeDebian,
-			wantName: "apt",
-		},
-		{
-			name:     "default to gentoo",
-			osType:   "",
-			wantName: "portage",
-		},
+	cfg := &config.BuilderConfig{
+		PortageReposPath: "/var/db/repos",
+		PortageConfPath:  "/etc/portage",
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &config.BuilderConfig{
-				HostOSType: tt.osType,
-			}
-			pm := NewPackageManager(cfg)
-			if pm.Name() != tt.wantName {
-				t.Errorf("NewPackageManager() name = %v, want %v", pm.Name(), tt.wantName)
-			}
-		})
+	pm := NewPackageManager(cfg)
+	if pm.Name() != "portage" {
+		t.Errorf("NewPackageManager() name = %v, want portage", pm.Name())
 	}
 }
 
 func TestGentooPackageManager_Commands(t *testing.T) {
 	cfg := &config.BuilderConfig{
-		HostOSType:       config.OSTypeGentoo,
 		PortageReposPath: "/var/db/repos",
 		PortageConfPath:  "/etc/portage",
 	}
@@ -109,7 +83,6 @@ func TestGentooPackageManager_Commands(t *testing.T) {
 
 func TestGentooPackageManager_DockerMounts(t *testing.T) {
 	cfg := &config.BuilderConfig{
-		HostOSType:       config.OSTypeGentoo,
 		PortageReposPath: "/var/db/repos",
 		PortageConfPath:  "/etc/portage",
 		MakeConfPath:     "/etc/portage/make.conf",
@@ -153,7 +126,6 @@ func TestGentooPackageManager_DockerMounts(t *testing.T) {
 func TestGentooPackageManager_EnvVars(t *testing.T) {
 	t.Run("with mirrors configured", func(t *testing.T) {
 		cfg := &config.BuilderConfig{
-			HostOSType:      config.OSTypeGentoo,
 			DistfilesMirror: "https://mirrors.example.com/gentoo",
 			SyncMirror:      "rsync://rsync.example.com/gentoo-portage",
 		}
@@ -170,9 +142,7 @@ func TestGentooPackageManager_EnvVars(t *testing.T) {
 	})
 
 	t.Run("without mirrors configured", func(t *testing.T) {
-		cfg := &config.BuilderConfig{
-			HostOSType: config.OSTypeGentoo,
-		}
+		cfg := &config.BuilderConfig{}
 		pm := NewGentooPackageManager(cfg)
 
 		envVars := pm.GetEnvVars(cfg)
@@ -181,109 +151,6 @@ func TestGentooPackageManager_EnvVars(t *testing.T) {
 			t.Error("GENTOO_MIRRORS should not be set when not configured")
 		}
 	})
-}
-
-func TestDebianPackageManager_Commands(t *testing.T) {
-	cfg := &config.BuilderConfig{
-		HostOSType:     config.OSTypeDebian,
-		DebianCodename: "bookworm",
-	}
-	pm := NewDebianPackageManager(cfg)
-
-	t.Run("install command", func(t *testing.T) {
-		cmd := pm.InstallCommand("nginx", nil)
-		if cmd[0] != "apt-get" {
-			t.Errorf("first element should be 'apt-get', got %v", cmd[0])
-		}
-		if cmd[1] != "install" {
-			t.Errorf("second element should be 'install', got %v", cmd[1])
-		}
-		if cmd[len(cmd)-1] != "nginx" {
-			t.Errorf("last element should be package name, got %v", cmd[len(cmd)-1])
-		}
-	})
-
-	t.Run("build command", func(t *testing.T) {
-		cmd := pm.BuildCommand("nginx", nil)
-		if cmd[0] != "sh" {
-			t.Errorf("first element should be 'sh', got %v", cmd[0])
-		}
-		if cmd[1] != "-c" {
-			t.Errorf("second element should be '-c', got %v", cmd[1])
-		}
-	})
-
-	t.Run("search command", func(t *testing.T) {
-		cmd := pm.SearchCommand("nginx")
-		if cmd[0] != "apt-cache" {
-			t.Errorf("first element should be 'apt-cache', got %v", cmd[0])
-		}
-	})
-
-	t.Run("update command", func(t *testing.T) {
-		cmd := pm.UpdateCommand()
-		if cmd[0] != "apt-get" {
-			t.Errorf("first element should be 'apt-get', got %v", cmd[0])
-		}
-		if cmd[1] != "update" {
-			t.Errorf("second element should be 'update', got %v", cmd[1])
-		}
-	})
-
-	t.Run("artifact extension", func(t *testing.T) {
-		ext := pm.ArtifactExtension()
-		if ext != ".deb" {
-			t.Errorf("artifact extension should be '.deb', got %v", ext)
-		}
-	})
-}
-
-func TestDebianPackageManager_DockerMounts(t *testing.T) {
-	cfg := &config.BuilderConfig{
-		HostOSType:     config.OSTypeDebian,
-		AptSourcesPath: "/etc/apt",
-		AptCachePath:   "/var/cache/apt",
-	}
-	pm := NewDebianPackageManager(cfg)
-
-	mounts := pm.GetDockerMounts(cfg)
-
-	// Should have sources.list, sources.list.d, and cache mounts
-	if len(mounts) < 3 {
-		t.Errorf("expected at least 3 mounts for Debian, got %d", len(mounts))
-	}
-
-	// Check apt cache mount is not read-only
-	foundCache := false
-	for _, m := range mounts {
-		if m.Target == "/var/cache/apt" {
-			foundCache = true
-			if m.ReadOnly {
-				t.Error("apt cache mount should not be read-only")
-			}
-			break
-		}
-	}
-	if !foundCache {
-		t.Error("expected /var/cache/apt mount")
-	}
-}
-
-func TestDebianPackageManager_EnvVars(t *testing.T) {
-	cfg := &config.BuilderConfig{
-		HostOSType:      config.OSTypeDebian,
-		DistfilesMirror: "https://mirrors.example.com/debian",
-	}
-	pm := NewDebianPackageManager(cfg)
-
-	envVars := pm.GetEnvVars(cfg)
-
-	if envVars["DEBIAN_FRONTEND"] != "noninteractive" {
-		t.Error("DEBIAN_FRONTEND should be 'noninteractive'")
-	}
-	if envVars["APT_MIRROR"] != "https://mirrors.example.com/debian" {
-		t.Errorf("APT_MIRROR not set correctly, got %v", envVars["APT_MIRROR"])
-	}
 }
 
 func TestDockerMount_String(t *testing.T) {
@@ -323,9 +190,7 @@ func TestDockerMount_String(t *testing.T) {
 }
 
 func TestGentooPackageManager_BuildCommandWithOptions(t *testing.T) {
-	cfg := &config.BuilderConfig{
-		HostOSType: config.OSTypeGentoo,
-	}
+	cfg := &config.BuilderConfig{}
 	pm := NewGentooPackageManager(cfg)
 
 	options := []string{"--oneshot", "--update"}
@@ -343,17 +208,15 @@ func TestGentooPackageManager_BuildCommandWithOptions(t *testing.T) {
 	}
 }
 
-func TestDebianPackageManager_InstallCommandWithOptions(t *testing.T) {
-	cfg := &config.BuilderConfig{
-		HostOSType: config.OSTypeDebian,
+func TestGentooPackageManager_GetArtifactPaths(t *testing.T) {
+	cfg := &config.BuilderConfig{}
+	pm := NewGentooPackageManager(cfg)
+
+	paths := pm.GetArtifactPaths()
+	if len(paths) == 0 {
+		t.Error("expected at least one artifact path")
 	}
-	pm := NewDebianPackageManager(cfg)
-
-	options := []string{"--no-install-recommends"}
-	cmd := pm.InstallCommand("nginx", options)
-
-	cmdStr := strings.Join(cmd, " ")
-	if !strings.Contains(cmdStr, "--no-install-recommends") {
-		t.Error("command should contain --no-install-recommends option")
+	if paths[0] != "/var/cache/binpkgs" {
+		t.Errorf("expected /var/cache/binpkgs, got %v", paths[0])
 	}
 }

@@ -3,7 +3,6 @@ package builder
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"github.com/slchris/portage-engine/pkg/config"
@@ -153,114 +152,7 @@ func (g *GentooPackageManager) ArtifactExtension() string {
 	return ".gpkg.tar"
 }
 
-// DebianPackageManager implements PackageManager for Debian-based systems.
-type DebianPackageManager struct {
-	cfg *config.BuilderConfig
-}
-
-// NewDebianPackageManager creates a new Debian package manager.
-func NewDebianPackageManager(cfg *config.BuilderConfig) *DebianPackageManager {
-	return &DebianPackageManager{cfg: cfg}
-}
-
-// Name returns the package manager name.
-func (d *DebianPackageManager) Name() string {
-	return "apt"
-}
-
-// InstallCommand returns the apt install command.
-func (d *DebianPackageManager) InstallCommand(pkg string, options []string) []string {
-	cmd := []string{"apt-get", "install", "-y"}
-	cmd = append(cmd, options...)
-	cmd = append(cmd, pkg)
-	return cmd
-}
-
-// BuildCommand returns the command to build a Debian package from source.
-func (d *DebianPackageManager) BuildCommand(pkg string, _ []string) []string {
-	// For Debian, building from source typically involves:
-	// 1. apt-get source pkg
-	// 2. cd pkg-version && dpkg-buildpackage
-	// We simplify this to apt-get build-dep + build from source
-	cmd := []string{"sh", "-c", fmt.Sprintf(
-		"apt-get source %s && cd %s-* && dpkg-buildpackage -us -uc -b",
-		pkg, pkg,
-	)}
-	return cmd
-}
-
-// SearchCommand returns the apt search command.
-func (d *DebianPackageManager) SearchCommand(pkg string) []string {
-	return []string{"apt-cache", "search", pkg}
-}
-
-// UpdateCommand returns the apt update command.
-func (d *DebianPackageManager) UpdateCommand() []string {
-	return []string{"apt-get", "update"}
-}
-
-// GetDockerMounts returns Debian-specific Docker mounts.
-func (d *DebianPackageManager) GetDockerMounts(cfg *config.BuilderConfig) []DockerMount {
-	mounts := []DockerMount{}
-
-	// Mount apt sources if configured
-	if cfg.AptSourcesPath != "" {
-		mounts = append(mounts, DockerMount{
-			Source:   filepath.Join(cfg.AptSourcesPath, "sources.list"),
-			Target:   "/etc/apt/sources.list",
-			ReadOnly: true,
-		})
-		mounts = append(mounts, DockerMount{
-			Source:   filepath.Join(cfg.AptSourcesPath, "sources.list.d"),
-			Target:   "/etc/apt/sources.list.d",
-			ReadOnly: true,
-		})
-	}
-
-	// Mount apt cache if configured (for reusing downloaded packages)
-	if cfg.AptCachePath != "" {
-		mounts = append(mounts, DockerMount{
-			Source:   cfg.AptCachePath,
-			Target:   "/var/cache/apt",
-			ReadOnly: false, // Need write access for cache
-		})
-	}
-
-	return mounts
-}
-
-// GetEnvVars returns Debian-specific environment variables.
-func (d *DebianPackageManager) GetEnvVars(cfg *config.BuilderConfig) map[string]string {
-	envVars := map[string]string{
-		"DEBIAN_FRONTEND": "noninteractive",
-	}
-
-	// Add mirror URL if configured
-	if cfg.DistfilesMirror != "" {
-		envVars["APT_MIRROR"] = cfg.DistfilesMirror
-	}
-
-	return envVars
-}
-
-// GetArtifactPaths returns paths where Debian packages are stored after build.
-func (d *DebianPackageManager) GetArtifactPaths() []string {
-	return []string{"/var/cache/apt/archives", "/tmp/build"}
-}
-
-// ArtifactExtension returns the Debian package extension.
-func (d *DebianPackageManager) ArtifactExtension() string {
-	return ".deb"
-}
-
-// NewPackageManager creates a PackageManager based on the OS type.
+// NewPackageManager creates a PackageManager (always Gentoo for Docker builds).
 func NewPackageManager(cfg *config.BuilderConfig) PackageManager {
-	switch cfg.HostOSType {
-	case config.OSTypeDebian:
-		return NewDebianPackageManager(cfg)
-	case config.OSTypeGentoo:
-		fallthrough
-	default:
-		return NewGentooPackageManager(cfg)
-	}
+	return NewGentooPackageManager(cfg)
 }
