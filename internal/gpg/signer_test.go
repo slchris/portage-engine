@@ -275,3 +275,64 @@ func TestSignDirectoryDisabled(t *testing.T) {
 		t.Errorf("SignDirectory should succeed when disabled: %v", err)
 	}
 }
+
+// TestGetSecretKeyNoKeyID tests GetSecretKey fails without key ID.
+func TestGetSecretKeyNoKeyID(t *testing.T) {
+	t.Parallel()
+
+	signer := NewSigner("", "", true)
+
+	_, err := signer.GetSecretKey()
+	if err == nil {
+		t.Error("GetSecretKey should fail without key ID")
+	}
+	if !strings.Contains(err.Error(), "no key ID configured") {
+		t.Errorf("Unexpected error: %v", err)
+	}
+}
+
+// TestExportSecretKeyNoKeyID tests ExportSecretKey fails without key ID.
+func TestExportSecretKeyNoKeyID(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	signer := NewSigner("", "", true)
+
+	err := signer.ExportSecretKey(filepath.Join(tmpDir, "secret.asc"))
+	if err == nil {
+		t.Error("ExportSecretKey should fail without key ID")
+	}
+}
+
+// TestExportKeyPairNoKeyID tests ExportKeyPair fails without key ID.
+func TestExportKeyPairNoKeyID(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	signer := NewSigner("", "", true)
+
+	_, _, err := signer.ExportKeyPair(tmpDir)
+	if err == nil {
+		t.Error("ExportKeyPair should fail without key ID")
+	}
+}
+
+// TestExportKeyPairCreateDirectory tests ExportKeyPair creates directory.
+func TestExportKeyPairCreateDirectory(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	newDir := filepath.Join(tmpDir, "nested", "gpg-keys")
+	signer := NewSigner("", "", true) // No key ID
+
+	// Will fail on export because no key ID
+	_, _, err := signer.ExportKeyPair(newDir)
+	if err == nil {
+		t.Error("ExportKeyPair should fail without key ID")
+	}
+
+	// Directory should still be created before the export attempt
+	if _, err := os.Stat(newDir); os.IsNotExist(err) {
+		t.Error("ExportKeyPair should create the directory before failing")
+	}
+}

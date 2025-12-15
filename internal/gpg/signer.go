@@ -262,6 +262,69 @@ func (s *Signer) ExportPublicKey(path string) error {
 	return nil
 }
 
+// GetSecretKey returns the secret key in ASCII armor format.
+// This is used for package signing in containers.
+func (s *Signer) GetSecretKey() (string, error) {
+	if s.keyID == "" {
+		return "", fmt.Errorf("no key ID configured")
+	}
+
+	args := s.buildBaseArgs()
+	args = append(args, "--armor", "--export-secret-keys", s.keyID)
+
+	cmd := exec.Command("gpg", args...)
+	if s.gnupgHome != "" {
+		cmd.Env = append(os.Environ(), "GNUPGHOME="+s.gnupgHome)
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to export secret key: %w, stderr: %s", err, stderr.String())
+	}
+
+	return stdout.String(), nil
+}
+
+// ExportSecretKey exports the secret key to a file.
+// This is needed for container-based package signing.
+func (s *Signer) ExportSecretKey(path string) error {
+	key, err := s.GetSecretKey()
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(path, []byte(key), 0600); err != nil {
+		return fmt.Errorf("failed to write secret key: %w", err)
+	}
+
+	log.Printf("Secret key exported to: %s", path)
+	return nil
+}
+
+// ExportKeyPair exports both public and secret keys to a directory.
+// Returns the paths to the public and secret key files.
+func (s *Signer) ExportKeyPair(dir string) (publicKeyPath, secretKeyPath string, err error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", "", fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	publicKeyPath = filepath.Join(dir, "public.asc")
+	secretKeyPath = filepath.Join(dir, "secret.asc")
+
+	if err := s.ExportPublicKey(publicKeyPath); err != nil {
+		return "", "", fmt.Errorf("failed to export public key: %w", err)
+	}
+
+	if err := s.ExportSecretKey(secretKeyPath); err != nil {
+		return "", "", fmt.Errorf("failed to export secret key: %w", err)
+	}
+
+	return publicKeyPath, secretKeyPath, nil
+}
+
 // SignPackage signs a package file with GPG.
 func (s *Signer) SignPackage(packagePath string) error {
 	if !s.enabled {

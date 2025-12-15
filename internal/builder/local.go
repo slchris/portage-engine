@@ -548,15 +548,25 @@ func (lb *LocalBuilder) generateBuildScript(pkgAtom string, useFlags string, gpg
 	if gpgKeyID != "" {
 		features = "buildpkg binpkg-signing"
 		gpgSetup = fmt.Sprintf(`
-# Setup GPG for package signing
-if [ -d /gpg-keys ]; then
-    export GNUPGHOME=/root/.gnupg
-    mkdir -p $GNUPGHOME
-    chmod 700 $GNUPGHOME
-    gpg --batch --yes --import /gpg-keys/*.asc 2>/dev/null || true
-    echo "GPG keys imported"
-    gpg --list-keys
+# Setup GPG for package signing with secret key
+export GNUPGHOME=/root/.gnupg
+mkdir -p $GNUPGHOME
+chmod 700 $GNUPGHOME
+
+# Import secret key for signing (required for binpkg-signing)
+if [ -f /gpg-keys/secret.asc ]; then
+    gpg --batch --yes --import /gpg-keys/secret.asc 2>/dev/null || true
+    echo "GPG secret key imported for signing"
 fi
+
+# Import public key as well
+if [ -f /gpg-keys/public.asc ]; then
+    gpg --batch --yes --import /gpg-keys/public.asc 2>/dev/null || true
+fi
+
+# Set trust level for the key
+gpg --batch --yes --list-keys
+echo -e "5\ny\n" | gpg --batch --yes --command-fd 0 --edit-key "%s" trust quit 2>/dev/null || true
 
 # Configure portage for GPG signing
 cat >> /etc/portage/make.conf << 'GPGEOF'
@@ -564,7 +574,7 @@ FEATURES="${FEATURES} binpkg-signing"
 BINPKG_GPG_SIGNING_GPG_HOME="/root/.gnupg"
 BINPKG_GPG_SIGNING_KEY="%s"
 GPGEOF
-`, gpgKeyID)
+`, gpgKeyID, gpgKeyID)
 	}
 
 	// Build emerge command with automatic dependency conflict resolution
@@ -634,10 +644,22 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 	outputDir := filepath.Join(jobWorkDir, "output")
 	_ = os.MkdirAll(outputDir, 0750)
 
-	// Prepare GPG key directory for mounting
+	// Prepare GPG key directory for mounting with both public and secret keys
 	gpgKeyDir := ""
-	if gpgKeyID != "" && lb.cfg != nil && lb.cfg.GPGHome != "" {
-		gpgKeyDir = lb.cfg.GPGHome
+	if gpgKeyID != "" && lb.signer != nil && lb.signer.IsEnabled() {
+		// Create temporary directory for GPG keys
+		gpgKeyDir = filepath.Join(jobWorkDir, "gpg-keys")
+		if err := os.MkdirAll(gpgKeyDir, 0700); err != nil {
+			return fmt.Errorf("failed to create GPG key directory: %w", err)
+		}
+		// Export both public and secret keys for container signing
+		_, _, err := lb.signer.ExportKeyPair(gpgKeyDir)
+		if err != nil {
+			log.Printf("Warning: failed to export GPG keys: %v", err)
+			gpgKeyDir = ""
+		} else {
+			log.Printf("GPG keys exported to %s for container signing", gpgKeyDir)
+		}
 	}
 
 	// Build container run arguments
