@@ -120,6 +120,12 @@ func (be *BuildExecutor) constructEmergeCommand(
 	cmd = append(cmd, "--verbose")       // Verbose output
 	cmd = append(cmd, "--quiet-build=n") // Show build output
 
+	// Add options to automatically resolve dependency conflicts
+	cmd = append(cmd, "--autounmask")          // Automatically unmask packages
+	cmd = append(cmd, "--autounmask-write")    // Write unmask changes to config
+	cmd = append(cmd, "--autounmask-continue") // Continue after writing changes
+	cmd = append(cmd, "--backtrack=50")        // Increase backtrack for complex deps
+
 	// Add package-specific USE flags if provided
 	if len(pkg.UseFlags) > 0 {
 		useFlags := strings.Join(pkg.UseFlags, " ")

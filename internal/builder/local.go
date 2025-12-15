@@ -567,17 +567,31 @@ GPGEOF
 `, gpgKeyID)
 	}
 
+	// Build emerge command with automatic dependency conflict resolution
+	emergeOpts := "--usepkg=n --autounmask --autounmask-write --autounmask-continue --backtrack=50"
+
 	return fmt.Sprintf(`#!/bin/bash
 set -e
 export USE="%s"
 export FEATURES="%s"
 %s
 echo "Starting Gentoo package build for %s"
-emerge --usepkg=n %s || exit 1
+
+# Run emerge with automatic dependency resolution
+# First attempt: try with autounmask options
+if ! emerge %s %s; then
+    echo "First emerge attempt failed, applying autounmask changes..."
+    # Dispatch any pending config updates
+    etc-update --automode -5 2>/dev/null || true
+    dispatch-conf --use-rcs 2>/dev/null || true
+    # Retry emerge after applying changes
+    emerge %s %s || exit 1
+fi
+
 echo "Build completed, copying artifacts..."
 find /var/cache/binpkgs -type f -name '*.gpkg.tar' -exec cp {} /output/ \; 2>/dev/null || find /var/cache/binpkgs -type f -name '*.tbz2' -exec cp {} /output/ \; 2>/dev/null || true
 ls -lh /output/
-`, useFlags, features, gpgSetup, pkgAtom, pkgAtom)
+`, useFlags, features, gpgSetup, pkgAtom, emergeOpts, pkgAtom, emergeOpts, pkgAtom)
 }
 
 // executeDockerBuild performs the build using Docker container.
