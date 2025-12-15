@@ -242,14 +242,19 @@ func (be *BuildExecutor) copyFile(src, dst string) error {
 // DockerBuildExecutor handles Docker-based builds.
 type DockerBuildExecutor struct {
 	*BuildExecutor
-	dockerImage string
+	dockerImage      string
+	containerRuntime ContainerRuntime
 }
 
 // NewDockerBuildExecutor creates a new Docker-based build executor.
-func NewDockerBuildExecutor(workDir, artifactDir, dockerImage string) *DockerBuildExecutor {
+func NewDockerBuildExecutor(workDir, artifactDir, dockerImage string, runtime ContainerRuntime) *DockerBuildExecutor {
+	if runtime == nil {
+		runtime = NewDockerRuntime()
+	}
 	return &DockerBuildExecutor{
-		BuildExecutor: NewBuildExecutor(workDir, artifactDir),
-		dockerImage:   dockerImage,
+		BuildExecutor:    NewBuildExecutor(workDir, artifactDir),
+		dockerImage:      dockerImage,
+		containerRuntime: runtime,
 	}
 }
 
@@ -275,31 +280,26 @@ func (dbe *DockerBuildExecutor) ExecuteBuild(
 		return fmt.Errorf("failed to export bundle: %w", err)
 	}
 
-	// Prepare Docker container
+	// Prepare container
 	containerName := fmt.Sprintf("portage-build-%s", buildID)
 
 	// Create container
-	createCmd := exec.CommandContext(ctx, "docker", "create",
+	createArgs := []string{
 		"--name", containerName,
 		"-v", fmt.Sprintf("%s:/workspace", buildWorkDir),
 		"-v", fmt.Sprintf("%s:/artifacts", dbe.artifactDir),
 		"-w", "/workspace",
 		dbe.dockerImage,
 		"/bin/bash", "-c", "sleep infinity",
-	)
+	}
 
-	var createOut, createErr bytes.Buffer
-	createCmd.Stdout = &createOut
-	createCmd.Stderr = &createErr
-
-	if err := createCmd.Run(); err != nil {
-		job.Log += fmt.Sprintf("Failed to create container:\n%s\n", createErr.String())
+	if err := dbe.containerRuntime.Create(ctx, createArgs); err != nil {
+		job.Log += fmt.Sprintf("Failed to create container: %v\n", err)
 		return fmt.Errorf("failed to create container: %w", err)
 	}
 
 	// Start container
-	startCmd := exec.CommandContext(ctx, "docker", "start", containerName)
-	if err := startCmd.Run(); err != nil {
+	if err := dbe.containerRuntime.Start(ctx, containerName); err != nil {
 		_ = dbe.cleanupContainer(ctx, containerName)
 		return fmt.Errorf("failed to start container: %w", err)
 	}
@@ -310,20 +310,20 @@ func (dbe *DockerBuildExecutor) ExecuteBuild(
 	}()
 
 	// Extract configuration bundle inside container
-	extractCmd := exec.CommandContext(ctx, "docker", "exec", containerName,
+	_, err := dbe.containerRuntime.Exec(ctx, containerName, []string{
 		"/bin/bash", "-c",
 		"mkdir -p /tmp/config && tar -xzf /workspace/config-bundle.tar.gz -C /tmp/config",
-	)
-	if err := extractCmd.Run(); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("failed to extract config bundle: %w", err)
 	}
 
 	// Apply configuration
-	applyCmd := exec.CommandContext(ctx, "docker", "exec", containerName,
+	_, err = dbe.containerRuntime.Exec(ctx, containerName, []string{
 		"/bin/bash", "-c",
 		"cp -r /tmp/config/etc/portage/* /etc/portage/",
-	)
-	if err := applyCmd.Run(); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("failed to apply configuration: %w", err)
 	}
 
@@ -337,7 +337,7 @@ func (dbe *DockerBuildExecutor) ExecuteBuild(
 	return nil
 }
 
-// buildPackageInDocker builds a package inside Docker container.
+// buildPackageInDocker builds a package inside container.
 func (dbe *DockerBuildExecutor) buildPackageInDocker(
 	ctx context.Context,
 	pkg PackageSpec,
@@ -356,55 +356,36 @@ func (dbe *DockerBuildExecutor) buildPackageInDocker(
 	// Execute build in container
 	fullCmd := fmt.Sprintf("%s %s", envStr, cmdStr)
 
-	execCmd := exec.CommandContext(ctx, "docker", "exec", containerName,
-		"/bin/bash", "-c", fullCmd,
-	)
-
-	var stdout, stderr bytes.Buffer
-	execCmd.Stdout = &stdout
-	execCmd.Stderr = &stderr
-
-	job.Log += fmt.Sprintf("Building package in Docker: %s\n", pkg.Atom)
+	job.Log += fmt.Sprintf("Building package in container: %s\n", pkg.Atom)
 	job.Log += fmt.Sprintf("Command: %s\n", fullCmd)
 
 	startTime := time.Now()
-	err := execCmd.Run()
+	output, err := dbe.containerRuntime.Exec(ctx, containerName, []string{
+		"/bin/bash", "-c", fullCmd,
+	})
 	duration := time.Since(startTime)
 
 	job.Log += fmt.Sprintf("Build duration: %s\n", duration)
-	job.Log += fmt.Sprintf("STDOUT:\n%s\n", stdout.String())
-	if stderr.Len() > 0 {
-		job.Log += fmt.Sprintf("STDERR:\n%s\n", stderr.String())
-	}
+	job.Log += fmt.Sprintf("Output:\n%s\n", string(output))
 
 	if err != nil {
 		return fmt.Errorf("emerge failed in container: %w", err)
 	}
 
 	// Copy artifacts from container
-	copyCmd := exec.CommandContext(ctx, "docker", "cp",
-		fmt.Sprintf("%s:/var/cache/binpkgs/.", containerName),
-		dbe.artifactDir,
-	)
-
-	var copyOut, copyErr bytes.Buffer
-	copyCmd.Stdout = &copyOut
-	copyCmd.Stderr = &copyErr
-
-	if err := copyCmd.Run(); err != nil {
-		job.Log += fmt.Sprintf("Warning: Failed to copy artifacts:\n%s\n", copyErr.String())
+	src := fmt.Sprintf("%s:/var/cache/binpkgs/.", containerName)
+	if err := dbe.containerRuntime.Copy(ctx, src, dbe.artifactDir); err != nil {
+		job.Log += fmt.Sprintf("Warning: Failed to copy artifacts: %v\n", err)
 	}
 
 	return nil
 }
 
-// cleanupContainer stops and removes a Docker container.
+// cleanupContainer stops and removes a container.
 func (dbe *DockerBuildExecutor) cleanupContainer(ctx context.Context, containerName string) error {
 	// Stop container
-	stopCmd := exec.CommandContext(ctx, "docker", "stop", containerName)
-	_ = stopCmd.Run()
+	_ = dbe.containerRuntime.Stop(ctx, containerName)
 
 	// Remove container
-	rmCmd := exec.CommandContext(ctx, "docker", "rm", containerName)
-	return rmCmd.Run()
+	return dbe.containerRuntime.Remove(ctx, containerName)
 }

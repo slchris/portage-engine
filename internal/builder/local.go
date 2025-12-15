@@ -45,26 +45,27 @@ type BuildJob struct {
 
 // LocalBuilder handles build jobs locally using Docker or native builds.
 type LocalBuilder struct {
-	workers        int
-	jobQueue       chan *BuildJob
-	jobs           map[string]*BuildJob
-	jobsMutex      sync.RWMutex
-	signer         *gpg.Signer
-	gpgClient      *GPGKeyClient
-	storageUpload  *StorageUploader
-	workDir        string
-	artifactDir    string
-	useDocker      bool
-	dockerImage    string
-	executor       *BuildExecutor
-	dockerExecutor *DockerBuildExecutor
-	notifier       *notification.Notifier
-	jobStore       *JobStore
-	persister      *JobPersister
-	instanceID     string
-	architecture   string
-	pkgMgr         PackageManager
-	cfg            *config.BuilderConfig
+	workers          int
+	jobQueue         chan *BuildJob
+	jobs             map[string]*BuildJob
+	jobsMutex        sync.RWMutex
+	signer           *gpg.Signer
+	gpgClient        *GPGKeyClient
+	storageUpload    *StorageUploader
+	workDir          string
+	artifactDir      string
+	useDocker        bool
+	dockerImage      string
+	containerRuntime ContainerRuntime
+	executor         *BuildExecutor
+	dockerExecutor   *DockerBuildExecutor
+	notifier         *notification.Notifier
+	jobStore         *JobStore
+	persister        *JobPersister
+	instanceID       string
+	architecture     string
+	pkgMgr           PackageManager
+	cfg              *config.BuilderConfig
 }
 
 // NewLocalBuilder creates a new local builder instance.
@@ -100,6 +101,18 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 			dockerImage = "gentoo/stage3:latest"
 		}
 	}
+
+	// Initialize container runtime
+	containerRuntimeName := os.Getenv("CONTAINER_RUNTIME")
+	if containerRuntimeName == "" {
+		if cfg != nil && cfg.ContainerRuntime != "" {
+			containerRuntimeName = cfg.ContainerRuntime
+		} else {
+			containerRuntimeName = "docker"
+		}
+	}
+	containerRuntime := NewContainerRuntime(containerRuntimeName)
+	log.Printf("Container runtime: %s", containerRuntime.Name())
 
 	_ = os.MkdirAll(workDir, 0750)
 	_ = os.MkdirAll(artifactDir, 0750)
@@ -261,25 +274,26 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 	}
 
 	lb := &LocalBuilder{
-		workers:        workers,
-		jobQueue:       make(chan *BuildJob, 100),
-		jobs:           loadedJobs,
-		signer:         signer,
-		gpgClient:      gpgClient,
-		storageUpload:  storageUpload,
-		workDir:        workDir,
-		artifactDir:    artifactDir,
-		useDocker:      useDocker,
-		dockerImage:    dockerImage,
-		executor:       NewBuildExecutor(workDir, artifactDir),
-		dockerExecutor: NewDockerBuildExecutor(workDir, artifactDir, dockerImage),
-		notifier:       notifier,
-		jobStore:       jobStore,
-		persister:      nil,
-		instanceID:     instanceID,
-		architecture:   architecture,
-		pkgMgr:         NewPackageManager(cfg),
-		cfg:            cfg,
+		workers:          workers,
+		jobQueue:         make(chan *BuildJob, 100),
+		jobs:             loadedJobs,
+		signer:           signer,
+		gpgClient:        gpgClient,
+		storageUpload:    storageUpload,
+		workDir:          workDir,
+		artifactDir:      artifactDir,
+		useDocker:        useDocker,
+		dockerImage:      dockerImage,
+		containerRuntime: containerRuntime,
+		executor:         NewBuildExecutor(workDir, artifactDir),
+		dockerExecutor:   NewDockerBuildExecutor(workDir, artifactDir, dockerImage, containerRuntime),
+		notifier:         notifier,
+		jobStore:         jobStore,
+		persister:        nil,
+		instanceID:       instanceID,
+		architecture:     architecture,
+		pkgMgr:           NewPackageManager(cfg),
+		cfg:              cfg,
 	}
 
 	log.Printf("Builder initialized: instance_id=%s, architecture=%s", instanceID, architecture)
@@ -612,8 +626,8 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 		gpgKeyDir = lb.cfg.GPGHome
 	}
 
-	// Build Docker run arguments
-	args := []string{"run", "--rm", "-i",
+	// Build container run arguments
+	args := []string{"--rm", "-i",
 		"-v", outputDir + ":/output",
 	}
 
@@ -643,27 +657,23 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 		)
 	}
 
-	args = append(args, lb.dockerImage, "/bin/bash", "-s")
+	args = append(args, lb.dockerImage, "/bin/bash", "-c", script)
 
-	// Run Docker container with script via stdin
-	cmd := exec.CommandContext(ctx, "docker", args...)
-
-	cmd.Stdin = strings.NewReader(script)
-
-	output, err := cmd.CombinedOutput()
+	// Run container with script
+	output, err := lb.containerRuntime.Run(ctx, args)
 	job.Log = string(output)
 
 	if err != nil {
-		log.Printf("Docker build failed for job %s: %v", job.ID, err)
-		return fmt.Errorf("docker build failed: %w", err)
+		log.Printf("Container build failed for job %s: %v", job.ID, err)
+		return fmt.Errorf("container build failed: %w", err)
 	}
 
-	log.Printf("Docker build completed for job %s, output size: %d bytes", job.ID, len(output))
+	log.Printf("Container build completed for job %s, output size: %d bytes", job.ID, len(output))
 
 	// Ensure all filesystem writes are flushed
 	_ = exec.Command("sync").Run()
 
-	// Give Docker time to fully unmount volumes and sync filesystem
+	// Give container time to fully unmount volumes and sync filesystem
 	time.Sleep(10 * time.Second)
 
 	// Wait for Docker filesystem to sync and retry if needed

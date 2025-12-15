@@ -107,6 +107,7 @@ type BuilderConfig struct {
 	InstanceID         string
 	Architecture       string
 	UseDocker          bool
+	ContainerRuntime   string // Container runtime: "docker" or "podman" (default: "docker")
 	DockerImage        string // Docker image for builds (e.g., gentoo/stage3:latest)
 	WorkDir            string
 	ArtifactDir        string
@@ -417,6 +418,7 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.InstanceID = getEnvString(env, "INSTANCE_ID", "")
 	config.Architecture = getEnvString(env, "ARCHITECTURE", "")
 	config.UseDocker = getEnvBool(env, "USE_DOCKER", config.UseDocker)
+	config.ContainerRuntime = getEnvString(env, "CONTAINER_RUNTIME", "docker")
 	config.DockerImage = getEnvString(env, "DOCKER_IMAGE", config.DockerImage)
 	config.WorkDir = getEnvString(env, "BUILD_WORK_DIR", config.WorkDir)
 	config.ArtifactDir = getEnvString(env, "BUILD_ARTIFACT_DIR", config.ArtifactDir)
