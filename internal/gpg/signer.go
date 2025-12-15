@@ -2,34 +2,266 @@
 package gpg
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // Signer handles GPG signing of packages.
 type Signer struct {
-	keyID   string
-	keyPath string
-	enabled bool
+	keyID      string
+	keyPath    string
+	enabled    bool
+	gnupgHome  string // Custom GNUPG_HOME directory
+	publicKey  string // Cached public key in ASCII armor format
+	autoCreate bool   // Auto-create key if not exists
+	keyName    string // Name for auto-generated key
+	keyEmail   string // Email for auto-generated key
+}
+
+// SignerOption is a functional option for configuring the Signer.
+type SignerOption func(*Signer)
+
+// WithGnupgHome sets a custom GNUPG_HOME directory.
+func WithGnupgHome(home string) SignerOption {
+	return func(s *Signer) {
+		s.gnupgHome = home
+	}
+}
+
+// WithAutoCreate enables automatic key generation if key doesn't exist.
+func WithAutoCreate(name, email string) SignerOption {
+	return func(s *Signer) {
+		s.autoCreate = true
+		s.keyName = name
+		s.keyEmail = email
+	}
 }
 
 // NewSigner creates a new GPG signer.
-func NewSigner(keyID, keyPath string, enabled bool) *Signer {
-	return &Signer{
+func NewSigner(keyID, keyPath string, enabled bool, opts ...SignerOption) *Signer {
+	s := &Signer{
 		keyID:   keyID,
 		keyPath: keyPath,
 		enabled: enabled,
 	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	return s
 }
 
 // IsEnabled returns whether GPG signing is enabled.
 func (s *Signer) IsEnabled() bool {
 	return s.enabled
-} // SignPackage signs a binary package file.
-// SignPackage signs a package file with GPG.
+}
+
+// KeyID returns the GPG key ID.
+func (s *Signer) KeyID() string {
+	return s.keyID
+}
+
+// SetKeyID sets the GPG key ID.
+func (s *Signer) SetKeyID(keyID string) {
+	s.keyID = keyID
+}
+
+// Initialize initializes the signer, creating a key if necessary.
+func (s *Signer) Initialize() error {
+	if !s.enabled {
+		return nil
+	}
+
+	// If we have a key ID, check if it exists
+	if s.keyID != "" {
+		if s.keyExists(s.keyID) {
+			log.Printf("GPG key %s found", s.keyID)
+			return nil
+		}
+		log.Printf("Configured GPG key %s not found", s.keyID)
+	}
+
+	// If auto-create is enabled and no valid key, create one
+	if s.autoCreate {
+		log.Printf("Auto-creating GPG key for %s <%s>", s.keyName, s.keyEmail)
+		keyID, err := s.generateKey()
+		if err != nil {
+			return fmt.Errorf("failed to generate GPG key: %w", err)
+		}
+		s.keyID = keyID
+		log.Printf("Generated GPG key: %s", keyID)
+		return nil
+	}
+
+	if s.keyID == "" {
+		return fmt.Errorf("GPG enabled but no key ID configured")
+	}
+
+	return nil
+}
+
+// keyExists checks if a GPG key exists.
+func (s *Signer) keyExists(keyID string) bool {
+	args := s.buildBaseArgs()
+	args = append(args, "--list-secret-keys", keyID)
+
+	cmd := exec.Command("gpg", args...)
+	if s.gnupgHome != "" {
+		cmd.Env = append(os.Environ(), "GNUPGHOME="+s.gnupgHome)
+	}
+
+	return cmd.Run() == nil
+}
+
+// generateKey generates a new GPG key.
+func (s *Signer) generateKey() (string, error) {
+	// Ensure GNUPGHOME exists
+	if s.gnupgHome != "" {
+		if err := os.MkdirAll(s.gnupgHome, 0700); err != nil {
+			return "", fmt.Errorf("failed to create GNUPGHOME: %w", err)
+		}
+	}
+
+	name := s.keyName
+	if name == "" {
+		name = "Portage Engine"
+	}
+	email := s.keyEmail
+	if email == "" {
+		email = "portage@localhost"
+	}
+
+	// Generate key using batch mode
+	batchConfig := fmt.Sprintf(`%%no-protection
+Key-Type: RSA
+Key-Length: 4096
+Subkey-Type: RSA
+Subkey-Length: 4096
+Name-Real: %s
+Name-Email: %s
+Expire-Date: 0
+%%commit
+`, name, email)
+
+	args := s.buildBaseArgs()
+	args = append(args, "--batch", "--gen-key")
+
+	cmd := exec.Command("gpg", args...)
+	cmd.Stdin = strings.NewReader(batchConfig)
+	if s.gnupgHome != "" {
+		cmd.Env = append(os.Environ(), "GNUPGHOME="+s.gnupgHome)
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("gpg --gen-key failed: %w, stderr: %s", err, stderr.String())
+	}
+
+	// Get the key ID of the newly generated key
+	return s.getLatestKeyID(email)
+}
+
+// getLatestKeyID gets the key ID for a given email.
+func (s *Signer) getLatestKeyID(email string) (string, error) {
+	args := s.buildBaseArgs()
+	args = append(args, "--list-secret-keys", "--keyid-format", "long", email)
+
+	cmd := exec.Command("gpg", args...)
+	if s.gnupgHome != "" {
+		cmd.Env = append(os.Environ(), "GNUPGHOME="+s.gnupgHome)
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to list keys: %w", err)
+	}
+
+	// Parse output to find key ID
+	output := stdout.String()
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "sec") {
+			// Format: sec   rsa4096/KEYID 2024-01-01 [SC]
+			parts := strings.Fields(line)
+			for _, part := range parts {
+				if strings.Contains(part, "/") {
+					keyParts := strings.Split(part, "/")
+					if len(keyParts) == 2 {
+						return keyParts[1], nil
+					}
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("could not find key ID in output")
+}
+
+// buildBaseArgs builds base GPG arguments.
+func (s *Signer) buildBaseArgs() []string {
+	var args []string
+	if s.keyPath != "" {
+		if _, err := os.Stat(s.keyPath); err == nil {
+			args = append(args, "--no-default-keyring", "--keyring", s.keyPath)
+		}
+	}
+	return args
+}
+
+// GetPublicKey returns the public key in ASCII armor format.
+func (s *Signer) GetPublicKey() (string, error) {
+	if s.publicKey != "" {
+		return s.publicKey, nil
+	}
+
+	if s.keyID == "" {
+		return "", fmt.Errorf("no key ID configured")
+	}
+
+	args := s.buildBaseArgs()
+	args = append(args, "--armor", "--export", s.keyID)
+
+	cmd := exec.Command("gpg", args...)
+	if s.gnupgHome != "" {
+		cmd.Env = append(os.Environ(), "GNUPGHOME="+s.gnupgHome)
+	}
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to export public key: %w", err)
+	}
+
+	s.publicKey = stdout.String()
+	return s.publicKey, nil
+}
+
+// ExportPublicKey exports the public key to a file.
+func (s *Signer) ExportPublicKey(path string) error {
+	key, err := s.GetPublicKey()
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(path, []byte(key), 0644); err != nil {
+		return fmt.Errorf("failed to write public key: %w", err)
+	}
+
+	log.Printf("Public key exported to: %s", path)
+	return nil
+}
+
 // SignPackage signs a package file with GPG.
 func (s *Signer) SignPackage(packagePath string) error {
 	if !s.enabled {
@@ -45,26 +277,27 @@ func (s *Signer) SignPackage(packagePath string) error {
 
 	log.Printf("Signing package: %s with key %s", packagePath, s.keyID)
 
-	args := []string{
+	args := s.buildBaseArgs()
+	args = append(args,
 		"--detach-sign",
 		"--armor",
+		"--batch",
+		"--yes",
 		"--local-user", s.keyID,
-	}
-
-	if s.keyPath != "" {
-		if _, err := os.Stat(s.keyPath); err == nil {
-			args = append([]string{"--no-default-keyring", "--keyring", s.keyPath}, args...)
-		}
-	}
-
-	args = append(args, "--output", signaturePath, packagePath)
+		"--output", signaturePath,
+		packagePath,
+	)
 
 	cmd := exec.Command("gpg", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if s.gnupgHome != "" {
+		cmd.Env = append(os.Environ(), "GNUPGHOME="+s.gnupgHome)
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to sign package: %w", err)
+		return fmt.Errorf("failed to sign package: %w, stderr: %s", err, stderr.String())
 	}
 
 	log.Printf("Package signed successfully: %s", signaturePath)
@@ -81,24 +314,19 @@ func (s *Signer) VerifyPackage(packagePath string) error {
 
 	log.Printf("Verifying package signature: %s", packagePath)
 
-	args := []string{
-		"--verify",
-		signaturePath,
-		packagePath,
-	}
-
-	if s.keyPath != "" {
-		if _, err := os.Stat(s.keyPath); err == nil {
-			args = append([]string{"--no-default-keyring", "--keyring", s.keyPath}, args...)
-		}
-	}
+	args := s.buildBaseArgs()
+	args = append(args, "--verify", signaturePath, packagePath)
 
 	cmd := exec.Command("gpg", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if s.gnupgHome != "" {
+		cmd.Env = append(os.Environ(), "GNUPGHOME="+s.gnupgHome)
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("signature verification failed: %w", err)
+		return fmt.Errorf("signature verification failed: %w, stderr: %s", err, stderr.String())
 	}
 
 	log.Printf("Package signature verified successfully")

@@ -39,6 +39,11 @@ func main() {
 	// Create server instance
 	srv := server.New(cfg)
 
+	// Initialize server (GPG keys, etc.)
+	if err := srv.Initialize(); err != nil {
+		log.Fatalf("Failed to initialize server: %v", err)
+	}
+
 	// HTTP server configuration
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),

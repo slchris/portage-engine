@@ -16,6 +16,7 @@ import (
 
 	"github.com/slchris/portage-engine/internal/binpkg"
 	"github.com/slchris/portage-engine/internal/builder"
+	"github.com/slchris/portage-engine/internal/gpg"
 	"github.com/slchris/portage-engine/internal/metrics"
 	"github.com/slchris/portage-engine/pkg/config"
 )
@@ -27,6 +28,7 @@ type Server struct {
 	builder         *builder.Manager
 	builderRegistry *builder.Registry
 	metrics         *metrics.Metrics
+	gpgSigner       *gpg.Signer
 }
 
 // New creates a new Server instance.
@@ -37,13 +39,49 @@ func New(cfg *config.ServerConfig) *Server {
 		Password: cfg.MetricsPassword,
 	}
 
+	// Create GPG signer with options
+	var opts []gpg.SignerOption
+	if cfg.GPGHome != "" {
+		opts = append(opts, gpg.WithGnupgHome(cfg.GPGHome))
+	}
+	if cfg.GPGAutoCreate {
+		opts = append(opts, gpg.WithAutoCreate(cfg.GPGKeyName, cfg.GPGKeyEmail))
+	}
+	signer := gpg.NewSigner(cfg.GPGKeyID, cfg.GPGKeyPath, cfg.GPGEnabled, opts...)
+
 	return &Server{
 		config:          cfg,
 		binpkgStore:     binpkg.NewStore(cfg.BinpkgPath),
 		builder:         builder.NewManager(cfg),
 		builderRegistry: builder.NewRegistry(60*time.Second, 30*time.Second),
 		metrics:         metrics.New(metricsCfg),
+		gpgSigner:       signer,
 	}
+}
+
+// Initialize initializes the server, including GPG key setup.
+func (s *Server) Initialize() error {
+	if s.gpgSigner.IsEnabled() {
+		log.Printf("Initializing GPG signer...")
+		if err := s.gpgSigner.Initialize(); err != nil {
+			return fmt.Errorf("failed to initialize GPG: %w", err)
+		}
+
+		// Export public key if configured
+		if s.config.GPGPublicKeyPath != "" {
+			if err := s.gpgSigner.ExportPublicKey(s.config.GPGPublicKeyPath); err != nil {
+				log.Printf("Warning: failed to export public key: %v", err)
+			}
+		}
+
+		log.Printf("GPG signer initialized with key: %s", s.gpgSigner.KeyID())
+	}
+	return nil
+}
+
+// GPGSigner returns the GPG signer instance.
+func (s *Server) GPGSigner() *gpg.Signer {
+	return s.gpgSigner
 }
 
 // Router returns the HTTP router for the server.
@@ -824,19 +862,27 @@ func (s *Server) handleGPGPublicKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if GPG is enabled
-	if !s.config.GPGEnabled {
+	if !s.gpgSigner.IsEnabled() {
 		http.Error(w, "GPG not enabled on server", http.StatusNotFound)
 		return
 	}
 
-	// Check if key file exists
-	if s.config.GPGKeyPath == "" {
-		http.Error(w, "GPG key path not configured", http.StatusInternalServerError)
+	// Try to get public key from signer
+	publicKey, err := s.gpgSigner.GetPublicKey()
+	if err != nil {
+		// Fall back to file if configured
+		if s.config.GPGPublicKeyPath != "" {
+			http.ServeFile(w, r, s.config.GPGPublicKeyPath)
+			return
+		}
+		s.metrics.IncHTTPRequestErrors()
+		http.Error(w, fmt.Sprintf("Failed to get public key: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Read and serve the public key file
-	http.ServeFile(w, r, s.config.GPGKeyPath)
+	w.Header().Set("Content-Type", "application/pgp-keys")
+	w.Header().Set("Content-Disposition", "attachment; filename=portage-engine.asc")
+	_, _ = w.Write([]byte(publicKey))
 }
 
 // loggingMiddleware provides request logging.

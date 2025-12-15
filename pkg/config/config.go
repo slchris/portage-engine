@@ -24,6 +24,11 @@ type ServerConfig struct {
 	GPGEnabled           bool
 	GPGKeyID             string
 	GPGKeyPath           string
+	GPGAutoCreate        bool   // Auto-create GPG key if not exists
+	GPGKeyName           string // Name for auto-generated key
+	GPGKeyEmail          string // Email for auto-generated key
+	GPGHome              string // Custom GNUPGHOME directory
+	GPGPublicKeyPath     string // Path to export public key
 	CloudProvider        string
 	CloudAliyunRegion    string
 	CloudAliyunZone      string
@@ -248,6 +253,11 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	config.GPGEnabled = getEnvBool(env, "GPG_ENABLED", config.GPGEnabled)
 	config.GPGKeyID = getEnvString(env, "GPG_KEY_ID", "")
 	config.GPGKeyPath = getEnvString(env, "GPG_KEY_PATH", "")
+	config.GPGAutoCreate = getEnvBool(env, "GPG_AUTO_CREATE", true)
+	config.GPGKeyName = getEnvString(env, "GPG_KEY_NAME", "Portage Engine")
+	config.GPGKeyEmail = getEnvString(env, "GPG_KEY_EMAIL", "portage@localhost")
+	config.GPGHome = getEnvString(env, "GPG_HOME", "/var/lib/portage-engine/gpg")
+	config.GPGPublicKeyPath = getEnvString(env, "GPG_PUBLIC_KEY_PATH", "/var/lib/portage-engine/gpg/public.asc")
 
 	config.CloudProvider = getEnvString(env, "CLOUD_DEFAULT_PROVIDER", config.CloudProvider)
 	config.CloudAliyunRegion = getEnvString(env, "CLOUD_ALIYUN_REGION", "cn-hangzhou")
