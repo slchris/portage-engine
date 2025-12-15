@@ -126,3 +126,42 @@ func TestFetchGPGKeyCreateDirectory(t *testing.T) {
 		t.Errorf("key file not created: %v", err)
 	}
 }
+
+func TestGPGKeyClientWithGnupgHome(t *testing.T) {
+	client := NewGPGKeyClient("http://localhost:8080")
+	client = client.WithGnupgHome("/tmp/gpg-test")
+
+	if client.gnupgHome != "/tmp/gpg-test" {
+		t.Errorf("gnupgHome = %s, want /tmp/gpg-test", client.gnupgHome)
+	}
+}
+
+func TestImportGPGKeyNoFile(t *testing.T) {
+	client := NewGPGKeyClient("http://localhost:8080")
+
+	err := client.ImportGPGKey("/nonexistent/path/to/key.asc")
+	if err == nil {
+		t.Error("expected error when key file doesn't exist")
+	}
+}
+
+func TestGetKeyIDNoFile(t *testing.T) {
+	client := NewGPGKeyClient("http://localhost:8080")
+
+	_, err := client.GetKeyID("/nonexistent/path/to/key.asc")
+	if err == nil {
+		t.Error("expected error when key file doesn't exist")
+	}
+}
+
+func TestFetchAndImportGPGKeyServerDown(t *testing.T) {
+	client := NewGPGKeyClient("http://localhost:9999")
+
+	tmpDir := t.TempDir()
+	destPath := filepath.Join(tmpDir, "gpg-key.asc")
+
+	err := client.FetchAndImportGPGKey(destPath)
+	if err == nil {
+		t.Error("expected error when server is down")
+	}
+}

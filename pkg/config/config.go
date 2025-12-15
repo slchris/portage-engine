@@ -116,6 +116,8 @@ type BuilderConfig struct {
 	GPGEnabled         bool
 	GPGKeyID           string
 	GPGKeyPath         string
+	GPGAutoSync        bool   // Auto-sync GPG key from server
+	GPGHome            string // Custom GNUPGHOME directory
 	StorageType        string
 	StorageLocalDir    string
 	StorageS3Bucket    string
@@ -425,6 +427,8 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.GPGEnabled = getEnvBool(env, "GPG_ENABLED", config.GPGEnabled)
 	config.GPGKeyID = getEnvString(env, "GPG_KEY_ID", "")
 	config.GPGKeyPath = getEnvString(env, "GPG_KEY_PATH", "")
+	config.GPGAutoSync = getEnvBool(env, "GPG_AUTO_SYNC", false)
+	config.GPGHome = getEnvString(env, "GPG_HOME", "/var/lib/portage-engine/gpg")
 
 	config.StorageType = getEnvString(env, "STORAGE_TYPE", config.StorageType)
 	config.StorageLocalDir = getEnvString(env, "STORAGE_LOCAL_DIR", config.StorageLocalDir)

@@ -143,7 +143,29 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 	var gpgClient *GPGKeyClient
 	if cfg != nil && cfg.ServerURL != "" {
 		gpgClient = NewGPGKeyClient(cfg.ServerURL)
+		if cfg.GPGHome != "" {
+			gpgClient = gpgClient.WithGnupgHome(cfg.GPGHome)
+		}
 		log.Printf("GPG key client initialized with server URL: %s", cfg.ServerURL)
+
+		// Auto-sync GPG key from server if enabled
+		if cfg.GPGAutoSync && cfg.GPGEnabled {
+			gpgKeyPath := cfg.GPGKeyPath
+			if gpgKeyPath == "" {
+				gpgKeyPath = filepath.Join(cfg.GPGHome, "server-public.asc")
+			}
+			if err := gpgClient.FetchAndImportGPGKey(gpgKeyPath); err != nil {
+				log.Printf("Failed to sync GPG key from server: %v", err)
+			} else {
+				keyID, err := gpgClient.GetKeyID(gpgKeyPath)
+				if err != nil {
+					log.Printf("Failed to get GPG key ID: %v", err)
+				} else {
+					cfg.GPGKeyID = keyID
+					log.Printf("GPG key synced from server: %s", keyID)
+				}
+			}
+		}
 	}
 
 	// Initialize storage uploader
@@ -506,17 +528,42 @@ func (lb *LocalBuilder) executeConfigBundleBuild(job *BuildJob) error {
 }
 
 // generateBuildScript creates a Gentoo build script for Docker container.
-func (lb *LocalBuilder) generateBuildScript(pkgAtom string, useFlags string) string {
+func (lb *LocalBuilder) generateBuildScript(pkgAtom string, useFlags string, gpgKeyID string) string {
+	features := "buildpkg"
+	gpgSetup := ""
+	if gpgKeyID != "" {
+		features = "buildpkg binpkg-signing"
+		gpgSetup = fmt.Sprintf(`
+# Setup GPG for package signing
+if [ -d /gpg-keys ]; then
+    export GNUPGHOME=/root/.gnupg
+    mkdir -p $GNUPGHOME
+    chmod 700 $GNUPGHOME
+    gpg --batch --yes --import /gpg-keys/*.asc 2>/dev/null || true
+    echo "GPG keys imported"
+    gpg --list-keys
+fi
+
+# Configure portage for GPG signing
+cat >> /etc/portage/make.conf << 'GPGEOF'
+FEATURES="${FEATURES} binpkg-signing"
+BINPKG_GPG_SIGNING_GPG_HOME="/root/.gnupg"
+BINPKG_GPG_SIGNING_KEY="%s"
+GPGEOF
+`, gpgKeyID)
+	}
+
 	return fmt.Sprintf(`#!/bin/bash
 set -e
 export USE="%s"
-export FEATURES="buildpkg"
+export FEATURES="%s"
+%s
 echo "Starting Gentoo package build for %s"
 emerge --usepkg=n %s || exit 1
 echo "Build completed, copying artifacts..."
 find /var/cache/binpkgs -type f -name '*.gpkg.tar' -exec cp {} /output/ \; 2>/dev/null || find /var/cache/binpkgs -type f -name '*.tbz2' -exec cp {} /output/ \; 2>/dev/null || true
 ls -lh /output/
-`, useFlags, pkgAtom, pkgAtom)
+`, useFlags, features, gpgSetup, pkgAtom, pkgAtom)
 }
 
 // executeDockerBuild performs the build using Docker container.
@@ -544,8 +591,14 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 		}
 	}
 
+	// Get GPG key ID for signing if enabled
+	gpgKeyID := ""
+	if lb.cfg != nil && lb.cfg.GPGEnabled && lb.cfg.GPGKeyID != "" {
+		gpgKeyID = lb.cfg.GPGKeyID
+	}
+
 	// Create build script based on package manager
-	script := lb.generateBuildScript(pkgAtom, useFlags)
+	script := lb.generateBuildScript(pkgAtom, useFlags, gpgKeyID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
@@ -553,9 +606,20 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 	outputDir := filepath.Join(jobWorkDir, "output")
 	_ = os.MkdirAll(outputDir, 0750)
 
+	// Prepare GPG key directory for mounting
+	gpgKeyDir := ""
+	if gpgKeyID != "" && lb.cfg != nil && lb.cfg.GPGHome != "" {
+		gpgKeyDir = lb.cfg.GPGHome
+	}
+
 	// Build Docker run arguments
 	args := []string{"run", "--rm", "-i",
 		"-v", outputDir + ":/output",
+	}
+
+	// Mount GPG keys if available
+	if gpgKeyDir != "" {
+		args = append(args, "-v", gpgKeyDir+":/gpg-keys:ro")
 	}
 
 	// Add package manager specific mounts
