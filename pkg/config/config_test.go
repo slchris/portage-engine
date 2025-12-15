@@ -245,3 +245,135 @@ EMPTY_KEY=
 		t.Errorf("Expected EMPTY_KEY='', got %s", env["EMPTY_KEY"])
 	}
 }
+
+// TestLoadBuilderConfigMultiDistro tests loading multi-distro configuration.
+func TestLoadBuilderConfigMultiDistro(t *testing.T) {
+	t.Run("gentoo config", func(t *testing.T) {
+		tmpFile := "/tmp/test-builder-gentoo.conf"
+		configData := `HOST_OS_TYPE=gentoo
+SYNC_MIRROR=rsync://rsync.example.com/gentoo-portage
+DISTFILES_MIRROR=https://mirrors.example.com/gentoo
+PORTAGE_REPOS_PATH=/custom/repos
+PORTAGE_CONF_PATH=/custom/portage
+MAKE_CONF_PATH=/custom/make.conf
+`
+
+		if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
+			t.Fatalf("Failed to create test config: %v", err)
+		}
+		defer func() { _ = os.Remove(tmpFile) }()
+
+		cfg, err := LoadBuilderConfig(tmpFile)
+		if err != nil {
+			t.Fatalf("LoadBuilderConfig failed: %v", err)
+		}
+
+		if cfg.HostOSType != OSTypeGentoo {
+			t.Errorf("Expected HostOSType=gentoo, got %s", cfg.HostOSType)
+		}
+
+		if cfg.SyncMirror != "rsync://rsync.example.com/gentoo-portage" {
+			t.Errorf("Expected SyncMirror=rsync://rsync.example.com/gentoo-portage, got %s", cfg.SyncMirror)
+		}
+
+		if cfg.DistfilesMirror != "https://mirrors.example.com/gentoo" {
+			t.Errorf("Expected DistfilesMirror=https://mirrors.example.com/gentoo, got %s", cfg.DistfilesMirror)
+		}
+
+		if cfg.PortageReposPath != "/custom/repos" {
+			t.Errorf("Expected PortageReposPath=/custom/repos, got %s", cfg.PortageReposPath)
+		}
+
+		if cfg.PortageConfPath != "/custom/portage" {
+			t.Errorf("Expected PortageConfPath=/custom/portage, got %s", cfg.PortageConfPath)
+		}
+
+		if cfg.MakeConfPath != "/custom/make.conf" {
+			t.Errorf("Expected MakeConfPath=/custom/make.conf, got %s", cfg.MakeConfPath)
+		}
+	})
+
+	t.Run("debian config", func(t *testing.T) {
+		tmpFile := "/tmp/test-builder-debian.conf"
+		configData := `HOST_OS_TYPE=debian
+DOCKER_IMAGE=debian:bookworm
+SYNC_MIRROR=http://deb.debian.org/debian
+DISTFILES_MIRROR=http://mirrors.example.com/debian
+APT_SOURCES_PATH=/custom/apt
+APT_CACHE_PATH=/custom/cache
+DEBIAN_CODENAME=sid
+`
+
+		if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
+			t.Fatalf("Failed to create test config: %v", err)
+		}
+		defer func() { _ = os.Remove(tmpFile) }()
+
+		cfg, err := LoadBuilderConfig(tmpFile)
+		if err != nil {
+			t.Fatalf("LoadBuilderConfig failed: %v", err)
+		}
+
+		if cfg.HostOSType != OSTypeDebian {
+			t.Errorf("Expected HostOSType=debian, got %s", cfg.HostOSType)
+		}
+
+		if cfg.DockerImage != "debian:bookworm" {
+			t.Errorf("Expected DockerImage=debian:bookworm, got %s", cfg.DockerImage)
+		}
+
+		if cfg.AptSourcesPath != "/custom/apt" {
+			t.Errorf("Expected AptSourcesPath=/custom/apt, got %s", cfg.AptSourcesPath)
+		}
+
+		if cfg.AptCachePath != "/custom/cache" {
+			t.Errorf("Expected AptCachePath=/custom/cache, got %s", cfg.AptCachePath)
+		}
+
+		if cfg.DebianCodename != "sid" {
+			t.Errorf("Expected DebianCodename=sid, got %s", cfg.DebianCodename)
+		}
+	})
+
+	t.Run("default os type", func(t *testing.T) {
+		tmpFile := "/tmp/test-builder-default.conf"
+		configData := `BUILDER_PORT=9090
+`
+
+		if err := os.WriteFile(tmpFile, []byte(configData), 0600); err != nil {
+			t.Fatalf("Failed to create test config: %v", err)
+		}
+		defer func() { _ = os.Remove(tmpFile) }()
+
+		cfg, err := LoadBuilderConfig(tmpFile)
+		if err != nil {
+			t.Fatalf("LoadBuilderConfig failed: %v", err)
+		}
+
+		// Default should be gentoo
+		if cfg.HostOSType != OSTypeGentoo {
+			t.Errorf("Expected default HostOSType=gentoo, got %s", cfg.HostOSType)
+		}
+
+		// Default Gentoo paths
+		if cfg.PortageReposPath != "/var/db/repos" {
+			t.Errorf("Expected default PortageReposPath=/var/db/repos, got %s", cfg.PortageReposPath)
+		}
+
+		// Default Debian paths should also be set
+		if cfg.AptSourcesPath != "/etc/apt" {
+			t.Errorf("Expected default AptSourcesPath=/etc/apt, got %s", cfg.AptSourcesPath)
+		}
+	})
+}
+
+// TestOSTypeConstants tests the OS type constants.
+func TestOSTypeConstants(t *testing.T) {
+	if OSTypeGentoo != "gentoo" {
+		t.Errorf("OSTypeGentoo should be 'gentoo', got %s", OSTypeGentoo)
+	}
+
+	if OSTypeDebian != "debian" {
+		t.Errorf("OSTypeDebian should be 'debian', got %s", OSTypeDebian)
+	}
+}

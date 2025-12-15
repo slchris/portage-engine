@@ -63,6 +63,8 @@ type LocalBuilder struct {
 	persister      *JobPersister
 	instanceID     string
 	architecture   string
+	pkgMgr         PackageManager
+	cfg            *config.BuilderConfig
 }
 
 // NewLocalBuilder creates a new local builder instance.
@@ -227,6 +229,16 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 		architecture = detectArchitecture()
 	}
 
+	// Ensure cfg is not nil for PackageManager
+	if cfg == nil {
+		cfg = &config.BuilderConfig{
+			HostOSType:       config.OSTypeGentoo,
+			PortageReposPath: "/var/db/repos",
+			PortageConfPath:  "/etc/portage",
+			MakeConfPath:     "/etc/portage/make.conf",
+		}
+	}
+
 	lb := &LocalBuilder{
 		workers:        workers,
 		jobQueue:       make(chan *BuildJob, 100),
@@ -245,6 +257,8 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 		persister:      nil,
 		instanceID:     instanceID,
 		architecture:   architecture,
+		pkgMgr:         NewPackageManager(cfg),
+		cfg:            cfg,
 	}
 
 	log.Printf("Builder initialized: instance_id=%s, architecture=%s", instanceID, architecture)
@@ -492,6 +506,63 @@ func (lb *LocalBuilder) executeConfigBundleBuild(job *BuildJob) error {
 	return err
 }
 
+// generateBuildScript creates a build script based on the OS type.
+func (lb *LocalBuilder) generateBuildScript(pkgAtom string, useFlags string) string {
+	if lb.cfg == nil || lb.cfg.HostOSType == config.OSTypeGentoo || lb.cfg.HostOSType == "" {
+		return lb.generateGentooScript(pkgAtom, useFlags)
+	}
+
+	switch lb.cfg.HostOSType {
+	case config.OSTypeGentoo:
+		return lb.generateGentooScript(pkgAtom, useFlags)
+	case config.OSTypeDebian:
+		return lb.generateDebianScript(pkgAtom)
+	default:
+		return lb.generateGentooScript(pkgAtom, useFlags)
+	}
+}
+
+// generateGentooScript creates a Gentoo build script.
+func (lb *LocalBuilder) generateGentooScript(pkgAtom string, useFlags string) string {
+	return fmt.Sprintf(`#!/bin/bash
+set -e
+export USE="%s"
+export FEATURES="buildpkg"
+echo "Starting Gentoo package build for %s"
+emerge --usepkg=n %s || exit 1
+echo "Build completed, copying artifacts..."
+find /var/cache/binpkgs -type f -name '*.gpkg.tar' -exec cp {} /output/ \; 2>/dev/null || find /var/cache/binpkgs -type f -name '*.tbz2' -exec cp {} /output/ \; 2>/dev/null || true
+ls -lh /output/
+`, useFlags, pkgAtom, pkgAtom)
+}
+
+// generateDebianScript creates a Debian build script.
+func (lb *LocalBuilder) generateDebianScript(pkgName string) string {
+	return fmt.Sprintf(`#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+echo "Starting Debian package build for %s"
+
+# Update package lists
+apt-get update
+
+# Install build dependencies
+apt-get build-dep -y %s || echo "Warning: Could not install build dependencies"
+
+# Get source and build
+mkdir -p /tmp/build
+cd /tmp/build
+apt-get source %s
+cd %s-*
+dpkg-buildpackage -us -uc -b
+
+# Copy artifacts to output
+echo "Build completed, copying artifacts..."
+find /tmp/build -maxdepth 1 -type f -name '*.deb' -exec cp {} /output/ \; 2>/dev/null || true
+ls -lh /output/
+`, pkgName, pkgName, pkgName, pkgName)
+}
+
 // executeDockerBuild performs the build using Docker container.
 func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 	req := job.Request
@@ -507,7 +578,7 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 		pkgAtom = fmt.Sprintf("=%s-%s", req.PackageName, req.Version)
 	}
 
-	// Build USE flags string
+	// Build USE flags string (Gentoo-specific, but harmless for Debian)
 	useFlags := ""
 	for flag, enabled := range req.UseFlags {
 		if enabled == "true" || enabled == "1" {
@@ -517,17 +588,8 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 		}
 	}
 
-	// Create build script
-	script := fmt.Sprintf(`#!/bin/bash
-set -e
-export USE="%s"
-export FEATURES="buildpkg"
-echo "Starting package build for %s"
-emerge --usepkg=n %s || exit 1
-echo "Build completed, copying artifacts..."
-find /var/cache/binpkgs -type f -name '*.gpkg.tar' -exec cp {} /output/ \; 2>/dev/null || find /var/cache/binpkgs -type f -name '*.tbz2' -exec cp {} /output/ \; 2>/dev/null || true
-ls -lh /output/
-`, useFlags, req.PackageName, pkgAtom)
+	// Create build script based on package manager
+	script := lb.generateBuildScript(pkgAtom, useFlags)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
@@ -535,14 +597,36 @@ ls -lh /output/
 	outputDir := filepath.Join(jobWorkDir, "output")
 	_ = os.MkdirAll(outputDir, 0750)
 
-	// Run Docker container with script via stdin and mounted repos/portage config
-	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "-i",
-		"-v", outputDir+":/output",
-		"-v", "/var/db/repos:/var/db/repos:ro",
-		"-v", "/etc/portage/make.conf:/etc/portage/make.conf:ro",
-		"-v", "/etc/portage/repos.conf:/etc/portage/repos.conf:ro",
-		lb.dockerImage,
-		"/bin/bash", "-s")
+	// Build Docker run arguments
+	args := []string{"run", "--rm", "-i",
+		"-v", outputDir + ":/output",
+	}
+
+	// Add package manager specific mounts
+	if lb.cfg != nil {
+		mounts := lb.pkgMgr.GetDockerMounts(lb.cfg)
+		for _, m := range mounts {
+			args = append(args, "-v", m.String())
+		}
+
+		// Add environment variables
+		envVars := lb.pkgMgr.GetEnvVars(lb.cfg)
+		for k, v := range envVars {
+			args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+		}
+	} else {
+		// Fallback to default Gentoo mounts for backward compatibility
+		args = append(args,
+			"-v", "/var/db/repos:/var/db/repos:ro",
+			"-v", "/etc/portage/make.conf:/etc/portage/make.conf:ro",
+			"-v", "/etc/portage/repos.conf:/etc/portage/repos.conf:ro",
+		)
+	}
+
+	args = append(args, lb.dockerImage, "/bin/bash", "-s")
+
+	// Run Docker container with script via stdin
+	cmd := exec.CommandContext(ctx, "docker", args...)
 
 	cmd.Stdin = strings.NewReader(script)
 
@@ -619,7 +703,7 @@ ls -lh /output/
 	return nil
 }
 
-// executeNativeBuild performs the build natively using emerge.
+// executeNativeBuild performs the build natively using the system package manager.
 func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 	req := job.Request
 
@@ -639,6 +723,14 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
 
+	// Add package manager specific environment variables
+	if lb.cfg != nil {
+		pkgEnv := lb.pkgMgr.GetEnvVars(lb.cfg)
+		for k, v := range pkgEnv {
+			env = append(env, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
+
 	if len(req.UseFlags) > 0 {
 		useFlags := ""
 		for flag, enabled := range req.UseFlags {
@@ -654,7 +746,9 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "emerge", "-B", "--quiet", pkgAtom)
+	// Build command using package manager
+	buildCmd := lb.pkgMgr.BuildCommand(pkgAtom, nil)
+	cmd := exec.CommandContext(ctx, buildCmd[0], buildCmd[1:]...)
 	cmd.Env = env
 	cmd.Dir = jobWorkDir
 
@@ -665,10 +759,17 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 		return fmt.Errorf("build failed: %w", err)
 	}
 
-	pkgDir := "/var/cache/binpkgs"
-	artifact, err := lb.findLatestPackage(pkgDir, req.PackageName)
-	if err != nil {
-		return fmt.Errorf("artifact not found: %w", err)
+	// Find artifacts from package manager specific paths
+	var artifact string
+	artifactPaths := lb.pkgMgr.GetArtifactPaths()
+	for _, pkgDir := range artifactPaths {
+		artifact, err = lb.findLatestPackage(pkgDir, req.PackageName)
+		if err == nil {
+			break
+		}
+	}
+	if artifact == "" {
+		return fmt.Errorf("artifact not found in any of %v", artifactPaths)
 	}
 
 	artifactName := filepath.Base(artifact)
