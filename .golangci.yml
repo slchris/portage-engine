@@ -25,7 +25,7 @@ linters:
   disable:
     - gosec  # Too many false positives for a build/package management tool
 
-linters-settings:
+settings:
   errcheck:
     check-type-assertions: true
     check-blank: true
@@ -92,27 +92,3 @@ linters-settings:
       - underef
       - unlambda
       - unnecessaryBlock
-
-issues:
-  exclude-use-default: false
-  max-issues-per-linter: 0
-  max-same-issues: 0
-  exclude:
-    - "undefined: yaml"
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gosec
-    - path: cmd/
-      linters:
-        - revive
-      text: "exported: exported function"
-    - text: "undefined: yaml"
-      linters:
-        - typecheck
-
-output:
-  format: colored-line-number
-  print-issued-lines: true
-  print-linter-name: true
