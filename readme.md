@@ -1,5 +1,11 @@
 # Portage Engine
 
+[![CI](https://github.com/slchris/portage-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/slchris/portage-engine/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/slchris/portage-engine)](https://goreportcard.com/report/github.com/slchris/portage-engine)
+[![GoDoc](https://godoc.org/github.com/slchris/portage-engine?status.svg)](https://godoc.org/github.com/slchris/portage-engine)
+[![CodeQL](https://github.com/slchris/portage-engine/actions/workflows/codeql.yml/badge.svg)](https://github.com/slchris/portage-engine/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A distributed binary package building and management system for Gentoo Linux with advanced configuration transfer capabilities. The system automatically provisions cloud infrastructure or Docker containers to build packages with custom USE flags and configurations when they're not available in the binary package server.
 
 ## 🎯 Key Features
