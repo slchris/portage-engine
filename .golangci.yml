@@ -3,8 +3,6 @@ version: "2"
 run:
   tests: true
   modules-download-mode: readonly
-  build-tags:
-    - ""
 
 linters:
   enable:
@@ -23,72 +21,4 @@ linters:
     - errorlint
     - exhaustive
   disable:
-    - gosec  # Too many false positives for a build/package management tool
-
-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-
-  govet:
-    enable:
-      - assign
-      - atomic
-      - bools
-      - buildtag
-      - cgocall
-      - composites
-      - copylocks
-      - errorsas
-      - httpresponse
-      - ifaceassert
-      - loopclosure
-      - lostcancel
-      - nilfunc
-      - printf
-      - shift
-      - stdmethods
-      - structtag
-      - unmarshal
-      - unreachable
-      - unsafeptr
-      - unusedresult
-    disable:
-      - shadow
-
-  revive:
-    rules:
-      - name: exported
-        disabled: false
-      - name: package-comments
-        disabled: true
-
-  gosec:
-    excludes-use-default: false
-    exclude-generated: true
-    excludes:
-      - G204 # Subprocess launched with variable - expected for build tools
-      - G304 # File path provided as taint input - expected for package management
-      - G306 # Expect WriteFile permissions to be 0600 or less - scripts need exec permission
-
-  gocritic:
-    enabled-checks:
-      - appendAssign
-      - assignOp
-      - captLocal
-      - dupImport
-      - elseif
-      - emptyStringTest
-      - hexLiteral
-      - indexAlloc
-      - methodExprCall
-      - nilValReturn
-      - rangeExprCopy
-      - rangeValCopy
-      - sloppyReassign
-      - stringXbytes
-      - typeAssertChain
-      - typeSwitchVar
-      - underef
-      - unlambda
-      - unnecessaryBlock
+    - gosec
