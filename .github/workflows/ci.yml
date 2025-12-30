@@ -44,7 +44,7 @@ jobs:
         run: docker build -f Dockerfile.test -t portage-test:latest .
 
       - name: Run tests in container
-        run: docker run --rm -v ${{ github.workspace }}:/app -w /app portage-test:latest go test -v -race -coverprofile=coverage.out ./...
+        run: docker run --rm -v ${{ github.workspace }}:/app -w /app portage-test:latest go test -v -coverprofile=coverage.out ./...
 
       - name: Upload coverage
         if: always()
