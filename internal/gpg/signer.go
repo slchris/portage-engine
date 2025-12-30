@@ -300,7 +300,7 @@ func (s *Signer) ExportSecretKey(path string) error {
 		return fmt.Errorf("failed to write secret key: %w", err)
 	}
 
-	log.Printf("Secret key exported to: %s", path)
+	log.Printf("Secret key exported successfully")
 	return nil
 }
 
