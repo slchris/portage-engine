@@ -4,6 +4,7 @@ package builder
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -247,6 +248,7 @@ func TestJobPersister_StartStop(t *testing.T) {
 	}
 
 	now := time.Now()
+	var jobsMutex sync.RWMutex
 	jobs := map[string]*BuildJob{
 		"job1": {
 			ID:        "job1",
@@ -256,7 +258,16 @@ func TestJobPersister_StartStop(t *testing.T) {
 	}
 
 	getJobsFunc := func() map[string]*BuildJob {
-		return jobs
+		jobsMutex.RLock()
+		defer jobsMutex.RUnlock()
+		// Return a deep copy to avoid concurrent modification issues
+		result := make(map[string]*BuildJob, len(jobs))
+		for k, v := range jobs {
+			// Deep copy the job
+			jobCopy := *v
+			result[k] = &jobCopy
+		}
+		return result
 	}
 
 	persister := NewJobPersister(store, getJobsFunc, 100*time.Millisecond, 0)
@@ -265,9 +276,14 @@ func TestJobPersister_StartStop(t *testing.T) {
 	// Wait for at least one tick
 	time.Sleep(200 * time.Millisecond)
 
-	// Update job status
+	// Update job status with proper synchronization
+	jobsMutex.Lock()
 	jobs["job1"].Status = "success"
 	jobs["job1"].EndTime = time.Now()
+	jobsMutex.Unlock()
+
+	// Wait for the persister to save the updated state
+	time.Sleep(200 * time.Millisecond)
 
 	persister.Stop()
 
