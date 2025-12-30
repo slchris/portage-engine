@@ -29,9 +29,9 @@ jobs:
         run: go build ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v3
+        uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.55.2
+          version: v2.7.2
           args: --timeout=5m -v
           skip-pkg-cache: true
           skip-build-cache: true
