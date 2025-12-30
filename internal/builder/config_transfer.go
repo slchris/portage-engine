@@ -355,45 +355,76 @@ func (ct *ConfigTransfer) parseRepoConfFile(path string, config *PortageConfig) 
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		if ct.isCommentOrEmpty(line) {
 			continue
 		}
 
-		// Check for section header [repo-name]
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			if currentRepo != nil {
-				config.Repos = append(config.Repos, *currentRepo)
-			}
-			repoName := strings.Trim(line, "[]")
-			currentRepo = &RepoConfig{Name: repoName}
+		if ct.isSectionHeader(line) {
+			currentRepo = ct.handleSectionHeader(line, currentRepo, config)
 			continue
 		}
 
-		// Parse key = value
-		if currentRepo != nil && strings.Contains(line, "=") {
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				key := strings.TrimSpace(parts[0])
-				value := strings.TrimSpace(parts[1])
+		ct.parseRepoConfigLine(line, currentRepo)
+	}
 
-				switch key {
-				case "location":
-					currentRepo.Location = value
-				case "sync-type":
-					currentRepo.SyncType = value
-				case "sync-uri":
-					currentRepo.SyncURI = value
-				case "priority":
-					_, _ = fmt.Sscanf(value, "%d", &currentRepo.Priority)
-				}
-			}
-		}
-	} // Add last repo
+	ct.addFinalRepo(currentRepo, config)
+	return nil
+}
+
+// isCommentOrEmpty checks if a line is a comment or empty.
+func (ct *ConfigTransfer) isCommentOrEmpty(line string) bool {
+	return line == "" || strings.HasPrefix(line, "#")
+}
+
+// isSectionHeader checks if a line is a section header.
+func (ct *ConfigTransfer) isSectionHeader(line string) bool {
+	return strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]")
+}
+
+// handleSectionHeader processes a section header and returns new current repo.
+func (ct *ConfigTransfer) handleSectionHeader(line string, currentRepo *RepoConfig, config *PortageConfig) *RepoConfig {
 	if currentRepo != nil {
 		config.Repos = append(config.Repos, *currentRepo)
 	}
+	repoName := strings.Trim(line, "[]")
+	return &RepoConfig{Name: repoName}
+}
 
-	return nil
+// parseRepoConfigLine parses a key=value line in repo config.
+func (ct *ConfigTransfer) parseRepoConfigLine(line string, currentRepo *RepoConfig) {
+	if currentRepo == nil || !strings.Contains(line, "=") {
+		return
+	}
+
+	parts := strings.SplitN(line, "=", 2)
+	if len(parts) != 2 {
+		return
+	}
+
+	key := strings.TrimSpace(parts[0])
+	value := strings.TrimSpace(parts[1])
+	ct.setRepoConfigField(key, value, currentRepo)
+}
+
+// setRepoConfigField sets a field in repo config based on key.
+func (ct *ConfigTransfer) setRepoConfigField(key, value string, repo *RepoConfig) {
+	switch key {
+	case "location":
+		repo.Location = value
+	case "sync-type":
+		repo.SyncType = value
+	case "sync-uri":
+		repo.SyncURI = value
+	case "priority":
+		_, _ = fmt.Sscanf(value, "%d", &repo.Priority)
+	}
+}
+
+// addFinalRepo adds the last repo to the config.
+func (ct *ConfigTransfer) addFinalRepo(currentRepo *RepoConfig, config *PortageConfig) {
+	if currentRepo != nil {
+		config.Repos = append(config.Repos, *currentRepo)
+	}
 }
 
 // CreateConfigBundle creates a configuration bundle from user's Portage setup.
@@ -490,80 +521,121 @@ func (ct *ConfigTransfer) addFileToTar(tw *tar.Writer, name string, data []byte)
 
 // addPortageConfigToTar adds Portage configuration files to the tar archive.
 func (ct *ConfigTransfer) addPortageConfigToTar(tw *tar.Writer, config *PortageConfig) error {
-	// Generate package.use
-	if len(config.PackageUse) > 0 {
+	if err := ct.addPackageUseToTar(tw, config.PackageUse); err != nil {
+		return err
+	}
+
+	if err := ct.addPackageKeywordsToTar(tw, config.PackageKeywords); err != nil {
+		return err
+	}
+
+	if err := ct.addPackageMaskToTar(tw, config.PackageMask); err != nil {
+		return err
+	}
+
+	if err := ct.addPackageUnmaskToTar(tw, config.PackageUnmask); err != nil {
+		return err
+	}
+
+	if err := ct.addMakeConfToTar(tw, config.MakeConf); err != nil {
+		return err
+	}
+
+	if err := ct.addReposConfToTar(tw, config.Repos); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// addPackageUseToTar adds package.use to tarball.
+func (ct *ConfigTransfer) addPackageUseToTar(tw *tar.Writer, packageUse map[string][]string) error {
+	if len(packageUse) == 0 {
+		return nil
+	}
+
+	lines := make([]string, 0, len(packageUse))
+	for pkg, flags := range packageUse {
+		lines = append(lines, fmt.Sprintf("%s %s", pkg, strings.Join(flags, " ")))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	return ct.addFileToTar(tw, "etc/portage/package.use/00-user", []byte(content))
+}
+
+// addPackageKeywordsToTar adds package.accept_keywords to tarball.
+func (ct *ConfigTransfer) addPackageKeywordsToTar(tw *tar.Writer, packageKeywords map[string][]string) error {
+	if len(packageKeywords) == 0 {
+		return nil
+	}
+
+	lines := make([]string, 0, len(packageKeywords))
+	for pkg, keywords := range packageKeywords {
+		lines = append(lines, fmt.Sprintf("%s %s", pkg, strings.Join(keywords, " ")))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	return ct.addFileToTar(tw, "etc/portage/package.accept_keywords/00-user", []byte(content))
+}
+
+// addPackageMaskToTar adds package.mask to tarball.
+func (ct *ConfigTransfer) addPackageMaskToTar(tw *tar.Writer, packageMask []string) error {
+	if len(packageMask) == 0 {
+		return nil
+	}
+
+	content := strings.Join(packageMask, "\n") + "\n"
+	return ct.addFileToTar(tw, "etc/portage/package.mask/00-user", []byte(content))
+}
+
+// addPackageUnmaskToTar adds package.unmask to tarball.
+func (ct *ConfigTransfer) addPackageUnmaskToTar(tw *tar.Writer, packageUnmask []string) error {
+	if len(packageUnmask) == 0 {
+		return nil
+	}
+
+	content := strings.Join(packageUnmask, "\n") + "\n"
+	return ct.addFileToTar(tw, "etc/portage/package.unmask/00-user", []byte(content))
+}
+
+// addMakeConfToTar adds make.conf to tarball.
+func (ct *ConfigTransfer) addMakeConfToTar(tw *tar.Writer, makeConf map[string]string) error {
+	if len(makeConf) == 0 {
+		return nil
+	}
+
+	lines := make([]string, 0, len(makeConf))
+	for key, value := range makeConf {
+		lines = append(lines, fmt.Sprintf("%s=\"%s\"", key, value))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	return ct.addFileToTar(tw, "etc/portage/make.conf.d/00-user", []byte(content))
+}
+
+// addReposConfToTar adds repos.conf to tarball.
+func (ct *ConfigTransfer) addReposConfToTar(tw *tar.Writer, repos []RepoConfig) error {
+	if len(repos) == 0 {
+		return nil
+	}
+
+	for _, repo := range repos {
 		var lines []string
-		for pkg, flags := range config.PackageUse {
-			lines = append(lines, fmt.Sprintf("%s %s", pkg, strings.Join(flags, " ")))
+		lines = append(lines, fmt.Sprintf("[%s]", repo.Name))
+		if repo.Location != "" {
+			lines = append(lines, fmt.Sprintf("location = %s", repo.Location))
 		}
+		if repo.SyncType != "" {
+			lines = append(lines, fmt.Sprintf("sync-type = %s", repo.SyncType))
+		}
+		if repo.SyncURI != "" {
+			lines = append(lines, fmt.Sprintf("sync-uri = %s", repo.SyncURI))
+		}
+		if repo.Priority != 0 {
+			lines = append(lines, fmt.Sprintf("priority = %d", repo.Priority))
+		}
+
 		content := strings.Join(lines, "\n") + "\n"
-		if err := ct.addFileToTar(tw, "etc/portage/package.use/00-user", []byte(content)); err != nil {
+		filename := fmt.Sprintf("etc/portage/repos.conf/%s.conf", repo.Name)
+		if err := ct.addFileToTar(tw, filename, []byte(content)); err != nil {
 			return err
-		}
-	}
-
-	// Generate package.accept_keywords
-	if len(config.PackageKeywords) > 0 {
-		var lines []string
-		for pkg, keywords := range config.PackageKeywords {
-			lines = append(lines, fmt.Sprintf("%s %s", pkg, strings.Join(keywords, " ")))
-		}
-		content := strings.Join(lines, "\n") + "\n"
-		if err := ct.addFileToTar(tw, "etc/portage/package.accept_keywords/00-user", []byte(content)); err != nil {
-			return err
-		}
-	}
-
-	// Generate package.mask
-	if len(config.PackageMask) > 0 {
-		content := strings.Join(config.PackageMask, "\n") + "\n"
-		if err := ct.addFileToTar(tw, "etc/portage/package.mask/00-user", []byte(content)); err != nil {
-			return err
-		}
-	}
-
-	// Generate package.unmask
-	if len(config.PackageUnmask) > 0 {
-		content := strings.Join(config.PackageUnmask, "\n") + "\n"
-		if err := ct.addFileToTar(tw, "etc/portage/package.unmask/00-user", []byte(content)); err != nil {
-			return err
-		}
-	}
-
-	// Generate make.conf entries
-	if len(config.MakeConf) > 0 {
-		var lines []string
-		for key, value := range config.MakeConf {
-			lines = append(lines, fmt.Sprintf("%s=\"%s\"", key, value))
-		}
-		content := strings.Join(lines, "\n") + "\n"
-		if err := ct.addFileToTar(tw, "etc/portage/make.conf.d/00-user", []byte(content)); err != nil {
-			return err
-		}
-	}
-
-	// Generate repos.conf entries
-	if len(config.Repos) > 0 {
-		for _, repo := range config.Repos {
-			var lines []string
-			lines = append(lines, fmt.Sprintf("[%s]", repo.Name))
-			if repo.Location != "" {
-				lines = append(lines, fmt.Sprintf("location = %s", repo.Location))
-			}
-			if repo.SyncType != "" {
-				lines = append(lines, fmt.Sprintf("sync-type = %s", repo.SyncType))
-			}
-			if repo.SyncURI != "" {
-				lines = append(lines, fmt.Sprintf("sync-uri = %s", repo.SyncURI))
-			}
-			if repo.Priority != 0 {
-				lines = append(lines, fmt.Sprintf("priority = %d", repo.Priority))
-			}
-			content := strings.Join(lines, "\n") + "\n"
-			filename := fmt.Sprintf("etc/portage/repos.conf/%s.conf", repo.Name)
-			if err := ct.addFileToTar(tw, filename, []byte(content)); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -631,8 +703,42 @@ func (ct *ConfigTransfer) ApplyConfigToSystem(bundle *ConfigBundle, targetRoot s
 		targetRoot = "/"
 	}
 
-	// Create necessary directories
 	portageDir := filepath.Join(targetRoot, "etc", "portage")
+	if err := ct.createPortageDirs(portageDir); err != nil {
+		return err
+	}
+
+	config := bundle.Config
+
+	if err := ct.writePackageUse(portageDir, config.PackageUse); err != nil {
+		return err
+	}
+
+	if err := ct.writePackageKeywords(portageDir, config.PackageKeywords); err != nil {
+		return err
+	}
+
+	if err := ct.writePackageMask(portageDir, config.PackageMask); err != nil {
+		return err
+	}
+
+	if err := ct.writePackageUnmask(portageDir, config.PackageUnmask); err != nil {
+		return err
+	}
+
+	if err := ct.writeMakeConf(portageDir, config.MakeConf); err != nil {
+		return err
+	}
+
+	if err := ct.writeReposConf(portageDir, config.Repos); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// createPortageDirs creates necessary Portage directories.
+func (ct *ConfigTransfer) createPortageDirs(portageDir string) error {
 	dirs := []string{
 		filepath.Join(portageDir, "package.use"),
 		filepath.Join(portageDir, "package.accept_keywords"),
@@ -643,92 +749,127 @@ func (ct *ConfigTransfer) ApplyConfigToSystem(bundle *ConfigBundle, targetRoot s
 	}
 
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0750); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
+	return nil
+}
 
-	config := bundle.Config
+// writePackageUse writes package.use configuration.
+func (ct *ConfigTransfer) writePackageUse(portageDir string, packageUse map[string][]string) error {
+	if len(packageUse) == 0 {
+		return nil
+	}
 
-	// Write package.use
-	if len(config.PackageUse) > 0 {
+	lines := make([]string, 0, len(packageUse))
+	for pkg, flags := range packageUse {
+		lines = append(lines, fmt.Sprintf("%s %s", pkg, strings.Join(flags, " ")))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	path := filepath.Join(portageDir, "package.use", "00-user")
+
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		return fmt.Errorf("failed to write package.use: %w", err)
+	}
+	return nil
+}
+
+// writePackageKeywords writes package.accept_keywords configuration.
+func (ct *ConfigTransfer) writePackageKeywords(portageDir string, packageKeywords map[string][]string) error {
+	if len(packageKeywords) == 0 {
+		return nil
+	}
+
+	lines := make([]string, 0, len(packageKeywords))
+	for pkg, keywords := range packageKeywords {
+		lines = append(lines, fmt.Sprintf("%s %s", pkg, strings.Join(keywords, " ")))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	path := filepath.Join(portageDir, "package.accept_keywords", "00-user")
+
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		return fmt.Errorf("failed to write package.accept_keywords: %w", err)
+	}
+	return nil
+}
+
+// writePackageMask writes package.mask configuration.
+func (ct *ConfigTransfer) writePackageMask(portageDir string, packageMask []string) error {
+	if len(packageMask) == 0 {
+		return nil
+	}
+
+	content := strings.Join(packageMask, "\n") + "\n"
+	path := filepath.Join(portageDir, "package.mask", "00-user")
+
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		return fmt.Errorf("failed to write package.mask: %w", err)
+	}
+	return nil
+}
+
+// writePackageUnmask writes package.unmask configuration.
+func (ct *ConfigTransfer) writePackageUnmask(portageDir string, packageUnmask []string) error {
+	if len(packageUnmask) == 0 {
+		return nil
+	}
+
+	content := strings.Join(packageUnmask, "\n") + "\n"
+	path := filepath.Join(portageDir, "package.unmask", "00-user")
+
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		return fmt.Errorf("failed to write package.unmask: %w", err)
+	}
+	return nil
+}
+
+// writeMakeConf writes make.conf configuration.
+func (ct *ConfigTransfer) writeMakeConf(portageDir string, makeConf map[string]string) error {
+	if len(makeConf) == 0 {
+		return nil
+	}
+
+	lines := make([]string, 0, len(makeConf))
+	for key, value := range makeConf {
+		lines = append(lines, fmt.Sprintf("%s=\"%s\"", key, value))
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	path := filepath.Join(portageDir, "make.conf.d", "00-user")
+
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		return fmt.Errorf("failed to write make.conf: %w", err)
+	}
+	return nil
+}
+
+// writeReposConf writes repos.conf configuration.
+func (ct *ConfigTransfer) writeReposConf(portageDir string, repos []RepoConfig) error {
+	if len(repos) == 0 {
+		return nil
+	}
+
+	for _, repo := range repos {
 		var lines []string
-		for pkg, flags := range config.PackageUse {
-			lines = append(lines, fmt.Sprintf("%s %s", pkg, strings.Join(flags, " ")))
+		lines = append(lines, fmt.Sprintf("[%s]", repo.Name))
+		if repo.Location != "" {
+			lines = append(lines, fmt.Sprintf("location = %s", repo.Location))
 		}
+		if repo.SyncType != "" {
+			lines = append(lines, fmt.Sprintf("sync-type = %s", repo.SyncType))
+		}
+		if repo.SyncURI != "" {
+			lines = append(lines, fmt.Sprintf("sync-uri = %s", repo.SyncURI))
+		}
+		if repo.Priority != 0 {
+			lines = append(lines, fmt.Sprintf("priority = %d", repo.Priority))
+		}
+
 		content := strings.Join(lines, "\n") + "\n"
-		path := filepath.Join(portageDir, "package.use", "00-user")
-		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-			return fmt.Errorf("failed to write package.use: %w", err)
-		}
-	}
+		path := filepath.Join(portageDir, "repos.conf", fmt.Sprintf("%s.conf", repo.Name))
 
-	// Write package.accept_keywords
-	if len(config.PackageKeywords) > 0 {
-		var lines []string
-		for pkg, keywords := range config.PackageKeywords {
-			lines = append(lines, fmt.Sprintf("%s %s", pkg, strings.Join(keywords, " ")))
-		}
-		content := strings.Join(lines, "\n") + "\n"
-		path := filepath.Join(portageDir, "package.accept_keywords", "00-user")
-		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-			return fmt.Errorf("failed to write package.accept_keywords: %w", err)
-		}
-	}
-
-	// Write package.mask
-	if len(config.PackageMask) > 0 {
-		content := strings.Join(config.PackageMask, "\n") + "\n"
-		path := filepath.Join(portageDir, "package.mask", "00-user")
-		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-			return fmt.Errorf("failed to write package.mask: %w", err)
-		}
-	}
-
-	// Write package.unmask
-	if len(config.PackageUnmask) > 0 {
-		content := strings.Join(config.PackageUnmask, "\n") + "\n"
-		path := filepath.Join(portageDir, "package.unmask", "00-user")
-		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-			return fmt.Errorf("failed to write package.unmask: %w", err)
-		}
-	}
-
-	// Write make.conf
-	if len(config.MakeConf) > 0 {
-		var lines []string
-		for key, value := range config.MakeConf {
-			lines = append(lines, fmt.Sprintf("%s=\"%s\"", key, value))
-		}
-		content := strings.Join(lines, "\n") + "\n"
-		path := filepath.Join(portageDir, "make.conf.d", "00-user")
-		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-			return fmt.Errorf("failed to write make.conf: %w", err)
-		}
-	}
-
-	// Write repos.conf entries
-	if len(config.Repos) > 0 {
-		for _, repo := range config.Repos {
-			var lines []string
-			lines = append(lines, fmt.Sprintf("[%s]", repo.Name))
-			if repo.Location != "" {
-				lines = append(lines, fmt.Sprintf("location = %s", repo.Location))
-			}
-			if repo.SyncType != "" {
-				lines = append(lines, fmt.Sprintf("sync-type = %s", repo.SyncType))
-			}
-			if repo.SyncURI != "" {
-				lines = append(lines, fmt.Sprintf("sync-uri = %s", repo.SyncURI))
-			}
-			if repo.Priority != 0 {
-				lines = append(lines, fmt.Sprintf("priority = %d", repo.Priority))
-			}
-			content := strings.Join(lines, "\n") + "\n"
-			path := filepath.Join(portageDir, "repos.conf", fmt.Sprintf("%s.conf", repo.Name))
-			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-				return fmt.Errorf("failed to write repos.conf for %s: %w", repo.Name, err)
-			}
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			return fmt.Errorf("failed to write repos.conf for %s: %w", repo.Name, err)
 		}
 	}
 

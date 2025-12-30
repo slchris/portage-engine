@@ -528,47 +528,7 @@ func TestGCPInstanceSpecFromMap(t *testing.T) {
 				"subnetwork":    "custom-subnet",
 				"preemptible":   "true",
 			},
-			validate: func(t *testing.T, spec *GCPInstanceSpec) {
-				if spec.Project != "my-proj" {
-					t.Errorf("Project = %s", spec.Project)
-				}
-				if spec.Region != "europe-west1" {
-					t.Errorf("Region = %s", spec.Region)
-				}
-				if spec.Zone != "europe-west1-b" {
-					t.Errorf("Zone = %s", spec.Zone)
-				}
-				if spec.MachineType != "n1-standard-8" {
-					t.Errorf("MachineType = %s", spec.MachineType)
-				}
-				if spec.CPUCount != 8 {
-					t.Errorf("CPUCount = %d", spec.CPUCount)
-				}
-				if spec.MemoryMB != 32768 {
-					t.Errorf("MemoryMB = %d", spec.MemoryMB)
-				}
-				if spec.DiskSizeGB != 500 {
-					t.Errorf("DiskSizeGB = %d", spec.DiskSizeGB)
-				}
-				if spec.DiskType != "pd-balanced" {
-					t.Errorf("DiskType = %s", spec.DiskType)
-				}
-				if spec.ImageProject != "debian-cloud" {
-					t.Errorf("ImageProject = %s", spec.ImageProject)
-				}
-				if spec.ImageFamily != "debian-11" {
-					t.Errorf("ImageFamily = %s", spec.ImageFamily)
-				}
-				if spec.Network != "custom-network" {
-					t.Errorf("Network = %s", spec.Network)
-				}
-				if spec.Subnetwork != "custom-subnet" {
-					t.Errorf("Subnetwork = %s", spec.Subnetwork)
-				}
-				if !spec.Preemptible {
-					t.Error("Preemptible should be true")
-				}
-			},
+			validate: validateGCPAllFields,
 		},
 		{
 			name: "preemptible variations",
@@ -588,6 +548,37 @@ func TestGCPInstanceSpecFromMap(t *testing.T) {
 			spec := GCPInstanceSpecFromMap(tt.input)
 			tt.validate(t, spec)
 		})
+	}
+}
+
+func validateGCPAllFields(t *testing.T, spec *GCPInstanceSpec) {
+	validateGCPBasic(t, spec)
+	validateGCPResources(t, spec)
+	validateGCPImage(t, spec)
+	validateGCPNetwork(t, spec)
+}
+
+func validateGCPBasic(t *testing.T, spec *GCPInstanceSpec) {
+	if spec.Project != "my-proj" || spec.Region != "europe-west1" || spec.Zone != "europe-west1-b" || spec.MachineType != "n1-standard-8" {
+		t.Error("Basic fields mismatch")
+	}
+}
+
+func validateGCPResources(t *testing.T, spec *GCPInstanceSpec) {
+	if spec.CPUCount != 8 || spec.MemoryMB != 32768 || spec.DiskSizeGB != 500 || spec.DiskType != "pd-balanced" {
+		t.Error("Resource fields mismatch")
+	}
+}
+
+func validateGCPImage(t *testing.T, spec *GCPInstanceSpec) {
+	if spec.ImageProject != "debian-cloud" || spec.ImageFamily != "debian-11" {
+		t.Error("Image fields mismatch")
+	}
+}
+
+func validateGCPNetwork(t *testing.T, spec *GCPInstanceSpec) {
+	if spec.Network != "custom-network" || spec.Subnetwork != "custom-subnet" || !spec.Preemptible {
+		t.Error("Network fields mismatch")
 	}
 }
 

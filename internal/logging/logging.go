@@ -96,7 +96,7 @@ func New(cfg *Config) (*Logger, error) {
 	}
 
 	if cfg.EnableFile && cfg.Dir != "" {
-		if err := os.MkdirAll(cfg.Dir, 0755); err != nil {
+		if err := os.MkdirAll(cfg.Dir, 0750); err != nil {
 			return nil, fmt.Errorf("failed to create log directory: %w", err)
 		}
 
@@ -165,7 +165,7 @@ func (l *Logger) rotate() error {
 		l.currentSize = 0
 	}
 
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
@@ -205,55 +205,77 @@ func (l *Logger) performCleanup() {
 		return
 	}
 
-	now := time.Now()
+	toDelete := l.getFilesToDelete(files, maxAge, maxBackups)
+	l.deleteFiles(toDelete)
+}
+
+// getFilesToDelete determines which files should be deleted.
+func (l *Logger) getFilesToDelete(files []string, maxAge time.Duration, maxBackups int) []string {
 	var toDelete []string
+	now := time.Now()
 
-	// Check age
 	if maxAge > 0 {
-		for _, file := range files {
-			info, err := os.Stat(file)
-			if err != nil {
-				continue
-			}
-			if now.Sub(info.ModTime()) > maxAge {
-				toDelete = append(toDelete, file)
-			}
-		}
+		toDelete = append(toDelete, l.getOldFiles(files, now, maxAge)...)
 	}
 
-	// Check backup count
 	if maxBackups > 0 && len(files) > maxBackups {
-		// Sort by modification time
-		type fileInfo struct {
-			path    string
-			modTime time.Time
-		}
-		var fileInfos []fileInfo
-		for _, file := range files {
-			info, err := os.Stat(file)
-			if err != nil {
-				continue
-			}
-			fileInfos = append(fileInfos, fileInfo{path: file, modTime: info.ModTime()})
-		}
+		toDelete = append(toDelete, l.getExcessFiles(files, maxBackups)...)
+	}
 
-		// Sort by mod time (oldest first)
-		for i := 0; i < len(fileInfos)-1; i++ {
-			for j := i + 1; j < len(fileInfos); j++ {
-				if fileInfos[i].modTime.After(fileInfos[j].modTime) {
-					fileInfos[i], fileInfos[j] = fileInfos[j], fileInfos[i]
-				}
-			}
-		}
+	return toDelete
+}
 
-		// Mark old files for deletion
-		for i := 0; i < len(fileInfos)-maxBackups; i++ {
-			toDelete = append(toDelete, fileInfos[i].path)
+// getOldFiles returns files older than maxAge.
+func (l *Logger) getOldFiles(files []string, now time.Time, maxAge time.Duration) []string {
+	var oldFiles []string
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) > maxAge {
+			oldFiles = append(oldFiles, file)
+		}
+	}
+	return oldFiles
+}
+
+// getExcessFiles returns files exceeding the backup count.
+func (l *Logger) getExcessFiles(files []string, maxBackups int) []string {
+	type fileInfo struct {
+		path    string
+		modTime time.Time
+	}
+
+	fileInfos := make([]fileInfo, 0, len(files))
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			continue
+		}
+		fileInfos = append(fileInfos, fileInfo{path: file, modTime: info.ModTime()})
+	}
+
+	// Sort by mod time (oldest first)
+	for i := 0; i < len(fileInfos)-1; i++ {
+		for j := i + 1; j < len(fileInfos); j++ {
+			if fileInfos[i].modTime.After(fileInfos[j].modTime) {
+				fileInfos[i], fileInfos[j] = fileInfos[j], fileInfos[i]
+			}
 		}
 	}
 
-	// Delete files
-	for _, file := range toDelete {
+	var excessFiles []string
+	for i := 0; i < len(fileInfos)-maxBackups; i++ {
+		excessFiles = append(excessFiles, fileInfos[i].path)
+	}
+
+	return excessFiles
+}
+
+// deleteFiles deletes the specified files.
+func (l *Logger) deleteFiles(files []string) {
+	for _, file := range files {
 		_ = os.Remove(file)
 	}
 }

@@ -254,7 +254,7 @@ func (s *Signer) ExportPublicKey(path string) error {
 		return err
 	}
 
-	if err := os.WriteFile(path, []byte(key), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(key), 0600); err != nil {
 		return fmt.Errorf("failed to write public key: %w", err)
 	}
 

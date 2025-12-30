@@ -513,51 +513,39 @@ func GenerateRemoteBuilderEntry(output *InstanceOutput, port int) string {
 func GCPInstanceSpecFromMap(m map[string]string) *GCPInstanceSpec {
 	spec := DefaultGCPInstanceSpec()
 
-	if v, ok := m["project"]; ok && v != "" {
-		spec.Project = v
-	}
-	if v, ok := m["region"]; ok && v != "" {
-		spec.Region = v
-	}
-	if v, ok := m["zone"]; ok && v != "" {
-		spec.Zone = v
-	}
-	if v, ok := m["machine_type"]; ok && v != "" {
-		spec.MachineType = v
-	}
-	if v, ok := m["cpu_count"]; ok && v != "" {
-		if n, err := parseInt(v); err == nil {
-			spec.CPUCount = n
+	setStringField := func(key string, target *string) {
+		if v, ok := m[key]; ok && v != "" {
+			*target = v
 		}
 	}
-	if v, ok := m["memory_mb"]; ok && v != "" {
-		if n, err := parseInt(v); err == nil {
-			spec.MemoryMB = n
+
+	setIntField := func(key string, target *int) {
+		if v, ok := m[key]; ok && v != "" {
+			if n, err := parseInt(v); err == nil {
+				*target = n
+			}
 		}
 	}
-	if v, ok := m["disk_size_gb"]; ok && v != "" {
-		if n, err := parseInt(v); err == nil {
-			spec.DiskSizeGB = n
+
+	setBoolField := func(key string, target *bool) {
+		if v, ok := m[key]; ok && v != "" {
+			*target = v == "true" || v == "1" || v == "yes"
 		}
 	}
-	if v, ok := m["disk_type"]; ok && v != "" {
-		spec.DiskType = v
-	}
-	if v, ok := m["image_project"]; ok && v != "" {
-		spec.ImageProject = v
-	}
-	if v, ok := m["image_family"]; ok && v != "" {
-		spec.ImageFamily = v
-	}
-	if v, ok := m["network"]; ok && v != "" {
-		spec.Network = v
-	}
-	if v, ok := m["subnetwork"]; ok && v != "" {
-		spec.Subnetwork = v
-	}
-	if v, ok := m["preemptible"]; ok && v != "" {
-		spec.Preemptible = v == "true" || v == "1" || v == "yes"
-	}
+
+	setStringField("project", &spec.Project)
+	setStringField("region", &spec.Region)
+	setStringField("zone", &spec.Zone)
+	setStringField("machine_type", &spec.MachineType)
+	setIntField("cpu_count", &spec.CPUCount)
+	setIntField("memory_mb", &spec.MemoryMB)
+	setIntField("disk_size_gb", &spec.DiskSizeGB)
+	setStringField("disk_type", &spec.DiskType)
+	setStringField("image_project", &spec.ImageProject)
+	setStringField("image_family", &spec.ImageFamily)
+	setStringField("network", &spec.Network)
+	setStringField("subnetwork", &spec.Subnetwork)
+	setBoolField("preemptible", &spec.Preemptible)
 
 	return spec
 }

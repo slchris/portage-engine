@@ -1,0 +1,11 @@
+{
+  "global": {
+    "nosec": false,
+    "audit": false
+  },
+  "exclude": {
+    "G204": "Most subprocess calls are necessary for container/package management",
+    "G304": "File operations are validated by application context",
+    "G107": "HTTP requests to internal/configured services are necessary"
+  }
+}

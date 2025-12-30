@@ -491,8 +491,12 @@ func (m *Manager) deployBuilder(instance *Instance, req *ProvisionRequest) error
 	// Create deployment script
 	script := m.generateDeploymentScript(req.ServerCallback, req.BuilderPort)
 	scriptPath := filepath.Join(instance.TerraformDir, "deploy.sh")
-	if err := os.WriteFile(scriptPath, []byte(script), 0700); err != nil {
+	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
 		return fmt.Errorf("failed to write deployment script: %w", err)
+	}
+	// Make script executable
+	if err := os.Chmod(scriptPath, 0700); err != nil { //nolint:gosec // Script needs exec permission
+		return fmt.Errorf("failed to make script executable: %w", err)
 	}
 
 	// Copy script to instance

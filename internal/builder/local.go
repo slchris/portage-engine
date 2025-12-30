@@ -70,213 +70,36 @@ type LocalBuilder struct {
 
 // NewLocalBuilder creates a new local builder instance.
 func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig) *LocalBuilder {
-	workDir := os.Getenv("BUILD_WORK_DIR")
-	if workDir == "" {
-		if cfg != nil && cfg.WorkDir != "" {
-			workDir = cfg.WorkDir
-		} else {
-			workDir = "/var/tmp/portage-builds"
-		}
-	}
+	return newLocalBuilderWithConfig(workers, signer, cfg)
+}
 
-	artifactDir := os.Getenv("BUILD_ARTIFACT_DIR")
-	if artifactDir == "" {
-		if cfg != nil && cfg.ArtifactDir != "" {
-			artifactDir = cfg.ArtifactDir
-		} else {
-			artifactDir = "/var/tmp/portage-artifacts"
-		}
-	}
-
-	useDocker := os.Getenv("USE_DOCKER") == "true"
-	if cfg != nil && cfg.UseDocker {
-		useDocker = cfg.UseDocker
-	}
-
-	dockerImage := os.Getenv("DOCKER_IMAGE")
-	if dockerImage == "" {
-		if cfg != nil && cfg.DockerImage != "" {
-			dockerImage = cfg.DockerImage
-		} else {
-			dockerImage = "gentoo/stage3:latest"
-		}
-	}
-
-	// Initialize container runtime
-	containerRuntimeName := os.Getenv("CONTAINER_RUNTIME")
-	if containerRuntimeName == "" {
-		if cfg != nil && cfg.ContainerRuntime != "" {
-			containerRuntimeName = cfg.ContainerRuntime
-		} else {
-			containerRuntimeName = "docker"
-		}
-	}
+// newLocalBuilderWithConfig creates a new local builder with the given configuration.
+func newLocalBuilderWithConfig(workers int, signer *gpg.Signer, cfg *config.BuilderConfig) *LocalBuilder {
+	workDir := getWorkDir(cfg)
+	artifactDir := getArtifactDir(cfg)
+	useDocker := getUseDocker(cfg)
+	dockerImage := getDockerImage(cfg)
+	containerRuntimeName := getContainerRuntime(cfg)
 	containerRuntime := NewContainerRuntime(containerRuntimeName)
+
 	log.Printf("Container runtime: %s", containerRuntime.Name())
 
-	_ = os.MkdirAll(workDir, 0750)
-	_ = os.MkdirAll(artifactDir, 0750)
+	ensureDirectories(workDir, artifactDir)
+	notifier := loadNotifier(cfg)
+	gpgClient := initGPGClient(cfg)
+	storageUpload := initStorageUploader(cfg)
+	executor := initBuildExecutor(cfg, containerRuntime, dockerImage)
+	dockerExecutor := initDockerExecutor(cfg, containerRuntime, dockerImage)
+	pkgMgr := initPackageManager(cfg)
+	jobStore := initJobStore(cfg)
 
-	// Verify directories are writable
-	testFile := filepath.Join(workDir, ".write_test")
-	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
-		log.Printf("WARNING: Work directory %s is not writable: %v", workDir, err)
-		log.Printf("Please ensure the directory exists and is owned by the service user")
-	} else {
-		_ = os.Remove(testFile)
-	}
-
-	testFile = filepath.Join(artifactDir, ".write_test")
-	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
-		log.Printf("WARNING: Artifact directory %s is not writable: %v", artifactDir, err)
-		log.Printf("Please ensure the directory exists and is owned by the service user")
-	} else {
-		_ = os.Remove(testFile)
-	}
-
-	// Load notification config if exists
-	var notifier *notification.Notifier
-	notifyConfigPath := os.Getenv("NOTIFY_CONFIG")
-	if notifyConfigPath == "" {
-		if cfg != nil && cfg.NotifyConfig != "" {
-			notifyConfigPath = cfg.NotifyConfig
-		} else {
-			notifyConfigPath = "configs/notification.json"
-		}
-	}
-	notifyConfig, err := notification.LoadConfig(notifyConfigPath)
-	if err == nil {
-		notifier = notification.NewNotifier(notifyConfig)
-		log.Printf("Notification system loaded from %s", notifyConfigPath)
-	} else {
-		log.Printf("Notification config not loaded (optional): %v", err)
-	}
-
-	// Initialize GPG key client if server URL is configured
-	var gpgClient *GPGKeyClient
-	if cfg != nil && cfg.ServerURL != "" {
-		gpgClient = NewGPGKeyClient(cfg.ServerURL)
-		if cfg.GPGHome != "" {
-			gpgClient = gpgClient.WithGnupgHome(cfg.GPGHome)
-		}
-		log.Printf("GPG key client initialized with server URL: %s", cfg.ServerURL)
-
-		// Auto-sync GPG key from server if enabled
-		if cfg.GPGAutoSync && cfg.GPGEnabled {
-			gpgKeyPath := cfg.GPGKeyPath
-			if gpgKeyPath == "" {
-				gpgKeyPath = filepath.Join(cfg.GPGHome, "server-public.asc")
-			}
-			if err := gpgClient.FetchAndImportGPGKey(gpgKeyPath); err != nil {
-				log.Printf("Failed to sync GPG key from server: %v", err)
-			} else {
-				keyID, err := gpgClient.GetKeyID(gpgKeyPath)
-				if err != nil {
-					log.Printf("Failed to get GPG key ID: %v", err)
-				} else {
-					cfg.GPGKeyID = keyID
-					log.Printf("GPG key synced from server: %s", keyID)
-				}
-			}
-		}
-	}
-
-	// Initialize storage uploader
-	var storageUpload *StorageUploader
-	if cfg != nil {
-		storageType := cfg.StorageType
-		if storageType == "" {
-			storageType = "local"
-		}
-
-		uploader, err := NewStorageUploader(
-			storageType,
-			cfg.StorageLocalDir,
-			cfg.StorageS3Bucket,
-			cfg.StorageS3Region,
-			cfg.StorageS3Prefix,
-			cfg.StorageHTTPBase,
-		)
-		if err != nil {
-			log.Printf("Failed to initialize storage uploader: %v", err)
-		} else {
-			storageUpload = uploader
-			log.Printf("Storage uploader initialized with type: %s, enabled: %v", storageType, storageUpload.IsEnabled())
-		}
-	}
-
-	// Initialize job store for persistence
-	var jobStore *JobStore
-	var persister *JobPersister
-	var loadedJobs map[string]*BuildJob
-
-	persistenceEnabled := true
-	dataDir := "/var/lib/portage-engine"
-	retentionDays := 7
-
-	if cfg != nil {
-		persistenceEnabled = cfg.PersistenceEnabled
-		if cfg.DataDir != "" {
-			dataDir = cfg.DataDir
-		}
-		if cfg.RetentionDays > 0 {
-			retentionDays = cfg.RetentionDays
-		}
-	}
-
-	if persistenceEnabled {
-		var err error
-		jobStore, err = NewJobStore(dataDir)
-		if err != nil {
-			log.Printf("Failed to initialize job store: %v (persistence disabled)", err)
-		} else {
-			loadedJobs, err = jobStore.Load()
-			if err != nil {
-				log.Printf("Failed to load persisted jobs: %v", err)
-				loadedJobs = make(map[string]*BuildJob)
-			} else {
-				log.Printf("Loaded %d persisted jobs from %s", len(loadedJobs), dataDir)
-			}
-		}
-	}
-
-	if loadedJobs == nil {
-		loadedJobs = make(map[string]*BuildJob)
-	}
-
-	// Get instance ID and architecture from config or auto-detect
-	instanceID := ""
-	architecture := ""
-	if cfg != nil {
-		instanceID = cfg.InstanceID
-		architecture = cfg.Architecture
-	}
-	if instanceID == "" {
-		// Auto-generate instance ID from hostname
-		if hostname, err := os.Hostname(); err == nil {
-			instanceID = hostname
-		} else {
-			instanceID = uuid.New().String()[:8]
-		}
-	}
-	if architecture == "" {
-		// Auto-detect architecture
-		architecture = detectArchitecture()
-	}
-
-	// Ensure cfg is not nil for PackageManager
-	if cfg == nil {
-		cfg = &config.BuilderConfig{
-			PortageReposPath: "/var/db/repos",
-			PortageConfPath:  "/etc/portage",
-			MakeConfPath:     "/etc/portage/make.conf",
-		}
-	}
+	instanceID := generateInstanceID(cfg)
+	architecture := getArchitecture(cfg)
 
 	lb := &LocalBuilder{
 		workers:          workers,
 		jobQueue:         make(chan *BuildJob, 100),
-		jobs:             loadedJobs,
+		jobs:             make(map[string]*BuildJob),
 		signer:           signer,
 		gpgClient:        gpgClient,
 		storageUpload:    storageUpload,
@@ -285,35 +108,262 @@ func NewLocalBuilder(workers int, signer *gpg.Signer, cfg *config.BuilderConfig)
 		useDocker:        useDocker,
 		dockerImage:      dockerImage,
 		containerRuntime: containerRuntime,
-		executor:         NewBuildExecutor(workDir, artifactDir),
-		dockerExecutor:   NewDockerBuildExecutor(workDir, artifactDir, dockerImage, containerRuntime),
+		executor:         executor,
+		dockerExecutor:   dockerExecutor,
 		notifier:         notifier,
 		jobStore:         jobStore,
-		persister:        nil,
 		instanceID:       instanceID,
 		architecture:     architecture,
-		pkgMgr:           NewPackageManager(cfg),
+		pkgMgr:           pkgMgr,
 		cfg:              cfg,
 	}
 
-	log.Printf("Builder initialized: instance_id=%s, architecture=%s", instanceID, architecture)
-
-	// Initialize persister if job store is available
 	if jobStore != nil {
-		retentionDuration := time.Duration(retentionDays) * 24 * time.Hour
-		persister = NewJobPersister(jobStore, lb.getJobsSnapshot, 30*time.Second, retentionDuration)
-		persister.Start()
-		lb.persister = persister
-		log.Printf("Job persistence enabled with %d day retention", retentionDays)
+		loadedJobs, err := jobStore.Load()
+		if err != nil {
+			log.Printf("Failed to load persisted jobs: %v", err)
+		} else {
+			lb.jobs = loadedJobs
+			log.Printf("Loaded %d persisted jobs", len(loadedJobs))
+		}
 	}
 
-	// Start worker pool
 	for i := 0; i < workers; i++ {
 		go lb.worker(i)
 	}
 
 	return lb
+}
 
+// getWorkDir returns the work directory from config or environment.
+func getWorkDir(cfg *config.BuilderConfig) string {
+	workDir := os.Getenv("BUILD_WORK_DIR")
+	if workDir == "" {
+		if cfg != nil && cfg.WorkDir != "" {
+			return cfg.WorkDir
+		}
+		return "/var/tmp/portage-builds"
+	}
+	return workDir
+}
+
+// getArtifactDir returns the artifact directory from config or environment.
+func getArtifactDir(cfg *config.BuilderConfig) string {
+	artifactDir := os.Getenv("BUILD_ARTIFACT_DIR")
+	if artifactDir == "" {
+		if cfg != nil && cfg.ArtifactDir != "" {
+			return cfg.ArtifactDir
+		}
+		return "/var/tmp/portage-artifacts"
+	}
+	return artifactDir
+}
+
+// getUseDocker returns whether to use Docker from config or environment.
+func getUseDocker(cfg *config.BuilderConfig) bool {
+	if cfg != nil && cfg.UseDocker {
+		return true
+	}
+	return os.Getenv("USE_DOCKER") == "true"
+}
+
+// getDockerImage returns the Docker image from config or environment.
+func getDockerImage(cfg *config.BuilderConfig) string {
+	dockerImage := os.Getenv("DOCKER_IMAGE")
+	if dockerImage == "" {
+		if cfg != nil && cfg.DockerImage != "" {
+			return cfg.DockerImage
+		}
+		return "gentoo/stage3:latest"
+	}
+	return dockerImage
+}
+
+// getContainerRuntime returns the container runtime from config or environment.
+func getContainerRuntime(cfg *config.BuilderConfig) string {
+	containerRuntime := os.Getenv("CONTAINER_RUNTIME")
+	if containerRuntime == "" {
+		if cfg != nil && cfg.ContainerRuntime != "" {
+			return cfg.ContainerRuntime
+		}
+		return "docker"
+	}
+	return containerRuntime
+}
+
+// ensureDirectories creates and verifies the work and artifact directories.
+func ensureDirectories(workDir, artifactDir string) {
+	_ = os.MkdirAll(workDir, 0750)
+	_ = os.MkdirAll(artifactDir, 0750)
+	verifyDirectoryWritable(workDir, "Work")
+	verifyDirectoryWritable(artifactDir, "Artifact")
+}
+
+// verifyDirectoryWritable checks if a directory is writable.
+func verifyDirectoryWritable(dir, dirType string) {
+	testFile := filepath.Join(dir, ".write_test")
+	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
+		log.Printf("WARNING: %s directory %s is not writable: %v", dirType, dir, err)
+		log.Printf("Please ensure the directory exists and is owned by the service user")
+	} else {
+		_ = os.Remove(testFile)
+	}
+}
+
+// loadNotifier loads the notification configuration.
+func loadNotifier(cfg *config.BuilderConfig) *notification.Notifier {
+	notifyConfigPath := os.Getenv("NOTIFY_CONFIG")
+	if notifyConfigPath == "" {
+		if cfg != nil && cfg.NotifyConfig != "" {
+			notifyConfigPath = cfg.NotifyConfig
+		} else {
+			notifyConfigPath = "configs/notification.json"
+		}
+	}
+
+	notifyConfig, err := notification.LoadConfig(notifyConfigPath)
+	if err == nil {
+		log.Printf("Notification system loaded from %s", notifyConfigPath)
+		return notification.NewNotifier(notifyConfig)
+	}
+	log.Printf("Notification config not loaded (optional): %v", err)
+	return nil
+}
+
+// initGPGClient initializes the GPG key client if configured.
+func initGPGClient(cfg *config.BuilderConfig) *GPGKeyClient {
+	if cfg == nil || cfg.ServerURL == "" {
+		return nil
+	}
+
+	gpgClient := NewGPGKeyClient(cfg.ServerURL)
+	if cfg.GPGHome != "" {
+		gpgClient = gpgClient.WithGnupgHome(cfg.GPGHome)
+	}
+	log.Printf("GPG key client initialized with server URL: %s", cfg.ServerURL)
+
+	if cfg.GPGAutoSync && cfg.GPGEnabled {
+		syncGPGKey(gpgClient, cfg)
+	}
+
+	return gpgClient
+}
+
+// syncGPGKey syncs GPG key from server.
+func syncGPGKey(gpgClient *GPGKeyClient, cfg *config.BuilderConfig) {
+	gpgKeyPath := cfg.GPGKeyPath
+	if gpgKeyPath == "" {
+		gpgKeyPath = filepath.Join(cfg.GPGHome, "server-public.asc")
+	}
+
+	if err := gpgClient.FetchAndImportGPGKey(gpgKeyPath); err != nil {
+		log.Printf("Failed to sync GPG key from server: %v", err)
+		return
+	}
+
+	keyID, err := gpgClient.GetKeyID(gpgKeyPath)
+	if err != nil {
+		log.Printf("Failed to get GPG key ID: %v", err)
+		return
+	}
+
+	cfg.GPGKeyID = keyID
+	log.Printf("GPG key synced from server: %s", keyID)
+}
+
+// initStorageUploader initializes the storage uploader if configured.
+func initStorageUploader(cfg *config.BuilderConfig) *StorageUploader {
+	if cfg == nil {
+		return nil
+	}
+
+	storageType := cfg.StorageType
+	if storageType == "" {
+		storageType = "local"
+	}
+
+	uploader, err := NewStorageUploader(
+		storageType,
+		cfg.StorageLocalDir,
+		cfg.StorageS3Bucket,
+		cfg.StorageS3Region,
+		cfg.StorageS3Prefix,
+		cfg.StorageHTTPBase,
+	)
+	if err != nil {
+		log.Printf("Failed to initialize storage uploader: %v", err)
+		return nil
+	}
+
+	log.Printf("Storage uploader initialized with type: %s, enabled: %v", storageType, uploader.IsEnabled())
+	return uploader
+}
+
+// initBuildExecutor initializes the build executor.
+func initBuildExecutor(cfg *config.BuilderConfig, _ ContainerRuntime, _ string) *BuildExecutor {
+	workDir := getWorkDir(cfg)
+	artifactDir := getArtifactDir(cfg)
+	return NewBuildExecutor(workDir, artifactDir)
+}
+
+// initDockerExecutor initializes the Docker build executor.
+func initDockerExecutor(cfg *config.BuilderConfig, containerRuntime ContainerRuntime, dockerImage string) *DockerBuildExecutor {
+	workDir := getWorkDir(cfg)
+	artifactDir := getArtifactDir(cfg)
+	return NewDockerBuildExecutor(workDir, artifactDir, dockerImage, containerRuntime)
+}
+
+// initPackageManager initializes the package manager.
+func initPackageManager(cfg *config.BuilderConfig) PackageManager {
+	if cfg == nil {
+		cfg = &config.BuilderConfig{
+			PortageReposPath: "/var/db/repos",
+			PortageConfPath:  "/etc/portage",
+			MakeConfPath:     "/etc/portage/make.conf",
+		}
+	}
+	return NewPackageManager(cfg)
+}
+
+// initJobStore initializes the job store and loads persisted jobs.
+func initJobStore(cfg *config.BuilderConfig) *JobStore {
+	if cfg == nil || !cfg.PersistenceEnabled {
+		return nil
+	}
+
+	dataDir := cfg.DataDir
+	if dataDir == "" {
+		dataDir = "/var/lib/portage-engine"
+	}
+
+	jobStore, err := NewJobStore(dataDir)
+	if err != nil {
+		log.Printf("Failed to initialize job store: %v (persistence disabled)", err)
+		return nil
+	}
+
+	return jobStore
+}
+
+// generateInstanceID generates or retrieves the instance ID.
+func generateInstanceID(cfg *config.BuilderConfig) string {
+	if cfg != nil && cfg.InstanceID != "" {
+		return cfg.InstanceID
+	}
+
+	if hostname, err := os.Hostname(); err == nil {
+		return hostname
+	}
+
+	return uuid.New().String()[:8]
+}
+
+// getArchitecture detects or retrieves the system architecture.
+func getArchitecture(cfg *config.BuilderConfig) string {
+	if cfg != nil && cfg.Architecture != "" {
+		return cfg.Architecture
+	}
+	return detectArchitecture()
 }
 
 // SubmitBuild submits a new build job.
@@ -361,18 +411,6 @@ func (lb *LocalBuilder) ListJobs() []*BuildJob {
 	}
 
 	return jobs
-}
-
-// getJobsSnapshot returns a copy of the jobs map for persistence.
-func (lb *LocalBuilder) getJobsSnapshot() map[string]*BuildJob {
-	lb.jobsMutex.RLock()
-	defer lb.jobsMutex.RUnlock()
-
-	snapshot := make(map[string]*BuildJob, len(lb.jobs))
-	for id, job := range lb.jobs {
-		snapshot[id] = job
-	}
-	return snapshot
 }
 
 // Shutdown gracefully shuts down the builder and persists jobs.
@@ -606,96 +644,144 @@ ls -lh /output/
 
 // executeDockerBuild performs the build using Docker container.
 func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
-	req := job.Request
-
-	jobWorkDir := filepath.Join(lb.workDir, job.ID)
-	if err := os.MkdirAll(jobWorkDir, 0750); err != nil {
-		return fmt.Errorf("failed to create work directory: %w", err)
+	jobWorkDir, err := lb.prepareJobWorkDir(job.ID)
+	if err != nil {
+		return err
 	}
 	defer func() { _ = os.RemoveAll(jobWorkDir) }()
 
+	script := lb.prepareDockerBuildScript(job)
+	outputDir := filepath.Join(jobWorkDir, "output")
+	_ = os.MkdirAll(outputDir, 0750)
+
+	gpgKeyDir := lb.prepareGPGKeys(jobWorkDir)
+	args := lb.buildDockerArgs(outputDir, gpgKeyDir)
+	args = append(args, lb.dockerImage, "/bin/bash", "-c", script)
+
+	if err := lb.runDockerBuild(job, args); err != nil {
+		return err
+	}
+
+	return lb.collectAndUploadArtifact(job, outputDir)
+}
+
+// prepareJobWorkDir creates and returns the job-specific work directory.
+func (lb *LocalBuilder) prepareJobWorkDir(jobID string) (string, error) {
+	jobWorkDir := filepath.Join(lb.workDir, jobID)
+	if err := os.MkdirAll(jobWorkDir, 0750); err != nil {
+		return "", fmt.Errorf("failed to create work directory: %w", err)
+	}
+	return jobWorkDir, nil
+}
+
+// prepareDockerBuildScript generates the build script for Docker.
+func (lb *LocalBuilder) prepareDockerBuildScript(job *BuildJob) string {
+	req := job.Request
 	pkgAtom := req.PackageName
 	if req.Version != "" {
 		pkgAtom = fmt.Sprintf("=%s-%s", req.PackageName, req.Version)
 	}
 
-	// Build USE flags string (Gentoo-specific, but harmless for Debian)
-	useFlags := ""
-	for flag, enabled := range req.UseFlags {
+	useFlags := buildUseFlagsString(req.UseFlags)
+	gpgKeyID := lb.getGPGKeyID()
+
+	return lb.generateBuildScript(pkgAtom, useFlags, gpgKeyID)
+}
+
+// buildUseFlagsString constructs the USE flags string.
+func buildUseFlagsString(useFlags map[string]string) string {
+	var flags string
+	for flag, enabled := range useFlags {
 		if enabled == "true" || enabled == "1" {
-			useFlags += flag + " "
+			flags += flag + " "
 		} else {
-			useFlags += "-" + flag + " "
+			flags += "-" + flag + " "
 		}
 	}
+	return flags
+}
 
-	// Get GPG key ID for signing if enabled
-	gpgKeyID := ""
+// getGPGKeyID returns the GPG key ID if signing is enabled.
+func (lb *LocalBuilder) getGPGKeyID() string {
 	if lb.cfg != nil && lb.cfg.GPGEnabled && lb.cfg.GPGKeyID != "" {
-		gpgKeyID = lb.cfg.GPGKeyID
+		return lb.cfg.GPGKeyID
+	}
+	return ""
+}
+
+// prepareGPGKeys exports GPG keys for container signing.
+func (lb *LocalBuilder) prepareGPGKeys(jobWorkDir string) string {
+	gpgKeyID := lb.getGPGKeyID()
+	if gpgKeyID == "" || lb.signer == nil || !lb.signer.IsEnabled() {
+		return ""
 	}
 
-	// Create build script based on package manager
-	script := lb.generateBuildScript(pkgAtom, useFlags, gpgKeyID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
-	defer cancel()
-
-	outputDir := filepath.Join(jobWorkDir, "output")
-	_ = os.MkdirAll(outputDir, 0750)
-
-	// Prepare GPG key directory for mounting with both public and secret keys
-	gpgKeyDir := ""
-	if gpgKeyID != "" && lb.signer != nil && lb.signer.IsEnabled() {
-		// Create temporary directory for GPG keys
-		gpgKeyDir = filepath.Join(jobWorkDir, "gpg-keys")
-		if err := os.MkdirAll(gpgKeyDir, 0700); err != nil {
-			return fmt.Errorf("failed to create GPG key directory: %w", err)
-		}
-		// Export both public and secret keys for container signing
-		_, _, err := lb.signer.ExportKeyPair(gpgKeyDir)
-		if err != nil {
-			log.Printf("Warning: failed to export GPG keys: %v", err)
-			gpgKeyDir = ""
-		} else {
-			log.Printf("GPG keys exported to %s for container signing", gpgKeyDir)
-		}
+	gpgKeyDir := filepath.Join(jobWorkDir, "gpg-keys")
+	if err := os.MkdirAll(gpgKeyDir, 0700); err != nil {
+		log.Printf("Warning: failed to create GPG key directory: %v", err)
+		return ""
 	}
 
-	// Build container run arguments
-	args := []string{"--rm", "-i",
-		"-v", outputDir + ":/output",
+	_, _, err := lb.signer.ExportKeyPair(gpgKeyDir)
+	if err != nil {
+		log.Printf("Warning: failed to export GPG keys: %v", err)
+		return ""
 	}
 
-	// Mount GPG keys if available
+	log.Printf("GPG keys exported to %s for container signing", gpgKeyDir)
+	return gpgKeyDir
+}
+
+// buildDockerArgs constructs the Docker run arguments.
+func (lb *LocalBuilder) buildDockerArgs(outputDir, gpgKeyDir string) []string {
+	args := []string{"--rm", "-i", "-v", outputDir + ":/output"}
+
 	if gpgKeyDir != "" {
 		args = append(args, "-v", gpgKeyDir+":/gpg-keys:ro")
 	}
 
-	// Add package manager specific mounts
 	if lb.cfg != nil {
-		mounts := lb.pkgMgr.GetDockerMounts(lb.cfg)
-		for _, m := range mounts {
-			args = append(args, "-v", m.String())
-		}
-
-		// Add environment variables
-		envVars := lb.pkgMgr.GetEnvVars(lb.cfg)
-		for k, v := range envVars {
-			args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
-		}
+		args = lb.addPackageManagerMounts(args)
+		args = lb.addEnvironmentVars(args)
 	} else {
-		// Fallback to default Gentoo mounts for backward compatibility
-		args = append(args,
-			"-v", "/var/db/repos:/var/db/repos:ro",
-			"-v", "/etc/portage/make.conf:/etc/portage/make.conf:ro",
-			"-v", "/etc/portage/repos.conf:/etc/portage/repos.conf:ro",
-		)
+		args = lb.addDefaultGentooMounts(args)
 	}
 
-	args = append(args, lb.dockerImage, "/bin/bash", "-c", script)
+	return args
+}
 
-	// Run container with script
+// addPackageManagerMounts adds package manager specific mounts.
+func (lb *LocalBuilder) addPackageManagerMounts(args []string) []string {
+	mounts := lb.pkgMgr.GetDockerMounts(lb.cfg)
+	for _, m := range mounts {
+		args = append(args, "-v", m.String())
+	}
+	return args
+}
+
+// addEnvironmentVars adds package manager specific environment variables.
+func (lb *LocalBuilder) addEnvironmentVars(args []string) []string {
+	envVars := lb.pkgMgr.GetEnvVars(lb.cfg)
+	for k, v := range envVars {
+		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+	}
+	return args
+}
+
+// addDefaultGentooMounts adds default Gentoo mounts for backward compatibility.
+func (lb *LocalBuilder) addDefaultGentooMounts(args []string) []string {
+	return append(args,
+		"-v", "/var/db/repos:/var/db/repos:ro",
+		"-v", "/etc/portage/make.conf:/etc/portage/make.conf:ro",
+		"-v", "/etc/portage/repos.conf:/etc/portage/repos.conf:ro",
+	)
+}
+
+// runDockerBuild executes the Docker build command.
+func (lb *LocalBuilder) runDockerBuild(job *BuildJob, args []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancel()
+
 	output, err := lb.containerRuntime.Run(ctx, args)
 	job.Log = string(output)
 
@@ -705,23 +791,45 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 	}
 
 	log.Printf("Container build completed for job %s, output size: %d bytes", job.ID, len(output))
+	return nil
+}
 
-	// Ensure all filesystem writes are flushed
+// collectAndUploadArtifact finds, copies, signs, and uploads the artifact.
+func (lb *LocalBuilder) collectAndUploadArtifact(job *BuildJob, outputDir string) error {
+	// Ensure filesystem is synced
 	_ = exec.Command("sync").Run()
-
-	// Give container time to fully unmount volumes and sync filesystem
 	time.Sleep(10 * time.Second)
 
-	// Wait for Docker filesystem to sync and retry if needed
+	artifact, err := lb.waitForArtifact(outputDir, job.Request.PackageName)
+	if err != nil {
+		return err
+	}
+
+	destPath, err := lb.copyArtifact(artifact)
+	if err != nil {
+		return err
+	}
+
+	job.ArtifactURL = destPath
+
+	lb.signArtifact(job, destPath)
+	lb.uploadArtifact(job, destPath)
+
+	return nil
+}
+
+// waitForArtifact waits for the artifact to appear with retries.
+func (lb *LocalBuilder) waitForArtifact(outputDir, pkgName string) (string, error) {
 	var artifact string
+	var err error
+
 	for i := 0; i < 10; i++ {
 		if i > 0 {
-			// Force filesystem sync before retrying
 			_ = exec.Command("sync").Run()
 			time.Sleep(2 * time.Second)
 		}
 
-		artifact, err = lb.findLatestPackage(outputDir, req.PackageName)
+		artifact, err = lb.findLatestPackage(outputDir, pkgName)
 		if err == nil {
 			break
 		}
@@ -730,33 +838,45 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 			log.Printf("Artifact not found on attempt %d, retrying...", i+1)
 		}
 	}
+
 	if err != nil {
-		return fmt.Errorf("artifact not found: %w", err)
+		return "", fmt.Errorf("artifact not found: %w", err)
 	}
 
+	return artifact, nil
+}
+
+// copyArtifact copies the artifact to the destination directory.
+func (lb *LocalBuilder) copyArtifact(artifact string) (string, error) {
 	artifactName := filepath.Base(artifact)
 	destPath := filepath.Join(lb.artifactDir, artifactName)
 
 	copyCmd := exec.Command("cp", artifact, destPath)
 	if err := copyCmd.Run(); err != nil {
-		return fmt.Errorf("failed to copy artifact: %w", err)
+		return "", fmt.Errorf("failed to copy artifact: %w", err)
 	}
 
-	job.ArtifactURL = destPath
+	return destPath, nil
+}
 
+// signArtifact signs the artifact if a signer is available.
+func (lb *LocalBuilder) signArtifact(job *BuildJob, artifactPath string) {
 	if lb.signer != nil && lb.signer.IsEnabled() {
-		if err := lb.signer.SignPackage(destPath); err != nil {
+		if err := lb.signer.SignPackage(artifactPath); err != nil {
 			log.Printf("Warning: failed to sign package: %v", err)
 		} else {
 			job.Metadata["signed"] = true
-			log.Printf("Package signed: %s", destPath)
+			log.Printf("Package signed: %s", artifactPath)
 		}
 	}
+}
 
-	// Upload to storage if configured
+// uploadArtifact uploads the artifact to storage if configured.
+func (lb *LocalBuilder) uploadArtifact(job *BuildJob, artifactPath string) {
 	if lb.storageUpload != nil && lb.storageUpload.IsEnabled() {
+		artifactName := filepath.Base(artifactPath)
 		remotePath := artifactName
-		if err := lb.storageUpload.Upload(destPath, remotePath); err != nil {
+		if err := lb.storageUpload.Upload(artifactPath, remotePath); err != nil {
 			log.Printf("Warning: failed to upload artifact to storage: %v", err)
 		} else {
 			uploadedURL, _ := lb.storageUpload.GetURL(remotePath)
@@ -765,31 +885,54 @@ func (lb *LocalBuilder) executeDockerBuild(job *BuildJob) error {
 			log.Printf("Artifact uploaded to storage: %s", uploadedURL)
 		}
 	}
-
-	return nil
 }
 
 // executeNativeBuild performs the build natively using the system package manager.
 func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
-	req := job.Request
-
-	jobWorkDir := filepath.Join(lb.workDir, job.ID)
-	if err := os.MkdirAll(jobWorkDir, 0750); err != nil {
-		return fmt.Errorf("failed to create work directory: %w", err)
+	jobWorkDir, err := lb.prepareJobWorkDir(job.ID)
+	if err != nil {
+		return err
 	}
 	defer func() { _ = os.RemoveAll(jobWorkDir) }()
 
+	pkgAtom, env := lb.prepareNativeBuildEnv(job)
+
+	if err := lb.runNativeBuild(job, pkgAtom, env, jobWorkDir); err != nil {
+		return err
+	}
+
+	artifact, err := lb.findArtifactFromPaths(job.Request.PackageName)
+	if err != nil {
+		return err
+	}
+
+	destPath, err := lb.copyArtifact(artifact)
+	if err != nil {
+		return err
+	}
+
+	job.ArtifactURL = destPath
+
+	lb.signArtifact(job, destPath)
+	lb.uploadArtifact(job, destPath)
+
+	return nil
+}
+
+// prepareNativeBuildEnv prepares the package atom and environment variables.
+func (lb *LocalBuilder) prepareNativeBuildEnv(job *BuildJob) (string, []string) {
+	req := job.Request
 	pkgAtom := req.PackageName
 	if req.Version != "" {
 		pkgAtom = fmt.Sprintf("=%s-%s", req.PackageName, req.Version)
 	}
 
 	env := os.Environ()
+
 	for k, v := range req.Environment {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	// Add package manager specific environment variables
 	if lb.cfg != nil {
 		pkgEnv := lb.pkgMgr.GetEnvVars(lb.cfg)
 		for k, v := range pkgEnv {
@@ -798,25 +941,22 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 	}
 
 	if len(req.UseFlags) > 0 {
-		useFlags := ""
-		for flag, enabled := range req.UseFlags {
-			if enabled == "true" || enabled == "1" {
-				useFlags += flag + " "
-			} else {
-				useFlags += "-" + flag + " "
-			}
-		}
+		useFlags := buildUseFlagsString(req.UseFlags)
 		env = append(env, fmt.Sprintf("USE=%s", useFlags))
 	}
 
+	return pkgAtom, env
+}
+
+// runNativeBuild executes the native build command.
+func (lb *LocalBuilder) runNativeBuild(job *BuildJob, pkgAtom string, env []string, workDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 
-	// Build command using package manager
 	buildCmd := lb.pkgMgr.BuildCommand(pkgAtom, nil)
 	cmd := exec.CommandContext(ctx, buildCmd[0], buildCmd[1:]...)
 	cmd.Env = env
-	cmd.Dir = jobWorkDir
+	cmd.Dir = workDir
 
 	output, err := cmd.CombinedOutput()
 	job.Log = string(output)
@@ -825,52 +965,19 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 		return fmt.Errorf("build failed: %w", err)
 	}
 
-	// Find artifacts from package manager specific paths
-	var artifact string
+	return nil
+}
+
+// findArtifactFromPaths finds the artifact from package manager specific paths.
+func (lb *LocalBuilder) findArtifactFromPaths(pkgName string) (string, error) {
 	artifactPaths := lb.pkgMgr.GetArtifactPaths()
 	for _, pkgDir := range artifactPaths {
-		artifact, err = lb.findLatestPackage(pkgDir, req.PackageName)
+		artifact, err := lb.findLatestPackage(pkgDir, pkgName)
 		if err == nil {
-			break
+			return artifact, nil
 		}
 	}
-	if artifact == "" {
-		return fmt.Errorf("artifact not found in any of %v", artifactPaths)
-	}
-
-	artifactName := filepath.Base(artifact)
-	destPath := filepath.Join(lb.artifactDir, artifactName)
-
-	copyCmd := exec.Command("cp", artifact, destPath)
-	if err := copyCmd.Run(); err != nil {
-		return fmt.Errorf("failed to copy artifact: %w", err)
-	}
-
-	job.ArtifactURL = destPath
-
-	if lb.signer != nil && lb.signer.IsEnabled() {
-		if err := lb.signer.SignPackage(destPath); err != nil {
-			log.Printf("Warning: failed to sign package: %v", err)
-		} else {
-			job.Metadata["signed"] = true
-			log.Printf("Package signed: %s", destPath)
-		}
-	}
-
-	// Upload to storage if configured
-	if lb.storageUpload != nil && lb.storageUpload.IsEnabled() {
-		remotePath := artifactName
-		if err := lb.storageUpload.Upload(destPath, remotePath); err != nil {
-			log.Printf("Warning: failed to upload artifact to storage: %v", err)
-		} else {
-			uploadedURL, _ := lb.storageUpload.GetURL(remotePath)
-			job.ArtifactURL = uploadedURL
-			job.Metadata["uploaded"] = true
-			log.Printf("Artifact uploaded to storage: %s", uploadedURL)
-		}
-	}
-
-	return nil
+	return "", fmt.Errorf("artifact not found in any of %v", artifactPaths)
 }
 
 // findLatestPackage finds the most recently created package file.

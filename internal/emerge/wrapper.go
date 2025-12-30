@@ -148,7 +148,7 @@ func (w *Wrapper) downloadPackages(packages []string) error {
 		w.config.CacheDir = "/var/cache/binpkgs"
 	}
 
-	if err := os.MkdirAll(w.config.CacheDir, 0755); err != nil {
+	if err := os.MkdirAll(w.config.CacheDir, 0750); err != nil {
 		return fmt.Errorf("failed to create cache dir: %w", err)
 	}
 

@@ -84,66 +84,44 @@ func DefaultPVEInstanceSpec() *PVEInstanceSpec {
 func PVEInstanceSpecFromMap(m map[string]string) *PVEInstanceSpec {
 	spec := DefaultPVEInstanceSpec()
 
-	if v, ok := m["node"]; ok && v != "" {
-		spec.Node = v
+	setStringField := func(key string, target *string) {
+		if v, ok := m[key]; ok && v != "" {
+			*target = v
+		}
 	}
-	if v, ok := m["vmid"]; ok && v != "" {
-		_, _ = fmt.Sscanf(v, "%d", &spec.VMID)
+
+	setIntField := func(key string, target *int) {
+		if v, ok := m[key]; ok && v != "" {
+			_, _ = fmt.Sscanf(v, "%d", target)
+		}
 	}
-	if v, ok := m["name"]; ok && v != "" {
-		spec.Name = v
+
+	setBoolField := func(key string, target *bool) {
+		if v, ok := m[key]; ok {
+			*target = v == "true" || v == "1"
+		}
 	}
-	if v, ok := m["cores"]; ok && v != "" {
-		_, _ = fmt.Sscanf(v, "%d", &spec.Cores)
-	}
-	if v, ok := m["sockets"]; ok && v != "" {
-		_, _ = fmt.Sscanf(v, "%d", &spec.Sockets)
-	}
-	if v, ok := m["memory_mb"]; ok && v != "" {
-		_, _ = fmt.Sscanf(v, "%d", &spec.MemoryMB)
-	}
-	if v, ok := m["disk_size_gb"]; ok && v != "" {
-		_, _ = fmt.Sscanf(v, "%d", &spec.DiskSizeGB)
-	}
-	if v, ok := m["disk_type"]; ok && v != "" {
-		spec.DiskType = v
-	}
-	if v, ok := m["storage"]; ok && v != "" {
-		spec.Storage = v
-	}
-	if v, ok := m["template"]; ok && v != "" {
-		spec.Template = v
-	}
-	if v, ok := m["os_type"]; ok && v != "" {
-		spec.OSType = v
-	}
-	if v, ok := m["network"]; ok && v != "" {
-		spec.Network = v
-	}
-	if v, ok := m["vlan"]; ok && v != "" {
-		_, _ = fmt.Sscanf(v, "%d", &spec.VLAN)
-	}
-	if v, ok := m["ip_config"]; ok && v != "" {
-		spec.IPConfig = v
-	}
-	if v, ok := m["gateway"]; ok && v != "" {
-		spec.Gateway = v
-	}
-	if v, ok := m["nameserver"]; ok && v != "" {
-		spec.Nameserver = v
-	}
-	if v, ok := m["ssh_keys"]; ok && v != "" {
-		spec.SSHKeys = v
-	}
-	if v, ok := m["pool"]; ok && v != "" {
-		spec.Pool = v
-	}
-	if v, ok := m["cloud_init"]; ok {
-		spec.CloudInit = v == "true" || v == "1"
-	}
-	if v, ok := m["agent"]; ok {
-		spec.Agent = v == "true" || v == "1"
-	}
+
+	setStringField("node", &spec.Node)
+	setIntField("vmid", &spec.VMID)
+	setStringField("name", &spec.Name)
+	setIntField("cores", &spec.Cores)
+	setIntField("sockets", &spec.Sockets)
+	setIntField("memory_mb", &spec.MemoryMB)
+	setIntField("disk_size_gb", &spec.DiskSizeGB)
+	setStringField("disk_type", &spec.DiskType)
+	setStringField("storage", &spec.Storage)
+	setStringField("template", &spec.Template)
+	setStringField("os_type", &spec.OSType)
+	setStringField("network", &spec.Network)
+	setIntField("vlan", &spec.VLAN)
+	setStringField("ip_config", &spec.IPConfig)
+	setStringField("gateway", &spec.Gateway)
+	setStringField("nameserver", &spec.Nameserver)
+	setStringField("ssh_keys", &spec.SSHKeys)
+	setStringField("pool", &spec.Pool)
+	setBoolField("cloud_init", &spec.CloudInit)
+	setBoolField("agent", &spec.Agent)
 
 	return spec
 }

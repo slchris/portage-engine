@@ -37,7 +37,7 @@ func (be *BuildExecutor) ExecuteBuild(
 	// Create build workspace
 	buildID := job.ID
 	buildWorkDir := filepath.Join(be.workDir, buildID)
-	if err := os.MkdirAll(buildWorkDir, 0755); err != nil {
+	if err := os.MkdirAll(buildWorkDir, 0750); err != nil {
 		return fmt.Errorf("failed to create build workspace: %w", err)
 	}
 	defer func() {
@@ -273,7 +273,7 @@ func (dbe *DockerBuildExecutor) ExecuteBuild(
 	// Create build workspace
 	buildID := job.ID
 	buildWorkDir := filepath.Join(dbe.workDir, buildID)
-	if err := os.MkdirAll(buildWorkDir, 0755); err != nil {
+	if err := os.MkdirAll(buildWorkDir, 0750); err != nil {
 		return fmt.Errorf("failed to create build workspace: %w", err)
 	}
 	defer func() {

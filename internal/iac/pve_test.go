@@ -16,9 +16,23 @@ func TestDefaultPVEInstanceSpec(t *testing.T) {
 		t.Fatal("DefaultPVEInstanceSpec returned nil")
 	}
 
+	verifyBasicFields(t, spec)
+	verifyResourceFields(t, spec)
+	verifyStorageFields(t, spec)
+	verifyBooleanFields(t, spec)
+	verifyTagsField(t, spec)
+}
+
+func verifyBasicFields(t *testing.T, spec *PVEInstanceSpec) {
 	if spec.Node != "pve" {
 		t.Errorf("Node = %s, want pve", spec.Node)
 	}
+	if spec.OSType != "l26" {
+		t.Errorf("OSType = %s, want l26", spec.OSType)
+	}
+}
+
+func verifyResourceFields(t *testing.T, spec *PVEInstanceSpec) {
 	if spec.Cores != 4 {
 		t.Errorf("Cores = %d, want 4", spec.Cores)
 	}
@@ -28,6 +42,9 @@ func TestDefaultPVEInstanceSpec(t *testing.T) {
 	if spec.MemoryMB != 8192 {
 		t.Errorf("MemoryMB = %d, want 8192", spec.MemoryMB)
 	}
+}
+
+func verifyStorageFields(t *testing.T, spec *PVEInstanceSpec) {
 	if spec.DiskSizeGB != 50 {
 		t.Errorf("DiskSizeGB = %d, want 50", spec.DiskSizeGB)
 	}
@@ -40,9 +57,9 @@ func TestDefaultPVEInstanceSpec(t *testing.T) {
 	if spec.Network != "vmbr0" {
 		t.Errorf("Network = %s, want vmbr0", spec.Network)
 	}
-	if spec.OSType != "l26" {
-		t.Errorf("OSType = %s, want l26", spec.OSType)
-	}
+}
+
+func verifyBooleanFields(t *testing.T, spec *PVEInstanceSpec) {
 	if !spec.Agent {
 		t.Error("Agent should be true by default")
 	}
@@ -52,6 +69,9 @@ func TestDefaultPVEInstanceSpec(t *testing.T) {
 	if !spec.CloudInit {
 		t.Error("CloudInit should be true by default")
 	}
+}
+
+func verifyTagsField(t *testing.T, spec *PVEInstanceSpec) {
 	if len(spec.Tags) != 1 || spec.Tags[0] != "portage-builder" {
 		t.Errorf("Tags = %v, want [portage-builder]", spec.Tags)
 	}
@@ -60,115 +80,7 @@ func TestDefaultPVEInstanceSpec(t *testing.T) {
 func TestPVEInstanceSpecFromMap(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name     string
-		input    map[string]string
-		validate func(*testing.T, *PVEInstanceSpec)
-	}{
-		{
-			name:  "empty map returns defaults",
-			input: map[string]string{},
-			validate: func(t *testing.T, spec *PVEInstanceSpec) {
-				if spec.Node != "pve" {
-					t.Errorf("Node = %s, want pve", spec.Node)
-				}
-				if spec.Cores != 4 {
-					t.Errorf("Cores = %d, want 4", spec.Cores)
-				}
-			},
-		},
-		{
-			name: "custom node and cores",
-			input: map[string]string{
-				"node":  "pve-node1",
-				"cores": "8",
-			},
-			validate: func(t *testing.T, spec *PVEInstanceSpec) {
-				if spec.Node != "pve-node1" {
-					t.Errorf("Node = %s, want pve-node1", spec.Node)
-				}
-				if spec.Cores != 8 {
-					t.Errorf("Cores = %d, want 8", spec.Cores)
-				}
-			},
-		},
-		{
-			name: "custom memory and disk",
-			input: map[string]string{
-				"memory_mb":    "16384",
-				"disk_size_gb": "100",
-				"disk_type":    "virtio",
-			},
-			validate: func(t *testing.T, spec *PVEInstanceSpec) {
-				if spec.MemoryMB != 16384 {
-					t.Errorf("MemoryMB = %d, want 16384", spec.MemoryMB)
-				}
-				if spec.DiskSizeGB != 100 {
-					t.Errorf("DiskSizeGB = %d, want 100", spec.DiskSizeGB)
-				}
-				if spec.DiskType != "virtio" {
-					t.Errorf("DiskType = %s, want virtio", spec.DiskType)
-				}
-			},
-		},
-		{
-			name: "network configuration",
-			input: map[string]string{
-				"network":    "vmbr1",
-				"vlan":       "100",
-				"ip_config":  "192.168.1.100/24",
-				"gateway":    "192.168.1.1",
-				"nameserver": "8.8.8.8",
-			},
-			validate: func(t *testing.T, spec *PVEInstanceSpec) {
-				if spec.Network != "vmbr1" {
-					t.Errorf("Network = %s, want vmbr1", spec.Network)
-				}
-				if spec.VLAN != 100 {
-					t.Errorf("VLAN = %d, want 100", spec.VLAN)
-				}
-				if spec.IPConfig != "192.168.1.100/24" {
-					t.Errorf("IPConfig = %s, want 192.168.1.100/24", spec.IPConfig)
-				}
-				if spec.Gateway != "192.168.1.1" {
-					t.Errorf("Gateway = %s, want 192.168.1.1", spec.Gateway)
-				}
-				if spec.Nameserver != "8.8.8.8" {
-					t.Errorf("Nameserver = %s, want 8.8.8.8", spec.Nameserver)
-				}
-			},
-		},
-		{
-			name: "vmid and pool",
-			input: map[string]string{
-				"vmid": "200",
-				"pool": "builders",
-			},
-			validate: func(t *testing.T, spec *PVEInstanceSpec) {
-				if spec.VMID != 200 {
-					t.Errorf("VMID = %d, want 200", spec.VMID)
-				}
-				if spec.Pool != "builders" {
-					t.Errorf("Pool = %s, want builders", spec.Pool)
-				}
-			},
-		},
-		{
-			name: "boolean values",
-			input: map[string]string{
-				"cloud_init": "false",
-				"agent":      "0",
-			},
-			validate: func(t *testing.T, spec *PVEInstanceSpec) {
-				if spec.CloudInit {
-					t.Error("CloudInit should be false")
-				}
-				if spec.Agent {
-					t.Error("Agent should be false")
-				}
-			},
-		},
-	}
+	testCases := createPVETestCases()
 
 	for _, tc := range testCases {
 		tc := tc
@@ -180,6 +92,79 @@ func TestPVEInstanceSpecFromMap(t *testing.T) {
 			}
 			tc.validate(t, spec)
 		})
+	}
+}
+
+func createPVETestCases() []struct {
+	name     string
+	input    map[string]string
+	validate func(*testing.T, *PVEInstanceSpec)
+} {
+	return []struct {
+		name     string
+		input    map[string]string
+		validate func(*testing.T, *PVEInstanceSpec)
+	}{
+		{name: "empty map returns defaults", input: map[string]string{}, validate: validatePVEDefaults},
+		{name: "custom node and cores", input: map[string]string{"node": "pve-node1", "cores": "8"}, validate: validatePVENodeCores},
+		{name: "custom memory and disk", input: map[string]string{"memory_mb": "16384", "disk_size_gb": "100", "disk_type": "virtio"}, validate: validatePVEMemoryDisk},
+		{name: "network configuration", input: map[string]string{"network": "vmbr1", "vlan": "100", "ip_config": "192.168.1.100/24", "gateway": "192.168.1.1", "nameserver": "8.8.8.8"}, validate: validatePVENetwork},
+		{name: "vmid and pool", input: map[string]string{"vmid": "200", "pool": "builders"}, validate: validatePVEVMIDPool},
+		{name: "boolean values", input: map[string]string{"cloud_init": "false", "agent": "0"}, validate: validatePVEBooleans},
+	}
+}
+
+func validatePVEDefaults(t *testing.T, spec *PVEInstanceSpec) {
+	if spec.Node != "pve" {
+		t.Errorf("Node = %s, want pve", spec.Node)
+	}
+	if spec.Cores != 4 {
+		t.Errorf("Cores = %d, want 4", spec.Cores)
+	}
+}
+
+func validatePVENodeCores(t *testing.T, spec *PVEInstanceSpec) {
+	if spec.Node != "pve-node1" {
+		t.Errorf("Node = %s, want pve-node1", spec.Node)
+	}
+	if spec.Cores != 8 {
+		t.Errorf("Cores = %d, want 8", spec.Cores)
+	}
+}
+
+func validatePVEMemoryDisk(t *testing.T, spec *PVEInstanceSpec) {
+	if spec.MemoryMB != 16384 {
+		t.Errorf("MemoryMB = %d, want 16384", spec.MemoryMB)
+	}
+	if spec.DiskSizeGB != 100 {
+		t.Errorf("DiskSizeGB = %d, want 100", spec.DiskSizeGB)
+	}
+	if spec.DiskType != "virtio" {
+		t.Errorf("DiskType = %s, want virtio", spec.DiskType)
+	}
+}
+
+func validatePVENetwork(t *testing.T, spec *PVEInstanceSpec) {
+	if spec.Network != "vmbr1" || spec.VLAN != 100 || spec.IPConfig != "192.168.1.100/24" || spec.Gateway != "192.168.1.1" || spec.Nameserver != "8.8.8.8" {
+		t.Error("Network configuration mismatch")
+	}
+}
+
+func validatePVEVMIDPool(t *testing.T, spec *PVEInstanceSpec) {
+	if spec.VMID != 200 {
+		t.Errorf("VMID = %d, want 200", spec.VMID)
+	}
+	if spec.Pool != "builders" {
+		t.Errorf("Pool = %s, want builders", spec.Pool)
+	}
+}
+
+func validatePVEBooleans(t *testing.T, spec *PVEInstanceSpec) {
+	if spec.CloudInit {
+		t.Error("CloudInit should be false")
+	}
+	if spec.Agent {
+		t.Error("Agent should be false")
 	}
 }
 

@@ -19,38 +19,51 @@ import (
 )
 
 func main() {
-	// Parse command line flags
+	cfg := loadConfig()
+	signer := initGPGSigner(cfg)
+	bldr := builder.NewLocalBuilder(cfg.Workers, signer, cfg)
+
+	mux := setupHTTPHandlers(bldr)
+	server := startServer(cfg, mux)
+
+	waitForShutdown(server, bldr)
+}
+
+// loadConfig loads and parses configuration.
+func loadConfig() *config.BuilderConfig {
 	configPath := flag.String("config", "configs/builder.conf", "Path to configuration file")
 	port := flag.Int("port", 9090, "Builder service port")
 	flag.Parse()
 
-	// Load configuration
 	cfg, err := config.LoadBuilderConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Override port if specified
 	if *port != 9090 {
 		cfg.Port = *port
 	}
 
 	log.Printf("Starting Portage Builder Service on port %d", cfg.Port)
+	return cfg
+}
 
-	// Initialize GPG signer if enabled
-	var signer *gpg.Signer
-	if cfg.GPGEnabled {
-		signer = gpg.NewSigner(cfg.GPGKeyID, cfg.GPGKeyPath, true)
-		if err := gpg.CheckGPG(); err != nil {
-			log.Fatalf("GPG check failed: %v", err)
-		}
-		log.Printf("GPG signing enabled with key: %s", cfg.GPGKeyID)
+// initGPGSigner initializes GPG signer if enabled.
+func initGPGSigner(cfg *config.BuilderConfig) *gpg.Signer {
+	if !cfg.GPGEnabled {
+		return nil
 	}
 
-	// Create builder instance
-	bldr := builder.NewLocalBuilder(cfg.Workers, signer, cfg)
+	signer := gpg.NewSigner(cfg.GPGKeyID, cfg.GPGKeyPath, true)
+	if err := gpg.CheckGPG(); err != nil {
+		log.Fatalf("GPG check failed: %v", err)
+	}
+	log.Printf("GPG signing enabled with key: %s", cfg.GPGKeyID)
+	return signer
+}
 
-	// Setup HTTP server
+// setupHTTPHandlers sets up all HTTP handlers.
+func setupHTTPHandlers(bldr *builder.LocalBuilder) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Health check
@@ -176,35 +189,42 @@ func main() {
 		http.ServeContent(w, r, fileName, fileInfo.ModTime(), file)
 	})
 
-	// Start HTTP server
+	return mux
+}
+
+// startServer starts the HTTP server.
+func startServer(cfg *config.BuilderConfig, mux *http.ServeMux) *http.Server {
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
 		Handler:           loggingMiddleware(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	// Graceful shutdown
+	log.Printf("Builder service listening on :%d", cfg.Port)
+	return server
+}
+
+// waitForShutdown waits for shutdown signal and performs cleanup.
+func waitForShutdown(server *http.Server, bldr *builder.LocalBuilder) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
 	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-		<-sigChan
-
-		log.Println("Shutting down builder service...")
-
-		// Shutdown builder to persist jobs
-		bldr.Shutdown()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("Server shutdown error: %v", err)
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
 		}
 	}()
 
-	log.Printf("Builder service listening on :%d", cfg.Port)
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatalf("Server error: %v", err)
+	<-sigChan
+	log.Println("Shutting down builder service...")
+
+	bldr.Shutdown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server shutdown error: %v", err)
 	}
 }
 

@@ -119,32 +119,22 @@ func LoadConfig(path string) (*Config, error) {
 func (n *Notifier) Notify(notification *BuildNotification) error {
 	var errors []string
 
-	if n.config.Email != nil && n.config.Email.Enabled {
-		if err := n.sendEmail(notification); err != nil {
-			errors = append(errors, fmt.Sprintf("email: %v", err))
-		}
+	if err := n.notifyEmail(notification); err != nil {
+		errors = append(errors, fmt.Sprintf("email: %v", err))
 	}
 
-	if n.config.Webhook != nil && n.config.Webhook.Enabled {
-		if err := n.sendWebhook(notification); err != nil {
-			errors = append(errors, fmt.Sprintf("webhook: %v", err))
-		}
+	if err := n.notifyWebhook(notification); err != nil {
+		errors = append(errors, fmt.Sprintf("webhook: %v", err))
 	}
 
-	if n.config.IRC != nil && n.config.IRC.Enabled {
-		n.sendIRC(notification)
+	n.notifyIRC(notification)
+
+	if err := n.notifySlack(notification); err != nil {
+		errors = append(errors, fmt.Sprintf("slack: %v", err))
 	}
 
-	if n.config.Slack != nil && n.config.Slack.Enabled {
-		if err := n.sendSlack(notification); err != nil {
-			errors = append(errors, fmt.Sprintf("slack: %v", err))
-		}
-	}
-
-	if n.config.Telegram != nil && n.config.Telegram.Enabled {
-		if err := n.sendTelegram(notification); err != nil {
-			errors = append(errors, fmt.Sprintf("telegram: %v", err))
-		}
+	if err := n.notifyTelegram(notification); err != nil {
+		errors = append(errors, fmt.Sprintf("telegram: %v", err))
 	}
 
 	if len(errors) > 0 {
@@ -152,6 +142,45 @@ func (n *Notifier) Notify(notification *BuildNotification) error {
 	}
 
 	return nil
+}
+
+// notifyEmail sends email notification if enabled.
+func (n *Notifier) notifyEmail(notification *BuildNotification) error {
+	if n.config.Email == nil || !n.config.Email.Enabled {
+		return nil
+	}
+	return n.sendEmail(notification)
+}
+
+// notifyWebhook sends webhook notification if enabled.
+func (n *Notifier) notifyWebhook(notification *BuildNotification) error {
+	if n.config.Webhook == nil || !n.config.Webhook.Enabled {
+		return nil
+	}
+	return n.sendWebhook(notification)
+}
+
+// notifyIRC sends IRC notification if enabled.
+func (n *Notifier) notifyIRC(notification *BuildNotification) {
+	if n.config.IRC != nil && n.config.IRC.Enabled {
+		n.sendIRC(notification)
+	}
+}
+
+// notifySlack sends Slack notification if enabled.
+func (n *Notifier) notifySlack(notification *BuildNotification) error {
+	if n.config.Slack == nil || !n.config.Slack.Enabled {
+		return nil
+	}
+	return n.sendSlack(notification)
+}
+
+// notifyTelegram sends Telegram notification if enabled.
+func (n *Notifier) notifyTelegram(notification *BuildNotification) error {
+	if n.config.Telegram == nil || !n.config.Telegram.Enabled {
+		return nil
+	}
+	return n.sendTelegram(notification)
 }
 
 // sendEmail sends email notification.

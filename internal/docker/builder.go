@@ -129,7 +129,11 @@ mkdir -p /binpkgs
 echo "Binary package content" > /binpkgs/%s-%s-%s.tbz2
 `, req.Package, req.Version, useFlagsStr, strings.ReplaceAll(req.Package, "/", "-"), req.Version, req.Arch)
 
-	return os.WriteFile(path, []byte(script), 0700) //nolint:gosec // Script needs exec
+	if err := os.WriteFile(path, []byte(script), 0600); err != nil {
+		return err
+	}
+	// Make script executable
+	return os.Chmod(path, 0700) //nolint:gosec // Script needs exec
 }
 
 // findArtifact finds the built package artifact.

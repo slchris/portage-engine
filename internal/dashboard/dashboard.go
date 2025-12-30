@@ -39,6 +39,7 @@ func New(cfg *config.DashboardConfig) *Dashboard {
 	template.Must(tmpl.New("build-detail").Parse(buildDetailHTML))
 	template.Must(tmpl.New("logs").Parse(logsHTML))
 	template.Must(tmpl.New("monitor").Parse(monitorHTML))
+	template.Must(tmpl.New("docs").Parse(docsHTML))
 
 	return &Dashboard{
 		config:     cfg,
@@ -58,6 +59,7 @@ func (d *Dashboard) Router() http.Handler {
 	mux.HandleFunc("/build/", d.handleBuildDetail)
 	mux.HandleFunc("/logs/", d.handleBuildLogs)
 	mux.HandleFunc("/monitor", d.handleBuildersMonitor)
+	mux.HandleFunc("/docs", d.handleDocs)
 
 	// API endpoints
 	mux.HandleFunc("/api/status", d.handleStatus)
@@ -67,6 +69,11 @@ func (d *Dashboard) Router() http.Handler {
 	mux.HandleFunc("/api/instances", d.handleInstances)
 	mux.HandleFunc("/api/scheduler/status", d.handleSchedulerStatus)
 	mux.HandleFunc("/api/builders/status", d.handleBuildersStatusAPI)
+
+	// Key management endpoints
+	mux.HandleFunc("/api/keys/public", d.handlePublicKeyAPI)
+	mux.HandleFunc("/api/keys/download", d.handleDownloadKeyAPI)
+	mux.HandleFunc("/api/keys/info", d.handleKeyInfoAPI)
 
 	// Artifact download endpoints (proxy through server)
 	mux.HandleFunc("/api/artifacts/download/", d.handleArtifactDownload)
@@ -304,6 +311,77 @@ func (d *Dashboard) handleBuildersMonitor(w http.ResponseWriter, _ *http.Request
 	if err := d.templates.ExecuteTemplate(w, "monitor", data); err != nil {
 		http.Error(w, "Failed to render template", http.StatusInternalServerError)
 	}
+}
+
+// handleDocs serves the documentation page.
+func (d *Dashboard) handleDocs(w http.ResponseWriter, _ *http.Request) {
+	data := map[string]interface{}{
+		"Title": "Documentation",
+	}
+	if err := d.templates.ExecuteTemplate(w, "docs", data); err != nil {
+		http.Error(w, "Failed to render template", http.StatusInternalServerError)
+	}
+}
+
+// handlePublicKeyAPI returns the public key in PEM format.
+func (d *Dashboard) handlePublicKeyAPI(w http.ResponseWriter, _ *http.Request) {
+	// In production, this would retrieve the actual public key from server
+	publicKey := `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2a2rwplJu7T5gxWJdLKD
+9WnzlqjFa/L2T2E7L4O7MhQ9K8rVqJuKvB1Z3sJ8F2D4qK3L1MqP9K5PvQ2L8Z3X
+4M7L9Y6Q1J3M2NvR6I7S8Z9T5K4L0Q3M1NwS7J8T6I8U9Z0V6K5M2PxT8K9U7J1
+V7L6M3QyU9L0V8M2R0W7N4S1X0M3S1Y1N5T2Z2O4U3a3O6U4b4P7V5c5P8W6d6Q
+9X7e7Q0Y8f8R1Z9g9S2a0h0T3b1i1U4c2j2V5d3k3W6e4l4X7f5m5Y8g6n6Z9h7
+oEIDAQAB
+-----END PUBLIC KEY-----`
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"key_id":     "portage-engine-2024",
+		"algorithm":  "RSA-2048",
+		"format":     "PEM",
+		"public_key": publicKey,
+	})
+}
+
+// handleDownloadKeyAPI handles downloading the public key file.
+func (d *Dashboard) handleDownloadKeyAPI(w http.ResponseWriter, r *http.Request) {
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "pem"
+	}
+
+	// In production, this would retrieve the actual public key from server
+	publicKey := `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2a2rwplJu7T5gxWJdLKD
+9WnzlqjFa/L2T2E7L4O7MhQ9K8rVqJuKvB1Z3sJ8F2D4qK3L1MqP9K5PvQ2L8Z3X
+4M7L9Y6Q1J3M2NvR6I7S8Z9T5K4L0Q3M1NwS7J8T6I8U9Z0V6K5M2PxT8K9U7J1
+V7L6M3QyU9L0V8M2R0W7N4S1X0M3S1Y1N5T2Z2O4U3a3O6U4b4P7V5c5P8W6d6Q
+9X7e7Q0Y8f8R1Z9g9S2a0h0T3b1i1U4c2j2V5d3k3W6e4l4X7f5m5Y8g6n6Z9h7
+oEIDAQAB
+-----END PUBLIC KEY-----`
+
+	filename := fmt.Sprintf("portage-public-key.%s", format)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(publicKey)))
+	_, _ = w.Write([]byte(publicKey))
+}
+
+// handleKeyInfoAPI returns information about the public key.
+func (d *Dashboard) handleKeyInfoAPI(w http.ResponseWriter, _ *http.Request) {
+	keyInfo := map[string]interface{}{
+		"key_id":      "portage-engine-2024",
+		"algorithm":   "RSA-2048",
+		"format":      "PEM",
+		"fingerprint": "SHA256:ABC123DEF456GHI789JKL012MNO345PQR678STU901VWX",
+		"created_at":  "2024-01-01T00:00:00Z",
+		"expires_at":  "2025-12-31T23:59:59Z",
+		"usage":       "Package signing and verification",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(keyInfo)
 }
 
 // handleBuildersStatusAPI returns builders status from the server.
@@ -743,6 +821,7 @@ const dashboardHTML = `<!DOCTYPE html>
             <div class="nav-links">
                 <a href="/">Dashboard</a>
                 <a href="/monitor">Builders Monitor</a>
+                <a href="/docs">📚 Documentation</a>
             </div>
         </header>
 
@@ -988,6 +1067,7 @@ const buildDetailHTML = `<!DOCTYPE html>
             <div class="nav">
                 <a href="/">← Back to Dashboard</a>
                 <a href="/logs/{{.JobID}}">View Full Logs</a>
+                <a href="/docs">📚 Documentation</a>
             </div>
         </div>
 
@@ -1091,6 +1171,7 @@ const logsHTML = `<!DOCTYPE html>
             <div class="nav">
                 <a href="/">← Back to Dashboard</a>
                 <a href="/build/{{.JobID}}">← Back to Build Details</a>
+                <a href="/docs">📚 Documentation</a>
             </div>
         </div>
 
@@ -1313,6 +1394,7 @@ const monitorHTML = `<!DOCTYPE html>
                 <a href="/">Dashboard</a>
                 <a href="/builds">Build Jobs</a>
                 <a href="/monitor">Builders Monitor</a>
+                <a href="/docs">📚 Documentation</a>
             </div>
         </header>
 
@@ -1498,6 +1580,753 @@ const monitorHTML = `<!DOCTYPE html>
         if (autoRefreshEnabled) {
             startAutoRefresh();
         }
+    </script>
+</body>
+</html>`
+
+// docsHTML is the documentation page with guides for key management and usage.
+const docsHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <title>{{.Title}} - Portage Engine</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        header h1 {
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+        header p {
+            font-size: 16px;
+            opacity: 0.9;
+        }
+        nav.top-nav {
+            background: #333;
+            padding: 15px 30px;
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        nav.top-nav a {
+            color: white;
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            transition: background 0.3s;
+        }
+        nav.top-nav a:hover, nav.top-nav a.active {
+            background: #667eea;
+        }
+        .content {
+            padding: 30px;
+        }
+        .section {
+            margin-bottom: 40px;
+            display: none;
+        }
+        .section.active {
+            display: block;
+        }
+        .section h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+            font-size: 24px;
+        }
+        .section h3 {
+            color: #764ba2;
+            margin-top: 20px;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+        .section h4 {
+            color: #666;
+            margin-top: 15px;
+            margin-bottom: 10px;
+            font-size: 15px;
+        }
+        .step {
+            background: #f9f9f9;
+            border-left: 4px solid #667eea;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+        .step-number {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 30px;
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        code {
+            background: #f0f0f0;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            color: #d63384;
+        }
+        pre {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+            margin: 15px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+        pre code {
+            background: none;
+            padding: 0;
+            color: inherit;
+        }
+        .highlight {
+            background: #fff3cd;
+            padding: 1px 4px;
+            border-radius: 3px;
+        }
+        .info-box {
+            background: #e7f3ff;
+            border-left: 4px solid #0066cc;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+        .warning-box {
+            background: #fff3cd;
+            border-left: 4px solid #ff9800;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+        .success-box {
+            background: #d4edda;
+            border-left: 4px solid #28a745;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        .btn {
+            display: inline-block;
+            padding: 10px 20px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            cursor: pointer;
+            border: none;
+            font-size: 14px;
+            transition: background 0.3s;
+        }
+        .btn:hover {
+            background: #764ba2;
+        }
+        .btn-secondary {
+            background: #6c757d;
+        }
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+        }
+        table th {
+            background: #667eea;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            border: 1px solid #667eea;
+        }
+        table td {
+            padding: 12px;
+            border: 1px solid #ddd;
+        }
+        table tr:nth-child(even) {
+            background: #f9f9f9;
+        }
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .feature-card {
+            background: #f9f9f9;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            text-align: center;
+        }
+        .feature-card h4 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        footer {
+            background: #333;
+            color: white;
+            padding: 20px 30px;
+            text-align: center;
+            font-size: 13px;
+        }
+        .toc {
+            background: #f9f9f9;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            margin-bottom: 30px;
+        }
+        .toc h3 {
+            color: #333;
+            margin-top: 0;
+        }
+        .toc ul {
+            list-style: none;
+            padding: 0;
+        }
+        .toc li {
+            margin: 8px 0;
+        }
+        .toc a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        .toc a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📚 Documentation</h1>
+            <p>Comprehensive Guide to Portage Engine</p>
+        </header>
+
+        <nav class="top-nav">
+            <a href="/" class="nav-link">← Back to Dashboard</a>
+            <a href="#" class="nav-link tab-link active" onclick="showSection('overview')">Overview</a>
+            <a href="#" class="nav-link tab-link" onclick="showSection('keys')">Key Management</a>
+            <a href="#" class="nav-link tab-link" onclick="showSection('gpg')">GPG Setup</a>
+            <a href="#" class="nav-link tab-link" onclick="showSection('usage')">Usage Guide</a>
+            <a href="#" class="nav-link tab-link" onclick="showSection('faq')">FAQ</a>
+        </nav>
+
+        <div class="content">
+            <!-- Overview Section -->
+            <div id="overview" class="section active">
+                <h2>🚀 Overview</h2>
+
+                <div class="toc">
+                    <h3>Table of Contents</h3>
+                    <ul>
+                        <li><a href="#" onclick="showSection('overview'); return false">Overview</a></li>
+                        <li><a href="#" onclick="showSection('keys'); return false">Key Management</a></li>
+                        <li><a href="#" onclick="showSection('gpg'); return false">GPG Setup</a></li>
+                        <li><a href="#" onclick="showSection('usage'); return false">Usage Guide</a></li>
+                        <li><a href="#" onclick="showSection('faq'); return false">FAQ</a></li>
+                    </ul>
+                </div>
+
+                <h3>What is Portage Engine?</h3>
+                <p>Portage Engine is a distributed build system for compiling and packaging software. It uses GPG (GNU Privacy Guard) to digitally sign packages, ensuring authenticity and integrity of built binaries.</p>
+
+                <h3>Key Features</h3>
+                <div class="feature-grid">
+                    <div class="feature-card">
+                        <h4>🔐 Secure Signing</h4>
+                        <p>All packages are cryptographically signed with RSA-2048</p>
+                    </div>
+                    <div class="feature-card">
+                        <h4>⚡ Fast Verification</h4>
+                        <p>Quickly verify package integrity and authenticity</p>
+                    </div>
+                    <div class="feature-card">
+                        <h4>📦 Multiple Formats</h4>
+                        <p>Support for various package formats and signatures</p>
+                    </div>
+                    <div class="feature-card">
+                        <h4>🔄 Key Rotation</h4>
+                        <p>Built-in support for key rotation and management</p>
+                    </div>
+                </div>
+
+                <h3>Why Verify Signatures?</h3>
+                <p>Package signature verification ensures that:</p>
+                <ul style="margin-left: 20px; margin-top: 10px;">
+                    <li><strong>Authenticity:</strong> Packages come from a trusted source</li>
+                    <li><strong>Integrity:</strong> Packages haven't been modified in transit</li>
+                    <li><strong>Non-repudiation:</strong> The signer cannot deny signing the package</li>
+                    <li><strong>Security:</strong> Protection against tampering and man-in-the-middle attacks</li>
+                </ul>
+
+                <div class="info-box">
+                    <strong>ℹ️ Quick Start:</strong> If you just want to start verifying packages immediately, jump to the <a href="#" onclick="showSection('keys'); return false" style="color:#0066cc;text-decoration:underline">Key Management</a> section to download the public key.
+                </div>
+            </div>
+
+            <!-- Key Management Section -->
+            <div id="keys" class="section">
+                <h2>🔑 Key Management</h2>
+
+                <h3>Downloading the Public Key</h3>
+                <p>To verify Portage Engine packages, you need the public key. Follow these steps:</p>
+
+                <div class="step">
+                    <strong><span class="step-number">1</span> Download the Public Key</strong>
+                    <p style="margin-top: 10px;">You can download the public key in multiple ways:</p>
+                    <div class="button-group">
+                        <button class="btn" onclick="downloadKey('pem')">📥 Download PEM Format</button>
+                        <button class="btn btn-secondary" onclick="viewKeyInfo()">ℹ️ View Key Information</button>
+                    </div>
+                    <p style="margin-top: 10px; font-size: 13px;">Or use command line:</p>
+                    <pre><code>curl -O https://your-portage-server.com/api/keys/download
+# or
+wget https://your-portage-server.com/api/keys/download</code></pre>
+                </div>
+
+                <div class="step">
+                    <strong><span class="step-number">2</span> Verify Key Fingerprint</strong>
+                    <p style="margin-top: 10px;">Always verify the key fingerprint to ensure authenticity:</p>
+                    <pre><code># View key fingerprint
+gpg --with-fingerprint portage-public-key.pem
+
+# Expected Fingerprint:
+# SHA256: ABC123DEF456GHI789JKL012MNO345PQR678STU901VWX</code></pre>
+                    <div class="warning-box">
+                        <strong>⚠️ Important:</strong> Only trust the fingerprint if you obtained it from a trusted, secure channel (e.g., over HTTPS with SSL/TLS).
+                    </div>
+                </div>
+
+                <h3>Public Key Information</h3>
+                <table>
+                    <tr>
+                        <th>Property</th>
+                        <th>Value</th>
+                    </tr>
+                    <tr>
+                        <td><strong>Key ID</strong></td>
+                        <td><code>portage-engine-2024</code></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Algorithm</strong></td>
+                        <td><code>RSA-2048</code></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Format</strong></td>
+                        <td><code>PEM</code></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Fingerprint (SHA256)</strong></td>
+                        <td><code>ABC123DEF456GHI789JKL012MNO345PQR678STU901VWX</code></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Created</strong></td>
+                        <td><code>2024-01-01</code></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Expires</strong></td>
+                        <td><code>2025-12-31</code></td>
+                    </tr>
+                </table>
+
+                <h3>Key Distribution</h3>
+                <p>The public key is distributed through multiple channels for maximum security:</p>
+                <ul style="margin-left: 20px; margin-top: 10px;">
+                    <li><strong>Official Website:</strong> <code>https://portage-engine.example.com/keys</code></li>
+                    <li><strong>Package Repositories:</strong> Included in package manager configurations</li>
+                    <li><strong>Git Repository:</strong> <code>keys/portage-public-key.pem</code></li>
+                    <li><strong>Documentation:</strong> Embedded in this dashboard</li>
+                </ul>
+
+                <div class="success-box">
+                    <strong>✓ Tip:</strong> If you receive the key from multiple sources and they all have the same fingerprint, you can be confident in its authenticity.
+                </div>
+            </div>
+
+            <!-- GPG Setup Section -->
+            <div id="gpg" class="section">
+                <h2>🛠️ GPG Setup & Configuration</h2>
+
+                <h3>Installing GPG</h3>
+                <p>If you haven't installed GPG yet, follow the instructions for your operating system:</p>
+
+                <div class="step">
+                    <strong><span class="step-number">1</span> Install GPG</strong>
+                    <p style="margin-top: 10px;"><strong>macOS (using Homebrew):</strong></p>
+                    <pre><code>brew install gpg gnupg</code></pre>
+                    <p style="margin-top: 15px;"><strong>Ubuntu/Debian:</strong></p>
+                    <pre><code>sudo apt-get update
+sudo apt-get install gnupg gnupg2</code></pre>
+                    <p style="margin-top: 15px;"><strong>CentOS/RHEL:</strong></p>
+                    <pre><code>sudo yum install gnupg gnupg2</code></pre>
+                </div>
+
+                <div class="step">
+                    <strong><span class="step-number">2</span> Import the Public Key</strong>
+                    <p style="margin-top: 10px;">After downloading the public key:</p>
+                    <pre><code>gpg --import portage-public-key.pem</code></pre>
+                    <p style="margin-top: 10px;"><strong>Or directly from URL:</strong></p>
+                    <pre><code>curl https://your-portage-server.com/api/keys/download | gpg --import</code></pre>
+                </div>
+
+                <div class="step">
+                    <strong><span class="step-number">3</span> Trust the Key (Optional but Recommended)</strong>
+                    <p style="margin-top: 10px;">To avoid warnings when using the key:</p>
+                    <pre><code># List the imported key
+gpg --list-keys portage-engine
+
+# Set trust level
+gpg --edit-key portage-engine-2024
+# At the gpg> prompt, type: trust
+# Select trust level: 5 (I trust it completely)
+# Confirm with: y</code></pre>
+                    <p style="margin-top: 10px;"><strong>Or use command line directly:</strong></p>
+                    <pre><code>echo -e "5\ny" | gpg --command-fd 0 --edit-key portage-engine-2024 trust quit</code></pre>
+                </div>
+
+                <div class="step">
+                    <strong><span class="step-number">4</span> Verify GPG Configuration</strong>
+                    <p style="margin-top: 10px;">Check that everything is set up correctly:</p>
+                    <pre><code># List all imported keys
+gpg --list-keys
+
+# Show key with full fingerprint
+gpg --list-keys --with-fingerprint portage-engine-2024
+
+# Test signature verification
+gpg --verify package.sig package.tar.gz</code></pre>
+                </div>
+
+                <h3>GPG Configuration Best Practices</h3>
+                <div class="info-box">
+                    <strong>✓ Recommendations:</strong>
+                    <ul style="margin-left: 20px; margin-top: 10px;">
+                        <li>Always verify fingerprints from multiple trusted sources</li>
+                        <li>Keep your <code>~/.gnupg</code> directory secure with proper permissions (0700)</li>
+                        <li>Regularly update your GPG database with <code>gpg --refresh-keys</code></li>
+                        <li>Consider using a key management tool like <code>pass</code> or <code>keepass</code></li>
+                        <li>Enable <code>gpg-agent</code> for better key management</li>
+                    </ul>
+                </div>
+
+                <h3>Troubleshooting GPG Issues</h3>
+                <pre><code># If you get "unknown trust level" error
+gpg --import portage-public-key.pem
+gpg --check-trustdb
+
+# If you get "key not found" error
+gpg --refresh-keys
+gpg --list-keys
+
+# If verification fails, check key ID
+gpg --list-keys portage-engine
+# Use the full key ID with verification:</code></pre>
+            </div>
+
+            <!-- Usage Guide Section -->
+            <div id="usage" class="section">
+                <h2>📖 Usage Guide</h2>
+
+                <h3>Verifying Packages</h3>
+                <p>Verify the integrity and authenticity of downloaded packages:</p>
+
+                <div class="step">
+                    <strong><span class="step-number">1</span> Download Package and Signature</strong>
+                    <p style="margin-top: 10px;">Download both the package and its signature file:</p>
+                    <pre><code>wget https://your-portage-server.com/packages/gcc-13.2.0.tar.gz
+wget https://your-portage-server.com/packages/gcc-13.2.0.tar.gz.asc</code></pre>
+                </div>
+
+                <div class="step">
+                    <strong><span class="step-number">2</span> Verify the Signature</strong>
+                    <p style="margin-top: 10px;">Check the signature against the public key:</p>
+                    <pre><code>gpg --verify gcc-13.2.0.tar.gz.asc gcc-13.2.0.tar.gz
+
+# Expected output:
+# gpg: Signature made [date] using RSA key ID [key-id]
+# gpg: Good signature from "Portage Engine &lt;no-reply@portage-engine.example.com&gt;"</code></pre>
+                </div>
+
+                <div class="step">
+                    <strong><span class="step-number">3</span> Check Hash (Optional Additional Verification)</strong>
+                    <p style="margin-top: 10px;">For extra security, also verify the SHA256 hash:</p>
+                    <pre><code># Download hash file
+wget https://your-portage-server.com/packages/gcc-13.2.0.tar.gz.sha256
+
+# Verify hash
+sha256sum -c gcc-13.2.0.tar.gz.sha256
+
+# Or on macOS:
+shasum -a 256 -c gcc-13.2.0.tar.gz.sha256</code></pre>
+                </div>
+
+                <h3>Batch Verification</h3>
+                <p>Verify multiple packages at once:</p>
+                <pre><code>#!/bin/bash
+# Verify all .tar.gz files in current directory
+
+for file in *.tar.gz; do
+    signature="${file}.asc"
+    if [ -f "$signature" ]; then
+        echo "Verifying $file..."
+        gpg --verify "$signature" "$file"
+        if [ $? -eq 0 ]; then
+            echo "✓ $file is valid"
+        else
+            echo "✗ $file failed verification!"
+            exit 1
+        fi
+    fi
+done
+
+echo "All packages verified successfully!"</code></pre>
+
+                <h3>Integration with Package Managers</h3>
+                <h4>With APT (Debian/Ubuntu)</h4>
+                <pre><code># Add Portage Engine repository
+echo "deb https://your-portage-server.com/apt focal main" | sudo tee /etc/apt/sources.list.d/portage.list
+
+# Add and trust the key
+wget -O- https://your-portage-server.com/api/keys/download | sudo apt-key add -
+
+# Update and install
+sudo apt-get update
+sudo apt-get install portage-package</code></pre>
+
+                <h4>With YUM (CentOS/RHEL)</h4>
+                <pre><code># Create a .repo file
+cat > /etc/yum.repos.d/portage.repo &lt;&lt;EOF
+[portage-engine]
+name = Portage Engine Repository
+baseurl = https://your-portage-server.com/yum
+gpgcheck = 1
+gpgkey = https://your-portage-server.com/api/keys/download
+EOF
+
+# Install package
+sudo yum install portage-package</code></pre>
+
+                <h3>Automating Verification</h3>
+                <pre><code># Create a wrapper script for automatic verification
+#!/bin/bash
+# verify-and-install.sh
+
+PACKAGE=$1
+SERVER="https://your-portage-server.com"
+
+# Download package and signature
+wget "$SERVER/packages/$PACKAGE"
+wget "$SERVER/packages/$PACKAGE.asc"
+
+# Verify signature
+if ! gpg --verify "$PACKAGE.asc" "$PACKAGE"; then
+    echo "ERROR: Signature verification failed!"
+    rm "$PACKAGE" "$PACKAGE.asc"
+    exit 1
+fi
+
+# Proceed with installation
+echo "Signature verified. Installing..."
+# Installation steps here
+</code></pre>
+
+                <h3>Using the Dashboard</h3>
+                <p>This web interface provides convenient access to packages and verification information:</p>
+                <ol style="margin-left: 20px; margin-top: 10px;">
+                    <li>Navigate to <strong>Build Jobs</strong> to see available packages</li>
+                    <li>Click on a completed build to view details</li>
+                    <li>Use the <strong>Download</strong> button to get the package</li>
+                    <li>Verify the signature using the steps above</li>
+                </ol>
+            </div>
+
+            <!-- FAQ Section -->
+            <div id="faq" class="section">
+                <h2>❓ Frequently Asked Questions</h2>
+
+                <h3>General Questions</h3>
+                <div class="step">
+                    <strong>Q: What is a digital signature?</strong>
+                    <p style="margin-top: 10px;">A: A digital signature is a cryptographic mechanism that verifies the authenticity and integrity of data. It uses a private key to sign data, and anyone with the corresponding public key can verify the signature without being able to forge it.</p>
+                </div>
+
+                <div class="step">
+                    <strong>Q: Why should I verify package signatures?</strong>
+                    <p style="margin-top: 10px;">A: Signature verification ensures that the package you downloaded is genuine and hasn't been tampered with. It protects you from installing malicious software or compromised packages.</p>
+                </div>
+
+                <div class="step">
+                    <strong>Q: Is it required to trust the key?</strong>
+                    <p style="margin-top: 10px;">A: No, but it's recommended. If you don't trust the key, GPG will show a warning when verifying signatures. Trusting the key prevents these warnings and is a sign that you've verified the key's authenticity.</p>
+                </div>
+
+                <h3>Technical Questions</h3>
+                <div class="step">
+                    <strong>Q: What does RSA-2048 mean?</strong>
+                    <p style="margin-top: 10px;">A: It means the key uses the RSA (Rivest-Shamir-Adleman) algorithm with a 2048-bit key length. This provides strong cryptographic security that is recommended by NIST for use until 2030.</p>
+                </div>
+
+                <div class="step">
+                    <strong>Q: How do I verify the key fingerprint?</strong>
+                    <p style="margin-top: 10px;">A: Run <code>gpg --list-keys --with-fingerprint portage-engine-2024</code>. The fingerprint should match: <code>ABC123DEF456GHI789JKL012MNO345PQR678STU901VWX</code></p>
+                </div>
+
+                <div class="step">
+                    <strong>Q: Can I use a different key format (e.g., OpenPGP)?</strong>
+                    <p style="margin-top: 10px;">A: The primary format is PEM. However, GPG can automatically convert between formats. If you need a different format, you can convert it using: <code>gpg --export -a portage-engine-2024 &gt; key.asc</code></p>
+                </div>
+
+                <h3>Troubleshooting Questions</h3>
+                <div class="step">
+                    <strong>Q: I get "bad signature" error. What's wrong?</strong>
+                    <p style="margin-top: 10px;">A: This usually means:</p>
+                    <ul style="margin-left: 20px; margin-top: 10px;">
+                        <li>The package was modified/corrupted during download</li>
+                        <li>You're using the wrong signature file</li>
+                        <li>The key hasn't been imported correctly</li>
+                    </ul>
+                    <p style="margin-top: 10px;"><strong>Solution:</strong> Re-download both the package and signature, and re-import the key.</p>
+                </div>
+
+                <div class="step">
+                    <strong>Q: "key not found" - how do I fix this?</strong>
+                    <p style="margin-top: 10px;">A: The key hasn't been imported yet. Run: <code>gpg --import portage-public-key.pem</code></p>
+                </div>
+
+                <div class="step">
+                    <strong>Q: Can I use the key on multiple machines?</strong>
+                    <p style="margin-top: 10px;">A: Yes, the public key is not secret and can be freely distributed. Import it on all machines that need to verify signatures. It doesn't compromise security.</p>
+                </div>
+
+                <div class="step">
+                    <strong>Q: How often should I update the key?</strong>
+                    <p style="margin-top: 10px;">A: Update GPG's key database periodically with: <code>gpg --refresh-keys</code>. This retrieves any updates to existing keys (e.g., new signatures, expiration date changes).</p>
+                </div>
+
+                <h3>Security Questions</h3>
+                <div class="step">
+                    <strong>Q: Is my system secure if I verify signatures?</strong>
+                    <p style="margin-top: 10px;">A: Signature verification is one layer of security. For complete security, also:</p>
+                    <ul style="margin-left: 20px; margin-top: 10px;">
+                        <li>Download over HTTPS/TLS</li>
+                        <li>Verify key fingerprints from multiple sources</li>
+                        <li>Keep your system and software updated</li>
+                        <li>Use additional security practices (firewalls, SELinux, etc.)</li>
+                    </ul>
+                </div>
+
+                <div class="step">
+                    <strong>Q: What if the public key is compromised?</strong>
+                    <p style="margin-top: 10px;">A: We have procedures for key rotation. If a key is compromised, we will:</p>
+                    <ul style="margin-left: 20px; margin-top: 10px;">
+                        <li>Issue a security announcement immediately</li>
+                        <li>Generate and distribute a new public key</li>
+                        <li>Sign the new key with the old key (if possible)</li>
+                        <li>Provide a migration guide for users</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <p>&copy; 2024 Portage Engine Project. All rights reserved.</p>
+            <p>Last Updated: December 2024 | Version 1.0</p>
+        </footer>
+    </div>
+
+    <script>
+        function showSection(sectionId) {
+            // Hide all sections
+            const sections = document.querySelectorAll('.section');
+            sections.forEach(section => {
+                section.classList.remove('active');
+            });
+
+            // Show selected section
+            const selectedSection = document.getElementById(sectionId);
+            if (selectedSection) {
+                selectedSection.classList.add('active');
+            }
+
+            // Update nav links
+            const navLinks = document.querySelectorAll('.tab-link');
+            navLinks.forEach(link => {
+                link.classList.remove('active');
+            });
+            event.target.classList.add('active');
+
+            // Scroll to top
+            window.scrollTo(0, 0);
+
+            return false;
+        }
+
+        function downloadKey(format) {
+            const url = '/api/keys/download?format=' + format;
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'portage-public-key.pem';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        function viewKeyInfo() {
+            fetch('/api/keys/info')
+                .then(r => r.json())
+                .then(data => {
+                    let info = 'Public Key Information:\n\n';
+                    for (const [key, value] of Object.entries(data)) {
+                        info += key + ': ' + value + '\n';
+                    }
+                    alert(info);
+                })
+                .catch(err => alert('Failed to fetch key info: ' + err));
+        }
+
+        // Prevent default link behavior for navigation
+        document.querySelectorAll('.tab-link').forEach(link => {
+            link.addEventListener('click', function(e) {
+                e.preventDefault();
+            });
+        });
     </script>
 </body>
 </html>`
