@@ -9,7 +9,8 @@ RUN emerge-webrsync && \
     dev-lang/go \
     dev-vcs/git \
     dev-libs/libgpg-error \
-    app-crypt/gnupg
+    app-crypt/gnupg && \
+    emerge --info
 
 # Copy source code
 COPY . .
@@ -21,10 +22,13 @@ RUN go mod download
 RUN mkdir -p /var/lib/portage-engine /tmp/portage-work /tmp/portage-artifacts && \
     chmod 777 /var/lib/portage-engine /tmp/portage-work /tmp/portage-artifacts
 
+# Verify emerge is available
+RUN which emerge && emerge --version
+
 # Set environment
 ENV PATH="/app/bin:${PATH}"
 ENV GOPATH=/go
 ENV CGO_ENABLED=1
 
-# Run tests
+# Default test command (can be overridden)
 CMD ["go", "test", "-v", "-race", "-coverprofile=coverage.out", "./..."]

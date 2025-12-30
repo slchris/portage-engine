@@ -42,18 +42,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.3'
+      - name: Build test Docker image
+        run: docker build -f Dockerfile.test -t portage-test:latest .
 
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out ./...
+      - name: Run tests in container
+        run: docker run --rm -v ${{ github.workspace }}:/app -w /app portage-test:latest go test -v -race -coverprofile=coverage.out ./...
 
       - name: Upload coverage
+        if: always()
         uses: codecov/codecov-action@v4
         with:
           file: ./coverage.out
