@@ -3,6 +3,9 @@ FROM gentoo/stage3:latest
 
 WORKDIR /app
 
+# Disable sandboxing features that don't work well in containers
+RUN echo 'FEATURES="-pid-sandbox -network-sandbox -ipc-sandbox -mount-sandbox"' >> /etc/portage/make.conf
+
 # Sync portage tree and install build dependencies
 RUN emerge-webrsync && \
     emerge -q \
