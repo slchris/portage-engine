@@ -1,0 +1,30 @@
+# Test stage - Gentoo base with portage tree synced
+FROM gentoo/stage3:latest
+
+WORKDIR /app
+
+# Sync portage tree and install build dependencies
+RUN emerge-webrsync && \
+    emerge -q \
+    dev-lang/go \
+    dev-vcs/git \
+    dev-libs/libgpg-error \
+    app-crypt/gnupg
+
+# Copy source code
+COPY . .
+
+# Download Go dependencies
+RUN go mod download
+
+# Create directories that might be needed
+RUN mkdir -p /var/lib/portage-engine /tmp/portage-work /tmp/portage-artifacts && \
+    chmod 777 /var/lib/portage-engine /tmp/portage-work /tmp/portage-artifacts
+
+# Set environment
+ENV PATH="/app/bin:${PATH}"
+ENV GOPATH=/go
+ENV CGO_ENABLED=1
+
+# Run tests
+CMD ["go", "test", "-v", "-race", "-coverprofile=coverage.out", "./..."]
