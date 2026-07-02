@@ -17,6 +17,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/ulikunitz/xz"
 )
 
 // binhost.go generates a Portage-consumable "Packages" index for a PKGDIR so a
@@ -261,10 +264,11 @@ func extractGpkgMetadata(path string) map[string]string {
 			continue
 		}
 		if meta == nil && strings.HasPrefix(name, "metadata.tar") {
-			r, derr := decompressReader(outer, name)
+			r, cleanup, derr := decompressReader(outer, name)
 			if derr == nil {
 				meta = readMetadataTar(r)
 			}
+			cleanup()
 		}
 	}
 
@@ -280,19 +284,43 @@ func extractGpkgMetadata(path string) map[string]string {
 	return meta
 }
 
+// noopCleanup is the cleanup for codecs that hold no releasable resources.
+func noopCleanup() {}
+
 // decompressReader wraps r with a decompressor selected by the member name's
-// extension. Only stdlib-supported codecs (gzip, bzip2) and the uncompressed
-// case are handled; xz/zstd/lz4 return an error so the caller falls back.
-func decompressReader(r io.Reader, name string) (io.Reader, error) {
+// extension. It returns the reader, a cleanup func the caller must invoke when
+// done (releases codec resources, e.g. zstd's decoder), and an error for
+// unsupported codecs.
+//
+// Supported: uncompressed (.tar), gzip (.gz), bzip2 (.bz2), zstd (.zst/.zstd),
+// and xz (.xz) — covering Portage's BINPKG_COMPRESS values (zstd is the modern
+// default). lzma/lz4 remain unsupported (rare).
+func decompressReader(r io.Reader, name string) (io.Reader, func(), error) {
 	switch {
 	case strings.HasSuffix(name, ".tar"):
-		return r, nil
+		return r, noopCleanup, nil
 	case strings.HasSuffix(name, ".gz"):
-		return gzip.NewReader(r)
+		gr, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, noopCleanup, err
+		}
+		return gr, func() { _ = gr.Close() }, nil
 	case strings.HasSuffix(name, ".bz2"):
-		return bzip2.NewReader(r), nil
+		return bzip2.NewReader(r), noopCleanup, nil
+	case strings.HasSuffix(name, ".zst"), strings.HasSuffix(name, ".zstd"):
+		zr, err := zstd.NewReader(r)
+		if err != nil {
+			return nil, noopCleanup, err
+		}
+		return zr, zr.Close, nil
+	case strings.HasSuffix(name, ".xz"):
+		xr, err := xz.NewReader(r)
+		if err != nil {
+			return nil, noopCleanup, err
+		}
+		return xr, noopCleanup, nil
 	default:
-		return nil, fmt.Errorf("unsupported metadata compression: %s", name)
+		return nil, noopCleanup, fmt.Errorf("unsupported metadata compression: %s", name)
 	}
 }
 
