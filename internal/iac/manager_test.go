@@ -2,6 +2,7 @@ package iac
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -735,8 +736,10 @@ func TestProvision_UnimplementedProvider(t *testing.T) {
 
 	manager := NewManager()
 
-	for _, provider := range []string{"aws", "aliyun", "azure", ""} {
-		provider := provider
+	// aws is now supported (its Provision path runs terraform, so it is NOT
+	// exercised here — that needs a live account). Only genuinely-unimplemented
+	// providers must fail fast with a clear error.
+	for _, provider := range []string{"aliyun", "azure", ""} {
 		t.Run("provider_"+provider, func(t *testing.T) {
 			t.Parallel()
 			_, err := manager.Provision(&ProvisionRequest{Provider: provider})
@@ -786,4 +789,71 @@ func TestSSHHostKeyArgs(t *testing.T) {
 			t.Errorf("default should use strict checking, got %q", args)
 		}
 	})
+}
+
+// TestGenerateAWSConfig verifies the generated AWS Terraform is structurally
+// correct: a data-source AMI (not a hardcoded region-specific ID), an injected
+// SSH key pair, an arch-appropriate instance type, and — when terraform is
+// available — that the HCL actually validates.
+func TestGenerateAWSConfig(t *testing.T) {
+	t.Parallel()
+	m := NewManager()
+
+	req := &ProvisionRequest{
+		Provider: "aws",
+		Arch:     "arm64",
+		SSH:      &SSHConfig{KeyPath: "/home/build/.ssh/id_ed25519", User: "ubuntu"},
+		Spec:     map[string]string{"region": "eu-west-1"},
+	}
+	main := m.generateAWSConfig(req, "eu-west-1", "")
+	fw := m.generateAWSFirewall(req, []string{"10.0.0.0/8"})
+
+	// Must NOT contain the old hardcoded, region-specific AMI.
+	if strings.Contains(main, "ami-0c55b159cbfafe1f0") {
+		t.Error("still uses the hardcoded region-specific AMI")
+	}
+	for _, want := range []string{
+		`data "aws_ami" "ubuntu"`,           // dynamic AMI lookup
+		"data.aws_ami.ubuntu.id",            // instance uses the resolved AMI
+		`resource "aws_key_pair" "portage"`, // SSH key injection
+		"aws_key_pair.portage.key_name",
+		`file("/home/build/.ssh/id_ed25519.pub")`,
+		`"t4g.large"`,                      // arm64 -> Graviton
+		`values = ["arm64"]`,               // architecture filter
+		"ubuntu-jammy-22.04-arm64-server-", // name-arch token
+	} {
+		if !strings.Contains(main, want) {
+			t.Errorf("generated AWS config missing %q", want)
+		}
+	}
+
+	// amd64 default instance type.
+	amd := m.generateAWSConfig(&ProvisionRequest{Provider: "aws", Arch: "amd64"}, "us-east-1", "")
+	if !strings.Contains(amd, `"t3.large"`) {
+		t.Error("amd64 should default to t3.large")
+	}
+
+	// Full `terraform init`/`validate` downloads the AWS provider (slow, network),
+	// so it is opt-in via PORTAGE_TF_VALIDATE=1 rather than run on every `go test`.
+	if os.Getenv("PORTAGE_TF_VALIDATE") != "1" {
+		return
+	}
+	tf, err := exec.LookPath("terraform")
+	if err != nil {
+		t.Skip("terraform not available; skipping HCL validation")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "firewall.tf"), []byte(fw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-input=false", "-no-color"}, {"validate", "-no-color"}} {
+		cmd := exec.Command(tf, args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("terraform %v failed: %v\n%s", args, err, out)
+		}
+	}
 }

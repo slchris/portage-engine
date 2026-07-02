@@ -255,13 +255,16 @@ func (m *Manager) GetExpiredInstances() []*Instance {
 }
 
 // supportedProviders lists the providers Provision can fully and correctly
-// provision. AWS and Aliyun are intentionally excluded: their generated
-// Terraform is a non-functional stub (default/region-specific images, no SSH
-// key, no user_data), so provisioning would either fail opaquely or create an
-// unusable instance. Return a clear error for those instead.
+// provision. GCP and PVE are validated against live environments. AWS generates
+// complete, valid Terraform (dynamic Ubuntu AMI, injected SSH key, arch-aware
+// instance type, security group) but has NOT been validated against a live AWS
+// account — treat it as beta. Aliyun remains a non-functional stub and is
+// intentionally excluded so provisioning returns a clear error instead of
+// creating an unusable instance.
 var supportedProviders = map[string]bool{
 	"gcp": true,
 	"pve": true,
+	"aws": true,
 }
 
 // Provision provisions a new instance using Terraform.
@@ -1039,10 +1042,72 @@ resource "google_compute_firewall" "portage_builder" {
 `, time.Now().Unix(), time.Now().Unix(), req.BuilderPort, strings.Join(allowedIPs, "\", \""), req.BuilderPort)
 }
 
+// awsInstanceTypeForArch returns a sensible default EC2 instance type for the
+// requested build arch (Graviton for arm64, x86 otherwise). A caller-supplied
+// spec["instance_type"] overrides this.
+func awsInstanceTypeForArch(arch string) string {
+	switch arch {
+	case "arm64", "aarch64":
+		return "t4g.large"
+	default:
+		return "t3.large"
+	}
+}
+
+// awsAMIArchFilter maps a build arch to the EC2 AMI "architecture" filter value
+// (x86_64 / arm64), which differs from the name-arch token below.
+func awsAMIArchFilter(arch string) string {
+	switch arch {
+	case "arm64", "aarch64":
+		return "arm64"
+	default:
+		return "x86_64"
+	}
+}
+
+// awsAMINameArch maps a build arch to Canonical's AMI-name arch token
+// (amd64 / arm64), used in the image name glob.
+func awsAMINameArch(arch string) string {
+	switch arch {
+	case "arm64", "aarch64":
+		return "arm64"
+	default:
+		return "amd64"
+	}
+}
+
 // generateAWSConfig generates AWS-specific Terraform config.
+//
+// NOTE: this HCL is written to be valid (terraform validate passes) and to wire
+// up everything the builder deploy needs — a region-agnostic Ubuntu AMI looked
+// up via a data source (not a hardcoded, region-specific AMI), an injected SSH
+// key pair so deployBuilder can connect, an arch-appropriate instance type, and
+// the security group / networking. It has NOT been validated against a live AWS
+// account, so real provisioning may still surface AMI/cloud-init/timing details
+// that only a real run reveals.
 func (m *Manager) generateAWSConfig(req *ProvisionRequest, region, zone string) string {
 	if zone == "" {
 		zone = region + "a"
+	}
+
+	instanceType := getOrDefault(req.Spec, "instance_type", awsInstanceTypeForArch(req.Arch))
+	amiArch := awsAMIArchFilter(req.Arch)
+	amiNameArch := awsAMINameArch(req.Arch)
+
+	// SSH key injection: create an aws_key_pair from the configured public key
+	// and attach it to the instance, so deployBuilder can SSH in. Without a key,
+	// fall back to no key_name (the instance still boots but cannot be deployed
+	// to — the caller is warned by the missing-SSH error path in the builder).
+	keyPairResource := ""
+	keyNameLine := ""
+	if req.SSH != nil && req.SSH.KeyPath != "" {
+		keyPairResource = fmt.Sprintf(`
+resource "aws_key_pair" "portage" {
+  key_name   = "portage-builder-%d"
+  public_key = file("%s")
+}
+`, time.Now().UnixNano(), req.SSH.KeyPath+".pub")
+		keyNameLine = "  key_name               = aws_key_pair.portage.key_name\n"
 	}
 
 	return fmt.Sprintf(`
@@ -1050,13 +1115,33 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 4.0"
+      version = "~> 5.0"
     }
   }
 }
 
 provider "aws" {
   region = "%s"
+}
+
+# Latest Ubuntu 22.04 AMI for the target arch, resolved at apply time so the
+# config is not tied to a single region's hardcoded AMI ID.
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-%s-server-*"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+  filter {
+    name   = "architecture"
+    values = ["%s"]
+  }
 }
 
 resource "aws_vpc" "portage" {
@@ -1104,13 +1189,13 @@ resource "aws_route_table_association" "portage" {
   subnet_id      = aws_subnet.portage.id
   route_table_id = aws_route_table.portage.id
 }
-
+%s
 resource "aws_instance" "portage_builder" {
-  ami                    = "ami-0c55b159cbfafe1f0"
-  instance_type          = "t3.large"
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "%s"
   subnet_id              = aws_subnet.portage.id
   vpc_security_group_ids = [aws_security_group.portage.id]
-
+%s
   root_block_device {
     volume_size = 50
     volume_type = "gp3"
@@ -1130,7 +1215,7 @@ output "ip_address" {
 output "private_ip" {
   value = aws_instance.portage_builder.private_ip
 }
-`, region, zone, req.Arch, req.Arch)
+`, region, amiNameArch, amiArch, zone, keyPairResource, instanceType, keyNameLine, req.Arch, req.Arch)
 }
 
 // generateAWSFirewall generates AWS security group rules.
