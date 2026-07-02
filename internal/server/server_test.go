@@ -835,3 +835,117 @@ func TestGetBuilderURLForJob(t *testing.T) {
 		t.Errorf("Expected first remote builder, got: %s", url)
 	}
 }
+
+// TestHandleSubmitBuildWithConfig verifies the config-bundle submit endpoint
+// (used by cmd/client) accepts a bundle and returns a queued job — previously
+// it returned 501 Not Implemented.
+func TestHandleSubmitBuildWithConfig(t *testing.T) {
+	cfg := &config.ServerConfig{BinpkgPath: "/tmp/binpkgs", MaxWorkers: 1}
+	server := New(cfg)
+
+	req := builder.LocalBuildRequest{
+		PackageName: "dev-lang/python",
+		Version:     "3.11.0",
+		ConfigBundle: &builder.ConfigBundle{
+			Config: &builder.PortageConfig{},
+			Packages: &builder.BuildPackageSpec{
+				Packages: []builder.PackageSpec{{Atom: "dev-lang/python", Version: "3.11.0"}},
+			},
+		},
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/builds/submit", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	server.handleSubmitBuildWithConfig(w, httpReq)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d", resp.StatusCode)
+	}
+	var out struct {
+		JobID  string `json:"job_id"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.JobID == "" {
+		t.Error("expected a job_id in the response")
+	}
+	if out.Status != "queued" {
+		t.Errorf("expected status queued, got %q", out.Status)
+	}
+}
+
+// TestHandleSubmitBuildWithConfig_RejectsEmptyBundle verifies validation.
+func TestHandleSubmitBuildWithConfig_RejectsEmptyBundle(t *testing.T) {
+	server := New(&config.ServerConfig{BinpkgPath: "/tmp/binpkgs", MaxWorkers: 1})
+
+	body, _ := json.Marshal(builder.LocalBuildRequest{PackageName: "x/y"})
+	httpReq := httptest.NewRequest(http.MethodPost, "/api/v1/builds/submit", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	server.handleSubmitBuildWithConfig(w, httpReq)
+
+	if w.Result().StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing bundle, got %d", w.Result().StatusCode)
+	}
+}
+
+// TestAPIKeyAuthMiddleware verifies the API-key auth layer via the real Router:
+// missing/wrong keys are rejected (constant-time compare), the correct key is
+// accepted, and public endpoints (/health, /binpkgs/) bypass auth.
+func TestAPIKeyAuthMiddleware(t *testing.T) {
+	cfg := &config.ServerConfig{
+		BinpkgPath: t.TempDir(),
+		MaxWorkers: 1,
+		APIKey:     "s3cr3t-key",
+	}
+	router := New(cfg).Router()
+
+	do := func(method, path, key string) int {
+		req := httptest.NewRequest(method, path, nil)
+		if key != "" {
+			req.Header.Set("X-API-Key", key)
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w.Result().StatusCode
+	}
+
+	// Protected endpoint: no key -> 401.
+	if got := do(http.MethodGet, "/api/v1/builds/list", ""); got != http.StatusUnauthorized {
+		t.Errorf("no key: expected 401, got %d", got)
+	}
+	// Wrong key -> 401.
+	if got := do(http.MethodGet, "/api/v1/builds/list", "wrong"); got != http.StatusUnauthorized {
+		t.Errorf("wrong key: expected 401, got %d", got)
+	}
+	// Correct key -> not 401 (200-class or handler-specific, but authorized).
+	if got := do(http.MethodGet, "/api/v1/builds/list", "s3cr3t-key"); got == http.StatusUnauthorized {
+		t.Errorf("correct key: unexpectedly 401")
+	}
+	// Public health endpoint bypasses auth.
+	if got := do(http.MethodGet, "/health", ""); got == http.StatusUnauthorized {
+		t.Errorf("/health should bypass auth, got 401")
+	}
+	// Binhost bypasses auth (emerge can't present a key).
+	if got := do(http.MethodGet, "/binpkgs/Packages", ""); got == http.StatusUnauthorized {
+		t.Errorf("/binpkgs/ should bypass auth, got 401")
+	}
+}
+
+// TestHandleBuildRequestRejectsEmptyPackage verifies empty package requests are
+// rejected with 400 rather than creating an empty queued job.
+func TestHandleBuildRequestRejectsEmptyPackage(t *testing.T) {
+	server := New(&config.ServerConfig{BinpkgPath: t.TempDir(), MaxWorkers: 1})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/packages/request-build", bytes.NewReader([]byte(`{"version":"1.0"}`)))
+	w := httptest.NewRecorder()
+	server.handleBuildRequest(w, req)
+	if w.Result().StatusCode != http.StatusBadRequest {
+		t.Errorf("empty package: expected 400, got %d", w.Result().StatusCode)
+	}
+}

@@ -160,11 +160,8 @@ func TestParseFlagsAndKeywords(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var result []string
-			if tt.input != "" {
-				parts := splitAndTrim(tt.input, ",")
-				result = parts
-			}
+			// Exercise the production parser directly.
+			result := parseCSV(tt.input)
 
 			if len(result) != len(tt.expected) {
 				t.Errorf("Expected %d items, got %d", len(tt.expected), len(result))
@@ -178,47 +175,4 @@ func TestParseFlagsAndKeywords(t *testing.T) {
 			}
 		})
 	}
-}
-
-func splitAndTrim(s, sep string) []string {
-	if s == "" {
-		return nil
-	}
-	parts := make([]string, 0)
-	for _, p := range splitString(s, sep) {
-		trimmed := trimSpace(p)
-		if trimmed != "" {
-			parts = append(parts, trimmed)
-		}
-	}
-	return parts
-}
-
-func splitString(s, sep string) []string {
-	if s == "" {
-		return []string{}
-	}
-	result := []string{}
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if i+len(sep) <= len(s) && s[i:i+len(sep)] == sep {
-			result = append(result, s[start:i])
-			start = i + len(sep)
-			i += len(sep) - 1
-		}
-	}
-	result = append(result, s[start:])
-	return result
-}
-
-func trimSpace(s string) string {
-	start := 0
-	end := len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
-		end--
-	}
-	return s[start:end]
 }

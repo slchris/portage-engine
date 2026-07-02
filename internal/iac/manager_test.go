@@ -3,6 +3,7 @@ package iac
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -292,10 +293,47 @@ func TestGenerateTerraformConfig(t *testing.T) {
 func TestGenerateDeploymentScript(t *testing.T) {
 	manager := NewManager()
 
-	script := manager.generateDeploymentScript("http://localhost:8080/api/heartbeat", 9090)
+	script := manager.generateDeploymentScript(&ProvisionRequest{
+		ServerCallback: "http://localhost:8080",
+		BuilderPort:    9090,
+		BuilderToken:   "secret-token",
+		Arch:           "amd64",
+		BinpkgHost:     "http://localhost:8080/binpkgs",
+	})
 
 	if len(script) == 0 {
-		t.Error("generateDeploymentScript() returned empty script")
+		t.Fatal("generateDeploymentScript() returned empty script")
+	}
+
+	// The builder config directory must be created BEFORE it is written to
+	// (the script runs under set -e).
+	mkdirIdx := strings.Index(script, "mkdir -p /etc/portage-engine")
+	writeIdx := strings.Index(script, "cat > /etc/portage-engine/builder.conf")
+	if mkdirIdx < 0 || writeIdx < 0 || mkdirIdx > writeIdx {
+		t.Error("mkdir /etc/portage-engine must precede the builder.conf write")
+	}
+
+	// The token must be wired into the builder config.
+	if !strings.Contains(script, "BUILDER_TOKEN=") {
+		t.Error("BUILDER_TOKEN not present in generated config")
+	}
+
+	// The Portage paths must point the builder at the synced tree / make.conf.
+	for _, want := range []string{"PORTAGE_REPOS_PATH=", "PORTAGE_CONF_PATH=", "MAKE_CONF_PATH="} {
+		if !strings.Contains(script, want) {
+			t.Errorf("generated config missing %q", want)
+		}
+	}
+
+	// A binhost farm must never compile for the exact CPU.
+	if strings.Contains(script, "-march=native") {
+		t.Error("make.conf must not use -march=native on a binhost farm")
+	}
+
+	// $(nproc) must be resolved by the shell, not written literally into
+	// make.conf (Portage does not evaluate command substitution).
+	if strings.Contains(script, `MAKEOPTS="-j$(nproc)"`) {
+		t.Error("$(nproc) leaked literally into make.conf")
 	}
 }
 
@@ -595,4 +633,157 @@ func TestInstanceTTLFields(t *testing.T) {
 	if inst.ActiveTasks != 0 {
 		t.Errorf("ActiveTasks = %d, want 0", inst.ActiveTasks)
 	}
+}
+
+// TestTerminateKeepsInstanceOnDestroyFailure verifies that a failed destroy does
+// NOT drop the instance from tracking (so the cleanup routine can retry it,
+// instead of leaking a billed VM with its terraform state deleted).
+func TestTerminateKeepsInstanceOnDestroyFailure(t *testing.T) {
+	m := NewManager()
+	id := "leak-test"
+	// A non-existent TerraformDir makes `terraform destroy` fail to start
+	// (chdir error), deterministically, whether or not terraform is installed.
+	m.instances[id] = &Instance{
+		ID:           id,
+		Provider:     "gcp",
+		Status:       "running",
+		TerraformDir: "/nonexistent/terraform/dir/for/test",
+	}
+
+	err := m.Terminate(id)
+	if err == nil {
+		t.Fatal("expected Terminate to return an error on destroy failure")
+	}
+
+	// Instance must still be tracked and marked destroy_failed.
+	inst, exists := m.instances[id]
+	if !exists {
+		t.Fatal("instance was dropped from tracking after a failed destroy (would leak the VM)")
+	}
+	if inst.Status != "destroy_failed" {
+		t.Errorf("expected status destroy_failed, got %q", inst.Status)
+	}
+}
+
+// TestCleanupRetriesDestroyFailedInstances verifies that destroy_failed
+// instances are selected for cleanup regardless of TTL.
+func TestCleanupRetriesDestroyFailedInstances(t *testing.T) {
+	m := NewManager()
+	id := "retry-test"
+	m.instances[id] = &Instance{
+		ID:           id,
+		Provider:     "gcp",
+		Status:       "destroy_failed",
+		TTL:          0, // even with no TTL, destroy_failed must be retried
+		TerraformDir: "/nonexistent/terraform/dir/for/test",
+		LastActivity: time.Now(),
+	}
+
+	// cleanupExpiredInstances calls Terminate, which will fail again (dir gone)
+	// and keep it tracked — the point is that it was *selected*, proving the
+	// retry path targets destroy_failed instances.
+	m.cleanupExpiredInstances()
+
+	inst, exists := m.instances[id]
+	if !exists {
+		t.Fatal("destroy_failed instance disappeared unexpectedly")
+	}
+	if inst.Status != "destroy_failed" {
+		t.Errorf("expected it to remain destroy_failed after a failed retry, got %q", inst.Status)
+	}
+}
+
+// TestGenerateAliyunFirewall_PerCIDRRules verifies finding #28: the Aliyun
+// firewall must emit one valid security-group-rule resource per allowed CIDR
+// instead of a single rule with an invalid comma-joined cidr_ip.
+func TestGenerateAliyunFirewall_PerCIDRRules(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+	req := &ProvisionRequest{
+		Provider:    "aliyun",
+		BuilderPort: 9090,
+	}
+	allowedIPs := []string{"1.2.3.0/24", "10.0.0.0/8"}
+
+	config := manager.generateAliyunFirewall(req, allowedIPs)
+
+	// One builder rule resource per CIDR.
+	if got := strings.Count(config, `resource "alicloud_security_group_rule" "builder_`); got != len(allowedIPs) {
+		t.Errorf("got %d per-CIDR builder rules, want %d\n%s", got, len(allowedIPs), config)
+	}
+
+	// Each CIDR must appear as its own single-value cidr_ip.
+	for _, cidr := range allowedIPs {
+		want := `cidr_ip           = "` + cidr + `"`
+		if !strings.Contains(config, want) {
+			t.Errorf("missing per-CIDR rule for %s", cidr)
+		}
+	}
+
+	// The invalid comma-joined cidr_ip must never be produced.
+	if strings.Contains(config, `cidr_ip           = "1.2.3.0/24,10.0.0.0/8"`) {
+		t.Error("firewall emitted invalid multi-CIDR cidr_ip")
+	}
+}
+
+// TestProvision_UnimplementedProvider verifies finding #27: AWS and Aliyun are
+// non-functional stubs and must fail fast with a clear error rather than
+// generating broken terraform.
+func TestProvision_UnimplementedProvider(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager()
+
+	for _, provider := range []string{"aws", "aliyun", "azure", ""} {
+		provider := provider
+		t.Run("provider_"+provider, func(t *testing.T) {
+			t.Parallel()
+			_, err := manager.Provision(&ProvisionRequest{Provider: provider})
+			if err == nil {
+				t.Fatalf("Provision(%q) should return an error", provider)
+			}
+			if !strings.Contains(err.Error(), "not implemented") {
+				t.Errorf("Provision(%q) error = %q, want 'not implemented'", provider, err)
+			}
+		})
+	}
+}
+
+// TestSSHHostKeyArgs verifies finding #50: host-key verification is only
+// disabled when explicitly opted in, uses a supplied known_hosts path when
+// available, and otherwise fails closed with strict checking.
+func TestSSHHostKeyArgs(t *testing.T) {
+	t.Parallel()
+
+	joinArgs := func(a []string) string { return strings.Join(a, " ") }
+
+	t.Run("insecure opt-in", func(t *testing.T) {
+		t.Parallel()
+		args := joinArgs(sshHostKeyArgs(&SSHConfig{InsecureHostKey: true}))
+		if !strings.Contains(args, "StrictHostKeyChecking=no") ||
+			!strings.Contains(args, "UserKnownHostsFile=/dev/null") {
+			t.Errorf("insecure opt-in should disable host key checking, got %q", args)
+		}
+	})
+
+	t.Run("known_hosts path", func(t *testing.T) {
+		t.Parallel()
+		args := joinArgs(sshHostKeyArgs(&SSHConfig{KnownHostsPath: "/etc/known_hosts"}))
+		if !strings.Contains(args, "StrictHostKeyChecking=yes") ||
+			!strings.Contains(args, "UserKnownHostsFile=/etc/known_hosts") {
+			t.Errorf("known_hosts should enable strict checking against the file, got %q", args)
+		}
+	})
+
+	t.Run("default fails closed", func(t *testing.T) {
+		t.Parallel()
+		args := joinArgs(sshHostKeyArgs(nil))
+		if strings.Contains(args, "StrictHostKeyChecking=no") {
+			t.Errorf("default must not disable host key checking, got %q", args)
+		}
+		if !strings.Contains(args, "StrictHostKeyChecking=yes") {
+			t.Errorf("default should use strict checking, got %q", args)
+		}
+	})
 }

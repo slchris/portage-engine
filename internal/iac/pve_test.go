@@ -291,8 +291,6 @@ func TestPVEProvisioner_GenerateMainTF(t *testing.T) {
 		`pm_api_url`,
 		`https://pve.example.com:8006/api2/json`,
 		`pm_tls_insecure = true`,
-		`pm_api_token_id`,
-		`pm_api_token_secret`,
 		`proxmox_vm_qemu`,
 		`name        = "test-builder"`,
 		`target_node = "pve-node1"`,
@@ -316,6 +314,12 @@ func TestPVEProvisioner_GenerateMainTF(t *testing.T) {
 		if !strings.Contains(tf, expected) {
 			t.Errorf("Generated TF missing expected string: %s", expected)
 		}
+	}
+
+	// The secret must NOT be embedded as a plaintext literal in main.tf; the
+	// proxmox provider reads credentials from PM_* environment variables.
+	if strings.Contains(tf, "secret-token") {
+		t.Error("token secret leaked as a plaintext literal in generated TF")
 	}
 }
 
@@ -440,11 +444,22 @@ func TestPVEProvisioner_GenerateMainTF_PasswordAuth(t *testing.T) {
 
 	tf := provisioner.GenerateMainTF(nil, "test-builder")
 
-	if !strings.Contains(tf, `pm_user     = "root@pam"`) {
-		t.Error("Generated TF missing pm_user")
+	// The password must be referenced via a variable, never embedded as a literal
+	// (finding #30).
+	if !strings.Contains(tf, `pm_password = var.pve_password`) {
+		t.Error("Generated TF should reference var.pve_password")
 	}
-	if !strings.Contains(tf, `pm_password = "password123"`) {
-		t.Error("Generated TF missing pm_password")
+	if !strings.Contains(tf, `variable "pve_password"`) {
+		t.Error("Generated TF should declare the pve_password variable")
+	}
+	if strings.Contains(tf, "password123") {
+		t.Error("Generated TF must NOT contain the plaintext password")
+	}
+
+	// AuthEnv must supply the secret out-of-band via TF_VAR_*.
+	env := provisioner.AuthEnv()
+	if len(env) != 1 || env[0] != "TF_VAR_pve_password=password123" {
+		t.Errorf("AuthEnv = %v, want [TF_VAR_pve_password=password123]", env)
 	}
 }
 
@@ -549,5 +564,50 @@ func TestBoolToInt(t *testing.T) {
 	}
 	if boolToInt(false) != 0 {
 		t.Error("boolToInt(false) should return 0")
+	}
+}
+
+// TestPVEProvisioner_GenerateMainTF_NoPlaintextTokenSecret verifies finding #30:
+// the API token secret must be passed via a Terraform variable, not embedded as
+// a literal in the generated main.tf.
+func TestPVEProvisioner_GenerateMainTF_NoPlaintextTokenSecret(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+
+	const secret = "super-secret-token-value"
+	config := &PVEConfig{
+		Endpoint:    "https://pve.example.com:8006",
+		Node:        "pve-node1",
+		TokenID:     "root@pam!terraform",
+		TokenSecret: secret,
+		StateDir:    tmpDir,
+		BuilderPort: 9090,
+	}
+
+	provisioner, err := NewPVEProvisioner(config)
+	if err != nil {
+		t.Fatalf("NewPVEProvisioner failed: %v", err)
+	}
+
+	tf := provisioner.GenerateMainTF(nil, "test-builder")
+
+	if strings.Contains(tf, secret) {
+		t.Error("Generated TF must NOT contain the plaintext token secret")
+	}
+	if !strings.Contains(tf, `pm_api_token_secret = var.pve_token_secret`) {
+		t.Error("Generated TF should reference var.pve_token_secret")
+	}
+	if !strings.Contains(tf, `variable "pve_token_secret"`) {
+		t.Error("Generated TF should declare the pve_token_secret variable")
+	}
+	// The token ID is not itself a credential and may still appear inline.
+	if !strings.Contains(tf, `pm_api_token_id     = "root@pam!terraform"`) {
+		t.Error("Generated TF should still include the token ID inline")
+	}
+
+	env := provisioner.AuthEnv()
+	if len(env) != 1 || env[0] != "TF_VAR_pve_token_secret="+secret {
+		t.Errorf("AuthEnv = %v, want [TF_VAR_pve_token_secret=%s]", env, secret)
 	}
 }

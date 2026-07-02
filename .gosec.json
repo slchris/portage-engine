@@ -3,9 +3,9 @@
     "nosec": false,
     "audit": false
   },
+  "exclude-generated": true,
   "exclude": {
-    "G204": "Most subprocess calls are necessary for container/package management",
-    "G304": "File operations are validated by application context",
-    "G107": "HTTP requests to internal/configured services are necessary"
+    "G204": "All subprocess launches use argv form (exec.Command/CommandContext with separate arguments, never 'sh -c'). User-controlled build inputs (package atom, USE flags, versions, env keys/values) are validated against strict allowlists in internal/builder/validate.go before reaching any command, and container execution passes emerge as argv with env via 'docker exec -e', so no value is shell-interpreted.",
+    "G304": "File paths passed to os.Open/os.ReadFile come from operator configuration (config files, GNUPGHOME, PKGDIR, terraform workspace) or from server-generated bundle paths, not from unauthenticated request bodies. Individual call sites carry inline #nosec G304 justifications."
   }
 }

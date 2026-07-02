@@ -424,3 +424,45 @@ func TestPasswordEdgeCases(t *testing.T) {
 		})
 	}
 }
+
+// TestConcurrentNewAndEnabledAccess exercises concurrent New calls (which toggle
+// the enabled flag) alongside recorders, IsEnabled and Handler reads to catch
+// data races on the enabled flag (run with -race).
+func TestConcurrentNewAndEnabledAccess(_ *testing.T) {
+	var wg sync.WaitGroup
+
+	// Goroutines that repeatedly reconfigure via New, toggling enabled and
+	// password.
+	for i := 0; i < 4; i++ {
+		enabled := i%2 == 0
+		pw := ""
+		if i%2 == 1 {
+			pw = "secret"
+		}
+		wg.Add(1)
+		go func(en bool, password string) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				m := New(&Config{Enabled: en, Password: password})
+				_ = m.IsEnabled()
+			}
+		}(enabled, pw)
+	}
+
+	// Goroutines that record metrics and build handlers concurrently.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				m := New(&Config{Enabled: true})
+				m.IncBuildsTotal()
+				m.IncHTTPRequests()
+				_ = m.Handler()
+				_ = m.GetSnapshot()
+			}
+		}()
+	}
+
+	wg.Wait()
+}

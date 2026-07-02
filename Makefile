@@ -5,54 +5,41 @@ BINARY_SERVER=bin/portage-server
 BINARY_DASHBOARD=bin/portage-dashboard
 BINARY_BUILDER=bin/portage-builder
 BINARY_CLIENT=bin/portage-client
-BINARY_WRAPPER=bin/emerge-wrapper
 GO=go
 GOFLAGS=-v
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+LDFLAGS=-ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)"
 
 all: build
 
 # Build all binaries
-build: build-server build-dashboard build-builder build-client build-wrapper
+build: build-server build-dashboard build-builder build-client
 
 # Build server
 build-server:
 	@echo "Building Portage Engine Server..."
 	@mkdir -p bin
-	$(GO) build $(GOFLAGS) -o $(BINARY_SERVER) cmd/server/main.go
+	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_SERVER) cmd/server/main.go
 
 # Build dashboard
 build-dashboard:
 	@echo "Building Portage Engine Dashboard..."
 	@mkdir -p bin
-	$(GO) build $(GOFLAGS) -o $(BINARY_DASHBOARD) cmd/dashboard/main.go
+	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_DASHBOARD) cmd/dashboard/main.go
 
 # Build builder
 build-builder:
 	@echo "Building Portage Engine Builder..."
 	@mkdir -p bin
-	$(GO) build $(GOFLAGS) -o $(BINARY_BUILDER) cmd/builder/main.go
+	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_BUILDER) cmd/builder/main.go
 
 # Build client
 build-client:
 	@echo "Building Portage Engine Client..."
 	@mkdir -p bin
 	$(GO) build $(GOFLAGS) -o $(BINARY_CLIENT) cmd/client/main.go
-
-# Build emerge wrapper
-build-wrapper:
-	@echo "Building Emerge Wrapper..."
-	@mkdir -p bin
-	$(GO) build $(GOFLAGS) -o $(BINARY_WRAPPER) cmd/emerge-wrapper/main.go
-
-# Install emerge wrapper (requires root)
-install-wrapper:
-	@echo "Installing emerge wrapper..."
-	@bash scripts/install-wrapper.sh
-
-# Uninstall emerge wrapper (requires root)
-uninstall-wrapper:
-	@echo "Uninstalling emerge wrapper..."
-	@bash scripts/uninstall-wrapper.sh
 
 # Clean build artifacts
 clean:
@@ -68,22 +55,22 @@ test:
 # Run server
 run-server:
 	@echo "Starting Portage Engine Server..."
-	$(GO) run cmd/server/main.go -config configs/server.yaml
+	$(GO) run cmd/server/main.go -config configs/server.conf
 
 # Run dashboard
 run-dashboard:
 	@echo "Starting Portage Engine Dashboard..."
-	$(GO) run cmd/dashboard/main.go -config configs/dashboard.yaml
+	$(GO) run cmd/dashboard/main.go -config configs/dashboard.conf
 
 # Run builder
 run-builder:
 	@echo "Starting Portage Engine Builder..."
-	$(GO) run cmd/builder/main.go -port 9090
+	$(GO) run cmd/builder/main.go -config configs/builder.conf
 
 # Run client example
 run-client:
 	@echo "Running client example..."
-	$(GO) run cmd/client/main.go -config configs/example-config.json -package dev-lang/python -version 3.11
+	$(GO) run cmd/client/main.go build -package dev-lang/python -version 3.11
 
 # Download dependencies
 deps:

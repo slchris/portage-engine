@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -335,4 +336,52 @@ func TestExportKeyPairCreateDirectory(t *testing.T) {
 	if _, err := os.Stat(newDir); os.IsNotExist(err) {
 		t.Error("ExportKeyPair should create the directory before failing")
 	}
+}
+
+// TestGetPublicKeyReturnsCache verifies that a pre-populated cache is returned
+// without shelling out to gpg.
+func TestGetPublicKeyReturnsCache(t *testing.T) {
+	t.Parallel()
+
+	signer := NewSigner("test-key", "", true)
+	signer.pubKeyMu.Lock()
+	signer.publicKey = "CACHED-KEY"
+	signer.pubKeyMu.Unlock()
+
+	key, err := signer.GetPublicKey()
+	if err != nil {
+		t.Fatalf("GetPublicKey returned error: %v", err)
+	}
+	if key != "CACHED-KEY" {
+		t.Errorf("Expected cached key, got %q", key)
+	}
+}
+
+// TestGetPublicKeyConcurrent exercises GetPublicKey concurrently to catch data
+// races on the cached public key (run with -race). The cache is pre-populated
+// so the test does not depend on gpg being installed.
+func TestGetPublicKeyConcurrent(t *testing.T) {
+	t.Parallel()
+
+	signer := NewSigner("test-key", "", true)
+	signer.pubKeyMu.Lock()
+	signer.publicKey = "CACHED-KEY"
+	signer.pubKeyMu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key, err := signer.GetPublicKey()
+			if err != nil {
+				t.Errorf("GetPublicKey returned error: %v", err)
+				return
+			}
+			if key != "CACHED-KEY" {
+				t.Errorf("Expected cached key, got %q", key)
+			}
+		}()
+	}
+	wg.Wait()
 }

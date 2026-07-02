@@ -44,7 +44,8 @@ jobs:
         run: docker build -f Dockerfile.test -t portage-test:latest .
 
       - name: Run tests in container
-        run: docker run --rm -v ${{ github.workspace }}:/app -w /app portage-test:latest go test -v -coverprofile=coverage.out ./...
+        # -race is re-enabled now that the code is race-clean.
+        run: docker run --rm -v ${{ github.workspace }}:/app -w /app portage-test:latest go test -v -race -coverprofile=coverage.out ./...
 
       - name: Upload coverage
         if: always()

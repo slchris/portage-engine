@@ -6,168 +6,27 @@ import (
 	"testing"
 )
 
-// TestNewS3Storage tests creating a new S3 storage backend.
+// TestNewS3Storage verifies the S3 constructor fails fast (backend not yet
+// implemented), so a STORAGE_TYPE=s3 misconfiguration is caught at startup.
 func TestNewS3Storage(t *testing.T) {
 	storage, err := NewS3Storage("test-bucket", "us-east-1", "prefix")
-	if err != nil {
-		t.Fatalf("NewS3Storage failed: %v", err)
-	}
-
-	if storage == nil {
-		t.Fatal("Expected non-nil storage")
-	}
-
-	if storage.bucket != "test-bucket" {
-		t.Errorf("Expected bucket test-bucket, got %s", storage.bucket)
-	}
-
-	if storage.region != "us-east-1" {
-		t.Errorf("Expected region us-east-1, got %s", storage.region)
-	}
-
-	if storage.prefix != "prefix" {
-		t.Errorf("Expected prefix prefix, got %s", storage.prefix)
-	}
-}
-
-// TestS3StorageUpload tests that Upload returns not implemented error.
-func TestS3StorageUpload(t *testing.T) {
-	storage, _ := NewS3Storage("test-bucket", "us-east-1", "")
-
-	err := storage.Upload("local.txt", "remote.txt")
 	if err == nil {
-		t.Error("Expected not implemented error")
+		t.Fatal("expected an error: S3 backend is not implemented")
+	}
+	if storage != nil {
+		t.Error("expected nil storage on constructor failure")
 	}
 }
 
-// TestS3StorageDownload tests that Download returns not implemented error.
-func TestS3StorageDownload(t *testing.T) {
-	storage, _ := NewS3Storage("test-bucket", "us-east-1", "")
-
-	err := storage.Download("remote.txt", "local.txt")
-	if err == nil {
-		t.Error("Expected not implemented error")
-	}
-}
-
-// TestS3StorageDelete tests that Delete returns not implemented error.
-func TestS3StorageDelete(t *testing.T) {
-	storage, _ := NewS3Storage("test-bucket", "us-east-1", "")
-
-	err := storage.Delete("remote.txt")
-	if err == nil {
-		t.Error("Expected not implemented error")
-	}
-}
-
-// TestS3StorageList tests that List returns not implemented error.
-func TestS3StorageList(t *testing.T) {
-	storage, _ := NewS3Storage("test-bucket", "us-east-1", "")
-
-	_, err := storage.List("prefix")
-	if err == nil {
-		t.Error("Expected not implemented error")
-	}
-}
-
-// TestS3StorageGetURL tests that GetURL returns not implemented error.
-func TestS3StorageGetURL(t *testing.T) {
-	storage, _ := NewS3Storage("test-bucket", "us-east-1", "")
-
-	_, err := storage.GetURL("file.txt")
-	if err == nil {
-		t.Error("Expected not implemented error")
-	}
-}
-
-// TestS3StorageExists tests that Exists returns not implemented error.
-func TestS3StorageExists(t *testing.T) {
-	storage, _ := NewS3Storage("test-bucket", "us-east-1", "")
-
-	_, err := storage.Exists("file.txt")
-	if err == nil {
-		t.Error("Expected not implemented error")
-	}
-}
-
-// TestNewHTTPStorage tests creating a new HTTP storage backend.
+// TestNewHTTPStorage verifies the HTTP constructor fails fast (backend not yet
+// implemented), so a STORAGE_TYPE=http misconfiguration is caught at startup.
 func TestNewHTTPStorage(t *testing.T) {
 	storage, err := NewHTTPStorage("http://localhost:8080/storage")
-	if err != nil {
-		t.Fatalf("NewHTTPStorage failed: %v", err)
-	}
-
-	if storage == nil {
-		t.Fatal("Expected non-nil storage")
-	}
-
-	if storage.baseURL != "http://localhost:8080/storage" {
-		t.Errorf("Expected baseURL http://localhost:8080/storage, got %s", storage.baseURL)
-	}
-}
-
-// TestHTTPStorageUpload tests that Upload returns not implemented error.
-func TestHTTPStorageUpload(t *testing.T) {
-	storage, _ := NewHTTPStorage("http://localhost:8080")
-
-	err := storage.Upload("local.txt", "remote.txt")
 	if err == nil {
-		t.Error("Expected not implemented error")
+		t.Fatal("expected an error: HTTP backend is not implemented")
 	}
-}
-
-// TestHTTPStorageDownload tests that Download returns not implemented error.
-func TestHTTPStorageDownload(t *testing.T) {
-	storage, _ := NewHTTPStorage("http://localhost:8080")
-
-	err := storage.Download("remote.txt", "local.txt")
-	if err == nil {
-		t.Error("Expected not implemented error")
-	}
-}
-
-// TestHTTPStorageDelete tests that Delete returns not implemented error.
-func TestHTTPStorageDelete(t *testing.T) {
-	storage, _ := NewHTTPStorage("http://localhost:8080")
-
-	err := storage.Delete("remote.txt")
-	if err == nil {
-		t.Error("Expected not implemented error")
-	}
-}
-
-// TestHTTPStorageList tests that List returns not implemented error.
-func TestHTTPStorageList(t *testing.T) {
-	storage, _ := NewHTTPStorage("http://localhost:8080")
-
-	_, err := storage.List("prefix")
-	if err == nil {
-		t.Error("Expected not implemented error")
-	}
-}
-
-// TestHTTPStorageGetURL tests GetURL functionality.
-func TestHTTPStorageGetURL(t *testing.T) {
-	storage, _ := NewHTTPStorage("http://localhost:8080/storage")
-
-	url, err := storage.GetURL("file.txt")
-	if err != nil {
-		t.Fatalf("GetURL failed: %v", err)
-	}
-
-	expected := "http://localhost:8080/storage/file.txt"
-	if url != expected {
-		t.Errorf("Expected URL %s, got %s", expected, url)
-	}
-}
-
-// TestHTTPStorageExists tests that Exists returns not implemented error.
-func TestHTTPStorageExists(t *testing.T) {
-	storage, _ := NewHTTPStorage("http://localhost:8080")
-
-	_, err := storage.Exists("file.txt")
-	if err == nil {
-		t.Error("Expected not implemented error")
+	if storage != nil {
+		t.Error("expected nil storage on constructor failure")
 	}
 }
 
@@ -197,15 +56,12 @@ func TestStorageInterfaceCompliance(t *testing.T) {
 	}
 	testStorageInterface(t, local, "test.txt", testFile)
 
-	// S3 and HTTP are not fully implemented
-	s3, _ := NewS3Storage("bucket", "region", "")
-	if s3 == nil {
-		t.Error("S3Storage should not be nil")
+	// S3 and HTTP backends are not implemented: their constructors error.
+	if _, err := NewS3Storage("bucket", "region", ""); err == nil {
+		t.Error("expected NewS3Storage to error (not implemented)")
 	}
-
-	http, _ := NewHTTPStorage("http://localhost:8080")
-	if http == nil {
-		t.Error("HTTPStorage should not be nil")
+	if _, err := NewHTTPStorage("http://localhost:8080"); err == nil {
+		t.Error("expected NewHTTPStorage to error (not implemented)")
 	}
 }
 

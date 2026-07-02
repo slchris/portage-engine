@@ -1,4 +1,9 @@
 // Package logging provides structured logging with rotation support.
+//
+// NOTE: This package is not yet wired into the application. The LOG_* options
+// are parsed and documented, but the command entrypoints do not yet call
+// logging.New. It is kept correct and stoppable (see Logger.Close) so a future
+// caller can adopt it without further changes.
 package logging
 
 import (
@@ -67,6 +72,11 @@ type Logger struct {
 	enableConsole bool
 	enableFile    bool
 	writers       []io.Writer
+
+	// stopCleanup signals the background cleanup goroutine to exit.
+	// closeOnce ensures Close is idempotent.
+	stopCleanup chan struct{}
+	closeOnce   sync.Once
 }
 
 // New creates a new Logger instance.
@@ -89,6 +99,7 @@ func New(cfg *Config) (*Logger, error) {
 		maxBackups:    cfg.MaxBackups,
 		enableConsole: cfg.EnableConsole,
 		enableFile:    cfg.EnableFile,
+		stopCleanup:   make(chan struct{}),
 	}
 
 	if !cfg.Enabled {
@@ -183,8 +194,13 @@ func (l *Logger) cleanOldLogs() {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		l.performCleanup()
+	for {
+		select {
+		case <-l.stopCleanup:
+			return
+		case <-ticker.C:
+			l.performCleanup()
+		}
 	}
 }
 
@@ -282,24 +298,29 @@ func (l *Logger) deleteFiles(files []string) {
 
 // log writes a log message.
 func (l *Logger) log(level Level, format string, v ...interface{}) {
-	if !l.enabled || level < l.level {
-		return
-	}
-
 	l.mu.RLock()
+	enabled := l.enabled
+	currentLevel := l.level
 	writers := l.writers
 	currentSize := l.currentSize
 	maxSize := l.maxSize
+	enableFile := l.enableFile
+	currentFile := l.currentFile
 	l.mu.RUnlock()
 
+	if !enabled || level < currentLevel {
+		return
+	}
+
 	// Check if rotation is needed
-	if l.enableFile && maxSize > 0 && currentSize >= maxSize {
+	if enableFile && maxSize > 0 && currentSize >= maxSize {
 		if err := l.rotate(); err != nil {
 			log.Printf("Failed to rotate log: %v", err)
 		}
 		l.updateWriters()
 		l.mu.RLock()
 		writers = l.writers
+		currentFile = l.currentFile
 		l.mu.RUnlock()
 	}
 
@@ -308,7 +329,7 @@ func (l *Logger) log(level Level, format string, v ...interface{}) {
 
 	for _, w := range writers {
 		n, _ := w.Write([]byte(msg))
-		if w == l.currentFile {
+		if w == currentFile {
 			l.mu.Lock()
 			l.currentSize += int64(n)
 			l.mu.Unlock()
@@ -336,13 +357,22 @@ func (l *Logger) Error(format string, v ...interface{}) {
 	l.log(LevelError, format, v...)
 }
 
-// Close closes the logger.
+// Close stops the background cleanup goroutine and closes the log file.
+// It is safe to call Close multiple times.
 func (l *Logger) Close() error {
+	l.closeOnce.Do(func() {
+		if l.stopCleanup != nil {
+			close(l.stopCleanup)
+		}
+	})
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if l.currentFile != nil {
-		return l.currentFile.Close()
+		err := l.currentFile.Close()
+		l.currentFile = nil
+		return err
 	}
 	return nil
 }

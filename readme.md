@@ -56,13 +56,15 @@ Automated cloud infrastructure provisioning system that creates build machines o
 - Docker containers (local builds)
 
 ### 4. Portage Client Tool
-Command-line client for submitting build requests with custom configurations.
+A management/request CLI. It does **not** install packages — that is done
+natively by Portage against the binhost (`emerge --getbinpkg`). The client
+covers the parts Portage has no native mechanism for.
 
-**Features:**
-- Submit builds with configuration files
-- Generate configuration bundles
-- Monitor build status
-- Support for batch operations
+**Subcommands:**
+- `configure` — point Portage at the binhost (writes `binrepos.conf`)
+- `build` — request the server build a package (with optional `-wait`)
+- `status` — check a build job
+- `bundle` — generate a Portage config bundle without building
 
 ### 5. Dashboard
 Web-based monitoring and management interface for the build cluster.
@@ -72,6 +74,13 @@ Web-based monitoring and management interface for the build cluster.
 - Build job tracking
 - Instance management
 - Authentication support (with anonymous access option)
+
+## 📚 Documentation
+
+- **[Usage guide](docs/USAGE.md)** — consuming packages (native `emerge
+  --getbinpkg`) vs. requesting builds, authentication, and config bundles.
+- **[Using system Portage configuration](docs/SYSTEM_CONFIG_USAGE.md)** —
+  building with your machine's exact `/etc/portage` settings.
 
 ## 🚀 Quick Start
 
@@ -108,17 +117,17 @@ make build
 # 1. Start the server (Docker mode for local testing)
 export USE_DOCKER=true
 export DOCKER_IMAGE=gentoo/stage3:latest
-./bin/portage-server -config configs/server.yaml
+./bin/portage-server -config configs/server.conf
 
-# 2. In another terminal, submit a build
-./bin/portage-client \
+# 2. In another terminal, request a build
+./bin/portage-client build \
   -server=http://localhost:8080 \
   -package=dev-lang/python \
   -version=3.11 \
-  -use=ssl,threads,sqlite
+  -use=ssl,threads,sqlite -wait
 
 # 3. Monitor via Dashboard (optional)
-./bin/portage-dashboard -config configs/dashboard.yaml
+./bin/portage-dashboard -config configs/dashboard.conf
 # Visit http://localhost:8081
 ```
 
@@ -127,8 +136,8 @@ export DOCKER_IMAGE=gentoo/stage3:latest
 ### Simple Build with USE Flags
 
 ```bash
-# Build Python 3.11 with specific USE flags
-./bin/portage-client \
+# Request a build of Python 3.11 with specific USE flags
+./bin/portage-client build \
   -package=dev-lang/python \
   -version=3.11 \
   -use=ssl,threads,sqlite,readline
@@ -136,11 +145,11 @@ export DOCKER_IMAGE=gentoo/stage3:latest
 
 ### 🆕 Build Using System Portage Configuration
 
-**New Feature**: Use your system's `/etc/portage` configuration directly!
+**Feature**: Use your system's `/etc/portage` configuration directly!
 
 ```bash
-# Build with your exact system configuration
-./bin/portage-client \
+# Request a build with your exact system configuration
+./bin/portage-client build \
   -portage-dir=/etc/portage \
   -package=dev-lang/python:3.11
 
@@ -151,11 +160,11 @@ export DOCKER_IMAGE=gentoo/stage3:latest
 # ✓ Use your repository configurations
 # ✓ Ensure USE flag consistency
 
-# Generate a configuration bundle from your system
-./bin/portage-client \
+# Generate a configuration bundle from your system (no build)
+./bin/portage-client bundle \
   -portage-dir=/etc/portage \
   -package=dev-lang/python:3.11 \
-  -output=python-system-config.tar.gz
+  -out=python-system-config.tar.gz
 ```
 
 **Benefits**:
@@ -183,10 +192,10 @@ See [System Configuration Usage Guide](docs/SYSTEM_CONFIG_USAGE.md) for details.
 }
 ```
 
-2. Submit the build:
+2. Request the build:
 
 ```bash
-./bin/portage-client \
+./bin/portage-client build \
   -config=my-config.json \
   -package=dev-lang/python \
   -version=3.11
@@ -196,83 +205,113 @@ See [System Configuration Usage Guide](docs/SYSTEM_CONFIG_USAGE.md) for details.
 
 ```bash
 # Create a configuration bundle without building
-./bin/portage-client \
+./bin/portage-client bundle \
   -config=my-config.json \
   -package=dev-lang/python \
-  -output=python-build.tar.gz
+  -out=python-build.tar.gz
 
 # Inspect the bundle
 tar -tzf python-build.tar.gz
 ```
 
-For more examples, see [docs/EXAMPLES.md](docs/EXAMPLES.md)
-
 ## Configuration
 
 ### Server Configuration
 
-Edit `configs/server.yaml`:
+Edit `configs/server.conf`:
 
-```yaml
-port: 8080
-binpkg_path: /var/cache/binpkgs
-max_workers: 5
-cloud_config:
-  default_provider: gcp
+```bash
+SERVER_PORT=8080
+BINPKG_PATH=/var/cache/binpkgs
+MAX_WORKERS=5
+CLOUD_DEFAULT_PROVIDER=gcp
+
+# Security (strongly recommended for production)
+API_KEY=your-api-key-here
+CORS_ALLOWED_ORIGINS=https://dashboard.example.com
 ```
 
 ### Dashboard Configuration
 
-Edit `configs/dashboard.yaml`:
+Edit `configs/dashboard.conf`:
 
-```yaml
-port: 8081
-server_url: http://localhost:8080
-auth_enabled: true
-allow_anonymous: true
+```bash
+DASHBOARD_PORT=8081
+SERVER_URL=http://localhost:8080
+AUTH_ENABLED=true
+# Generate with: openssl rand -hex 32
+JWT_SECRET=your-strong-secret-at-least-32-chars
+ALLOW_ANONYMOUS=false
 ```
 
 ### Client Configuration
 
-Edit `configs/client.conf`:
+The client is configured via flags (or environment variables); there is no
+config file. The server URL is passed with `-server`, and the API key with
+`-api-key` or the `PORTAGE_ENGINE_API_KEY` environment variable:
 
 ```bash
-PORTAGE_ENGINE_URL=http://your-server:8080
-CLOUD_PROVIDER=gcp
+export PORTAGE_ENGINE_API_KEY=your-api-key-here
+./bin/portage-client build -server=http://your-server:8080 -package=dev-lang/python
 ```
+
+The consume path is configured in Portage itself (see "Consuming packages"
+below), not in the client.
 
 ## Usage
 
 ### Starting the Server
 
 ```bash
-./bin/portage-server -config configs/server.yaml
+./bin/portage-server -config configs/server.conf
 ```
 
 ### Starting the Dashboard
 
 ```bash
-./bin/portage-dashboard -config configs/dashboard.yaml
+./bin/portage-dashboard -config configs/dashboard.conf
 ```
 
-### Client Usage
+### Consuming packages (the normal path)
+
+Portage consumes a binary host natively — there is no special client for
+installing. Point Portage at the server's binhost once, then use `emerge` as
+usual:
 
 ```bash
-# Configure portage integration
-sudo ./scripts/portage-client.sh configure
+# One-time: write /etc/portage/binrepos.conf/portage-engine.conf
+sudo ./bin/portage-client configure -server=http://your-server:8080
 
-# Install a package (query/build/install automatically)
-sudo ./scripts/portage-client.sh install gcc 13.2.0
-
-# Query package availability
-./scripts/portage-client.sh query gcc 13.2.0
-
-# Request a build
-./scripts/portage-client.sh build gcc 13.2.0
-
-# Check build status
-./scripts/portage-client.sh status <job-id>
+# Enable binary fetching (either flag per-invocation or FEATURES in make.conf)
+emerge --getbinpkg gcc
+#   or add to /etc/portage/make.conf:  FEATURES="getbinpkg"
 ```
+
+With `--getbinpkg`, emerge fetches the prebuilt (GPG-signed) package from the
+binhost when available and **falls back to a normal source build** when it is
+not. Signatures are verified by Portage itself (`verify-signature = true`).
+
+### Requesting a build (optional)
+
+Portage has no native "ask the binhost to build X" mechanism. When you want the
+server to build a package with specific USE flags, use the client's `build`
+subcommand (this is a request tool, not the install path):
+
+```bash
+# Request a build and wait for it to finish
+./bin/portage-client build -server=http://your-server:8080 \
+  -package=dev-lang/python -version=3.11 -use=ssl,threads -wait
+
+# Check a job later
+./bin/portage-client status -server=http://your-server:8080 -job=<job-id>
+
+# Generate a Portage config bundle from your system without building
+./bin/portage-client bundle -portage-dir=/etc/portage \
+  -package=dev-lang/python -out=python-bundle.tar.gz
+```
+
+Once the build completes, the package appears on the binhost and any client with
+`--getbinpkg` will pick it up.
 
 ## API Documentation
 
@@ -358,17 +397,17 @@ sudo ./scripts/portage-client.sh install gcc 13.2.0
 portage-engine/
 ├── cmd/
 │   ├── server/          # Server entry point
-│   └── dashboard/       # Dashboard entry point
+│   ├── dashboard/       # Dashboard entry point
+│   ├── builder/         # Builder daemon entry point
+│   └── client/          # Client CLI (configure / build / status / bundle)
 ├── internal/
-│   ├── server/          # Server implementation
-│   ├── binpkg/          # Binary package management
+│   ├── server/          # Server implementation (incl. /binpkgs binhost)
+│   ├── binpkg/          # Binary package store + Packages index generation
 │   ├── builder/         # Build management
 │   ├── iac/             # Infrastructure provisioning
 │   └── dashboard/       # Dashboard implementation
 ├── pkg/
 │   └── config/          # Configuration management
-├── scripts/
-│   └── portage-client.sh # Client script
 ├── configs/             # Configuration files
 ├── go.mod
 ├── go.sum
@@ -394,20 +433,24 @@ This project follows Google's Go code style guide:
 
 ### Docker Deployment
 
-```bash
-# Build Docker images
-docker build -t portage-engine-server -f Dockerfile.server .
-docker build -t portage-engine-dashboard -f Dockerfile.dashboard .
+A single multi-stage `Dockerfile` at the repository root builds all three
+binaries (server, dashboard, builder) into one Gentoo-based image:
 
-# Run with Docker Compose
-docker-compose up -d
+```bash
+# Build the image (contains portage-server, portage-dashboard, portage-builder)
+docker build -t portage-engine .
+
+# Or run the full example stack (server + two builders + dashboard)
+docker compose up -d
 ```
+
+See `docker-compose.yml` for a complete example that wires the server to two
+builders and the dashboard.
 
 ### Kubernetes Deployment
 
-```bash
-kubectl apply -f deployments/kubernetes/
-```
+Kubernetes manifests are not shipped yet (TODO). For now, deploy with Docker
+Compose (above) or run the binaries directly (see the Quick Start section).
 
 ## License
 

@@ -31,7 +31,12 @@ type LocalBuildRequest struct {
 }
 
 // BuildJob represents a build job with its status.
+//
+// The mutable fields (Status, Log, ArtifactURL, Error, EndTime, Metadata) are
+// written by the worker/executor goroutine while HTTP handler goroutines read
+// them, so all access must go through the mu-guarded helpers below.
 type BuildJob struct {
+	mu          sync.Mutex             `json:"-"`
 	ID          string                 `json:"id"`
 	Request     *LocalBuildRequest     `json:"request"`
 	Status      string                 `json:"status"` // queued, building, success, failed
@@ -41,6 +46,59 @@ type BuildJob struct {
 	ArtifactURL string                 `json:"artifact_url"`
 	Error       string                 `json:"error,omitempty"`
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// appendLog appends to the job log under the job lock.
+func (j *BuildJob) appendLog(s string) {
+	j.mu.Lock()
+	j.Log += s
+	j.mu.Unlock()
+}
+
+// setArtifactURL sets the artifact URL under the job lock.
+func (j *BuildJob) setArtifactURL(url string) {
+	j.mu.Lock()
+	j.ArtifactURL = url
+	j.mu.Unlock()
+}
+
+// setLog replaces the job log under the job lock.
+func (j *BuildJob) setLog(s string) {
+	j.mu.Lock()
+	j.Log = s
+	j.mu.Unlock()
+}
+
+// snapshot returns a copy of the status and artifact URL under the job lock.
+func (j *BuildJob) snapshot() (status, artifactURL string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.Status, j.ArtifactURL
+}
+
+// Clone returns a deep copy of the job (without the mutex) taken under the job
+// lock. Use this instead of copying a BuildJob by value, which would copy the
+// mutex.
+func (j *BuildJob) Clone() *BuildJob {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	c := &BuildJob{
+		ID:          j.ID,
+		Request:     j.Request,
+		Status:      j.Status,
+		StartTime:   j.StartTime,
+		EndTime:     j.EndTime,
+		Log:         j.Log,
+		ArtifactURL: j.ArtifactURL,
+		Error:       j.Error,
+	}
+	if j.Metadata != nil {
+		c.Metadata = make(map[string]interface{}, len(j.Metadata))
+		for k, v := range j.Metadata {
+			c.Metadata[k] = v
+		}
+	}
+	return c
 }
 
 // LocalBuilder handles build jobs locally using Docker or native builds.
@@ -125,7 +183,14 @@ func newLocalBuilderWithConfig(workers int, signer *gpg.Signer, cfg *config.Buil
 		} else {
 			lb.jobs = loadedJobs
 			log.Printf("Loaded %d persisted jobs", len(loadedJobs))
+			reconcileLoadedJobs(jobStore, loadedJobs)
 		}
+
+		// Construct the persister so job state actually survives restarts.
+		// Without this, saveJobState()/Stop() were no-ops (lb.persister was nil).
+		retention := time.Duration(cfg.RetentionDays) * 24 * time.Hour
+		lb.persister = NewJobPersister(jobStore, lb.jobsSnapshot, 30*time.Second, retention)
+		lb.persister.Start()
 	}
 
 	for i := 0; i < workers; i++ {
@@ -249,12 +314,12 @@ func initGPGClient(cfg *config.BuilderConfig) *GPGKeyClient {
 	return gpgClient
 }
 
-// syncGPGKey syncs GPG key from server.
+// syncGPGKey imports the server's public key so the builder can verify
+// server-signed material. It does NOT change cfg.GPGKeyID: that is the builder's
+// own signing key, and signing requires a private key (the server key is public
+// only). Overwriting it would break binpkg-signing.
 func syncGPGKey(gpgClient *GPGKeyClient, cfg *config.BuilderConfig) {
-	gpgKeyPath := cfg.GPGKeyPath
-	if gpgKeyPath == "" {
-		gpgKeyPath = filepath.Join(cfg.GPGHome, "server-public.asc")
-	}
+	gpgKeyPath := filepath.Join(cfg.GPGHome, "server-public.asc")
 
 	if err := gpgClient.FetchAndImportGPGKey(gpgKeyPath); err != nil {
 		log.Printf("Failed to sync GPG key from server: %v", err)
@@ -263,12 +328,11 @@ func syncGPGKey(gpgClient *GPGKeyClient, cfg *config.BuilderConfig) {
 
 	keyID, err := gpgClient.GetKeyID(gpgKeyPath)
 	if err != nil {
-		log.Printf("Failed to get GPG key ID: %v", err)
+		log.Printf("Failed to get server GPG key ID: %v", err)
 		return
 	}
 
-	cfg.GPGKeyID = keyID
-	log.Printf("GPG key synced from server: %s", keyID)
+	log.Printf("Imported server GPG public key for verification: %s", keyID)
 }
 
 // initStorageUploader initializes the storage uploader if configured.
@@ -299,18 +363,49 @@ func initStorageUploader(cfg *config.BuilderConfig) *StorageUploader {
 	return uploader
 }
 
+// containerGnupgHome is where the signing key's GNUPGHOME is mounted inside the
+// build container for the config-bundle executor path.
+const containerGnupgHome = "/gpg-signing"
+
+// buildOptionsFromConfig derives the executor's format/signing options from the
+// builder config. Native binpkg signing is enabled only when GPG is enabled and
+// a key ID is configured, and only for the (signable) gpkg format. forDocker
+// selects the in-container GNUPGHOME path (the keyring is bind-mounted) vs the
+// real host path used by the native executor.
+func buildOptionsFromConfig(cfg *config.BuilderConfig, forDocker bool) BuildOptions {
+	format := "gpkg"
+	if cfg != nil && cfg.BinpkgFormat != "" {
+		format = cfg.BinpkgFormat
+	}
+	opts := BuildOptions{Format: format}
+	if cfg != nil && cfg.GPGEnabled && cfg.GPGKeyID != "" && format != "xpak" {
+		opts.SignKeyID = cfg.GPGKeyID
+		opts.SignHostGnupgHome = cfg.GPGHome
+		if forDocker {
+			// The Docker executor bind-mounts the host keyring into the container
+			// at containerGnupgHome; emerge inside the container reads it there.
+			opts.SignGnupgHome = containerGnupgHome
+		} else {
+			// The native executor runs emerge directly on the host, so it must
+			// point BINPKG_GPG_SIGNING_GPG_HOME at the real host keyring.
+			opts.SignGnupgHome = cfg.GPGHome
+		}
+	}
+	return opts
+}
+
 // initBuildExecutor initializes the build executor.
 func initBuildExecutor(cfg *config.BuilderConfig, _ ContainerRuntime, _ string) *BuildExecutor {
 	workDir := getWorkDir(cfg)
 	artifactDir := getArtifactDir(cfg)
-	return NewBuildExecutor(workDir, artifactDir)
+	return NewBuildExecutorWithOptions(workDir, artifactDir, buildOptionsFromConfig(cfg, false))
 }
 
 // initDockerExecutor initializes the Docker build executor.
 func initDockerExecutor(cfg *config.BuilderConfig, containerRuntime ContainerRuntime, dockerImage string) *DockerBuildExecutor {
 	workDir := getWorkDir(cfg)
 	artifactDir := getArtifactDir(cfg)
-	return NewDockerBuildExecutor(workDir, artifactDir, dockerImage, containerRuntime)
+	return NewDockerBuildExecutorWithOptions(workDir, artifactDir, dockerImage, containerRuntime, buildOptionsFromConfig(cfg, true))
 }
 
 // initPackageManager initializes the package manager.
@@ -345,6 +440,34 @@ func initJobStore(cfg *config.BuilderConfig) *JobStore {
 	return jobStore
 }
 
+// reconcileLoadedJobs marks any persisted jobs that were left in the
+// "building" state (e.g. due to a crash) as "failed", since the build
+// process did not survive the restart. The reconciled state is persisted.
+func reconcileLoadedJobs(jobStore *JobStore, jobs map[string]*BuildJob) {
+	reconciled := 0
+	for _, job := range jobs {
+		if job.Status == "building" || job.Status == "queued" {
+			job.Status = "failed"
+			if job.Error == "" {
+				job.Error = "build interrupted by builder restart"
+			}
+			if job.EndTime.IsZero() {
+				job.EndTime = time.Now()
+			}
+			reconciled++
+		}
+	}
+
+	if reconciled == 0 {
+		return
+	}
+
+	log.Printf("Reconciled %d interrupted job(s) to failed on startup", reconciled)
+	if err := jobStore.Save(jobs); err != nil {
+		log.Printf("Failed to persist reconciled jobs: %v", err)
+	}
+}
+
 // generateInstanceID generates or retrieves the instance ID.
 func generateInstanceID(cfg *config.BuilderConfig) string {
 	if cfg != nil && cfg.InstanceID != "" {
@@ -368,6 +491,14 @@ func getArchitecture(cfg *config.BuilderConfig) string {
 
 // SubmitBuild submits a new build job.
 func (lb *LocalBuilder) SubmitBuild(req *LocalBuildRequest) (string, error) {
+	// Validate every untrusted field before the request can reach any build
+	// path (the legacy Docker shell script, the native emerge argv, or the
+	// config-bundle executor). This is the single choke point that closes shell
+	// injection and emerge option injection.
+	if err := validateLocalBuildRequest(req); err != nil {
+		return "", fmt.Errorf("invalid build request: %w", err)
+	}
+
 	jobID := uuid.New().String()
 
 	job := &BuildJob{
@@ -382,9 +513,17 @@ func (lb *LocalBuilder) SubmitBuild(req *LocalBuildRequest) (string, error) {
 	lb.jobs[jobID] = job
 	lb.jobsMutex.Unlock()
 
-	lb.jobQueue <- job
-
-	return jobID, nil
+	// Non-blocking send: if the queue is full, reject the job instead of
+	// blocking the calling (HTTP handler) goroutine indefinitely.
+	select {
+	case lb.jobQueue <- job:
+		return jobID, nil
+	default:
+		lb.jobsMutex.Lock()
+		delete(lb.jobs, jobID)
+		lb.jobsMutex.Unlock()
+		return "", fmt.Errorf("builder queue full")
+	}
 }
 
 // GetJobStatus returns the status of a build job.
@@ -397,7 +536,9 @@ func (lb *LocalBuilder) GetJobStatus(jobID string) (*BuildJob, error) {
 		return nil, fmt.Errorf("job not found: %s", jobID)
 	}
 
-	return job, nil
+	// Return a clone so callers (e.g. JSON-encoding HTTP handlers) never read
+	// the live job's mutable fields while the worker is writing them.
+	return job.Clone(), nil
 }
 
 // ListJobs returns all build jobs.
@@ -407,10 +548,24 @@ func (lb *LocalBuilder) ListJobs() []*BuildJob {
 
 	jobs := make([]*BuildJob, 0, len(lb.jobs))
 	for _, job := range lb.jobs {
-		jobs = append(jobs, job)
+		// Clone so concurrent worker writes don't race the caller's reads.
+		jobs = append(jobs, job.Clone())
 	}
 
 	return jobs
+}
+
+// jobsSnapshot returns a deep copy of the jobs map for persistence. Clone()
+// copies each job's fields under its lock (without the mutex), so this is safe
+// to call while workers are mutating jobs.
+func (lb *LocalBuilder) jobsSnapshot() map[string]*BuildJob {
+	lb.jobsMutex.RLock()
+	defer lb.jobsMutex.RUnlock()
+	out := make(map[string]*BuildJob, len(lb.jobs))
+	for k, v := range lb.jobs {
+		out[k] = v.Clone()
+	}
+	return out
 }
 
 // Shutdown gracefully shuts down the builder and persists jobs.
@@ -488,9 +643,13 @@ func (lb *LocalBuilder) worker(id int) {
 	for job := range lb.jobQueue {
 		log.Printf("Worker %d processing job %s", id, job.ID)
 
-		lb.jobsMutex.Lock()
+		job.mu.Lock()
 		job.Status = "building"
-		lb.jobsMutex.Unlock()
+		job.mu.Unlock()
+
+		// Persist the "building" transition so a crash mid-build can be
+		// reconciled on the next startup instead of leaving a stuck job.
+		lb.saveJobState()
 
 		var err error
 		// Check if this is a new-style config bundle build
@@ -505,7 +664,7 @@ func (lb *LocalBuilder) worker(id int) {
 			}
 		}
 
-		lb.jobsMutex.Lock()
+		job.mu.Lock()
 		job.EndTime = time.Now()
 		if err != nil {
 			job.Status = "failed"
@@ -519,7 +678,7 @@ func (lb *LocalBuilder) worker(id int) {
 			job.Status = "success"
 			log.Printf("Worker %d: Job %s completed successfully", id, job.ID)
 		}
-		lb.jobsMutex.Unlock()
+		job.mu.Unlock()
 
 		// Persist job state immediately after completion
 		lb.saveJobState()
@@ -584,7 +743,7 @@ func (lb *LocalBuilder) generateBuildScript(pkgAtom string, useFlags string, gpg
 	features := "buildpkg"
 	gpgSetup := ""
 	if gpgKeyID != "" {
-		features = "buildpkg binpkg-signing"
+		features = "buildpkg binpkg-signing gpg-keepalive"
 		gpgSetup = fmt.Sprintf(`
 # Setup GPG for package signing with secret key
 export GNUPGHOME=/root/.gnupg
@@ -606,9 +765,10 @@ fi
 gpg --batch --yes --list-keys
 echo -e "5\ny\n" | gpg --batch --yes --command-fd 0 --edit-key "%s" trust quit 2>/dev/null || true
 
-# Configure portage for GPG signing
+# Configure portage for GPG signing (GPKG is the only signable format)
 cat >> /etc/portage/make.conf << 'GPGEOF'
-FEATURES="${FEATURES} binpkg-signing"
+FEATURES="${FEATURES} binpkg-signing gpg-keepalive"
+BINPKG_FORMAT="gpkg"
 BINPKG_GPG_SIGNING_GPG_HOME="/root/.gnupg"
 BINPKG_GPG_SIGNING_KEY="%s"
 GPGEOF
@@ -783,7 +943,7 @@ func (lb *LocalBuilder) runDockerBuild(job *BuildJob, args []string) error {
 	defer cancel()
 
 	output, err := lb.containerRuntime.Run(ctx, args)
-	job.Log = string(output)
+	job.setLog(string(output))
 
 	if err != nil {
 		log.Printf("Container build failed for job %s: %v", job.ID, err)
@@ -810,7 +970,7 @@ func (lb *LocalBuilder) collectAndUploadArtifact(job *BuildJob, outputDir string
 		return err
 	}
 
-	job.ArtifactURL = destPath
+	job.setArtifactURL(destPath)
 
 	lb.signArtifact(job, destPath)
 	lb.uploadArtifact(job, destPath)
@@ -880,7 +1040,7 @@ func (lb *LocalBuilder) uploadArtifact(job *BuildJob, artifactPath string) {
 			log.Printf("Warning: failed to upload artifact to storage: %v", err)
 		} else {
 			uploadedURL, _ := lb.storageUpload.GetURL(remotePath)
-			job.ArtifactURL = uploadedURL
+			job.setArtifactURL(uploadedURL)
 			job.Metadata["uploaded"] = true
 			log.Printf("Artifact uploaded to storage: %s", uploadedURL)
 		}
@@ -911,7 +1071,7 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 		return err
 	}
 
-	job.ArtifactURL = destPath
+	job.setArtifactURL(destPath)
 
 	lb.signArtifact(job, destPath)
 	lb.uploadArtifact(job, destPath)
@@ -959,7 +1119,7 @@ func (lb *LocalBuilder) runNativeBuild(job *BuildJob, pkgAtom string, env []stri
 	cmd.Dir = workDir
 
 	output, err := cmd.CombinedOutput()
-	job.Log = string(output)
+	job.setLog(string(output))
 
 	if err != nil {
 		return fmt.Errorf("build failed: %w", err)
@@ -1087,20 +1247,21 @@ func (lb *LocalBuilder) GetArtifactPath(jobID string) (string, error) {
 		return "", fmt.Errorf("job not found: %s", jobID)
 	}
 
-	if job.Status != "success" {
-		return "", fmt.Errorf("job not completed successfully: status=%s", job.Status)
+	status, artifactURL := job.snapshot()
+	if status != "success" {
+		return "", fmt.Errorf("job not completed successfully: status=%s", status)
 	}
 
-	if job.ArtifactURL == "" {
+	if artifactURL == "" {
 		return "", fmt.Errorf("no artifact available for job: %s", jobID)
 	}
 
 	// Check if ArtifactURL is a local file path
-	if _, err := os.Stat(job.ArtifactURL); err != nil {
-		return "", fmt.Errorf("artifact file not found: %s", job.ArtifactURL)
+	if _, err := os.Stat(artifactURL); err != nil {
+		return "", fmt.Errorf("artifact file not found: %s", artifactURL)
 	}
 
-	return job.ArtifactURL, nil
+	return artifactURL, nil
 }
 
 // ArtifactInfo contains metadata about a build artifact.
@@ -1123,24 +1284,25 @@ func (lb *LocalBuilder) GetArtifactInfo(jobID string) (*ArtifactInfo, error) {
 		return nil, fmt.Errorf("job not found: %s", jobID)
 	}
 
-	if job.Status != "success" {
-		return nil, fmt.Errorf("job not completed successfully: status=%s", job.Status)
+	status, artifactURL := job.snapshot()
+	if status != "success" {
+		return nil, fmt.Errorf("job not completed successfully: status=%s", status)
 	}
 
-	if job.ArtifactURL == "" {
+	if artifactURL == "" {
 		return nil, fmt.Errorf("no artifact available for job: %s", jobID)
 	}
 
 	// Get file info
-	fileInfo, err := os.Stat(job.ArtifactURL)
+	fileInfo, err := os.Stat(artifactURL)
 	if err != nil {
-		return nil, fmt.Errorf("artifact file not found: %s", job.ArtifactURL)
+		return nil, fmt.Errorf("artifact file not found: %s", artifactURL)
 	}
 
 	return &ArtifactInfo{
 		JobID:       jobID,
-		FileName:    filepath.Base(job.ArtifactURL),
-		FilePath:    job.ArtifactURL,
+		FileName:    filepath.Base(artifactURL),
+		FilePath:    artifactURL,
 		FileSize:    fileInfo.Size(),
 		PackageName: job.Request.PackageName,
 		Version:     job.Request.Version,

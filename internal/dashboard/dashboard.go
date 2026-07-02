@@ -2,6 +2,7 @@
 package dashboard
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -40,6 +41,7 @@ func New(cfg *config.DashboardConfig) *Dashboard {
 	template.Must(tmpl.New("logs").Parse(logsHTML))
 	template.Must(tmpl.New("monitor").Parse(monitorHTML))
 	template.Must(tmpl.New("docs").Parse(docsHTML))
+	template.Must(tmpl.New("builds").Parse(buildsHTML))
 
 	return &Dashboard{
 		config:     cfg,
@@ -111,18 +113,50 @@ func (d *Dashboard) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleLogin handles user authentication.
+// handleLogin validates operator credentials and issues a signed JWT.
 func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// In production, this would validate credentials and issue JWT
+	// When authentication is disabled there is nothing to log in to.
+	if !d.config.AuthEnabled {
+		http.Error(w, "authentication is disabled", http.StatusNotFound)
+		return
+	}
+
+	var creds struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Constant-time credential check against the configured admin account.
+	userOK := subtle.ConstantTimeCompare([]byte(creds.Username), []byte(d.config.AdminUser)) == 1
+	passOK := subtle.ConstantTimeCompare([]byte(creds.Password), []byte(d.config.AdminPassword)) == 1
+	if d.config.AdminUser == "" || d.config.AdminPassword == "" || !userOK || !passOK {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	ttl := time.Duration(d.config.TokenTTLMinutes) * time.Minute
+	if ttl <= 0 {
+		ttl = 12 * time.Hour
+	}
+	token, err := signToken(d.config.JWTSecret, creds.Username, time.Now(), ttl)
+	if err != nil {
+		http.Error(w, "failed to issue token", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"token": "sample-jwt-token",
-		"user":  "admin",
+		"token": token,
+		"user":  creds.Username,
 	})
 }
 
@@ -131,7 +165,7 @@ func (d *Dashboard) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	// Query the server for current status
 	status, err := d.fetchClusterStatus()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeBackendError(w, err)
 		return
 	}
 
@@ -153,32 +187,13 @@ func (d *Dashboard) handleBuilds(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Query the server for build list
+	// Query the server for build list. On failure, report the outage honestly
+	// rather than fabricating sample builds (which would hide a real outage).
 	url := fmt.Sprintf("%s/api/v1/builds/list?limit=%d", d.config.ServerURL, limit)
-	resp, err := d.httpClient.Get(url)
+	resp, err := d.serverGet(url)
 	if err != nil {
 		log.Printf("Failed to query builds: %v", err)
-		// Return sample data on error
-		builds := []map[string]interface{}{
-			{
-				"job_id":       "sample-job-1",
-				"package_name": "gcc",
-				"version":      "13.2.0",
-				"arch":         "x86_64",
-				"status":       "building",
-				"created_at":   time.Now().Add(-10 * time.Minute).Format(time.RFC3339),
-			},
-			{
-				"job_id":       "sample-job-2",
-				"package_name": "python",
-				"version":      "3.11.5",
-				"arch":         "x86_64",
-				"status":       "queued",
-				"created_at":   time.Now().Add(-5 * time.Minute).Format(time.RFC3339),
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(builds)
+		writeBackendError(w, err)
 		return
 	}
 	defer func() {
@@ -192,19 +207,12 @@ func (d *Dashboard) handleBuilds(w http.ResponseWriter, r *http.Request) {
 
 // handleInstances returns the list of active instances.
 func (d *Dashboard) handleInstances(w http.ResponseWriter, _ *http.Request) {
-	// In production, this would query the server for instance list
-	instances := []map[string]interface{}{
-		{
-			"id":         "gcp-12345678",
-			"provider":   "gcp",
-			"status":     "running",
-			"ip_address": "10.0.1.100",
-			"arch":       "amd64",
-		},
-	}
-
+	// The server does not currently expose an instance-list endpoint, so return
+	// an empty list rather than fabricating a fake running instance (which would
+	// mislead operators into thinking cloud capacity exists when it may not).
+	// Registered builders are available via /api/builders/status.
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(instances)
+	_ = json.NewEncoder(w).Encode([]map[string]interface{}{})
 }
 
 // handleBuildsPage serves the builds list page.
@@ -253,21 +261,10 @@ func (d *Dashboard) handleBuildDetailAPI(w http.ResponseWriter, r *http.Request)
 	}
 
 	url := fmt.Sprintf("%s/api/v1/builds/status?job_id=%s", d.config.ServerURL, jobID)
-	resp, err := d.httpClient.Get(url)
+	resp, err := d.serverGet(url)
 	if err != nil {
 		log.Printf("Failed to query build detail: %v", err)
-		sampleDetail := map[string]interface{}{
-			"job_id":       jobID,
-			"package_name": "dev-lang/python",
-			"version":      "3.11.5",
-			"status":       "building",
-			"builder_node": "builder-node-1",
-			"builder_url":  "http://builder-node-1:9090",
-			"created_at":   time.Now().Add(-15 * time.Minute).Format(time.RFC3339),
-			"started_at":   time.Now().Add(-10 * time.Minute).Format(time.RFC3339),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(sampleDetail)
+		writeBackendError(w, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -285,15 +282,10 @@ func (d *Dashboard) handleBuildLogsAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	url := fmt.Sprintf("%s/api/v1/builds/logs?job_id=%s", d.config.ServerURL, jobID)
-	resp, err := d.httpClient.Get(url)
+	resp, err := d.serverGet(url)
 	if err != nil {
 		log.Printf("Failed to query build logs: %v", err)
-		sampleLogs := map[string]interface{}{
-			"job_id": jobID,
-			"logs":   "Compiling...\nBuilding package...\n",
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(sampleLogs)
+		writeBackendError(w, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -323,133 +315,72 @@ func (d *Dashboard) handleDocs(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-// handlePublicKeyAPI returns the public key in PEM format.
+// fetchServerPublicKey retrieves the server's real GPG public key (armored).
+func (d *Dashboard) fetchServerPublicKey() (string, error) {
+	resp, err := d.serverGet(d.config.ServerURL + "/api/v1/gpg/public-key")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	key, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(key), nil
+}
+
+// handlePublicKeyAPI returns the server's real GPG public key.
 func (d *Dashboard) handlePublicKeyAPI(w http.ResponseWriter, _ *http.Request) {
-	// In production, this would retrieve the actual public key from server
-	publicKey := `-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2a2rwplJu7T5gxWJdLKD
-9WnzlqjFa/L2T2E7L4O7MhQ9K8rVqJuKvB1Z3sJ8F2D4qK3L1MqP9K5PvQ2L8Z3X
-4M7L9Y6Q1J3M2NvR6I7S8Z9T5K4L0Q3M1NwS7J8T6I8U9Z0V6K5M2PxT8K9U7J1
-V7L6M3QyU9L0V8M2R0W7N4S1X0M3S1Y1N5T2Z2O4U3a3O6U4b4P7V5c5P8W6d6Q
-9X7e7Q0Y8f8R1Z9g9S2a0h0T3b1i1U4c2j2V5d3k3W6e4l4X7f5m5Y8g6n6Z9h7
-oEIDAQAB
------END PUBLIC KEY-----`
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"key_id":     "portage-engine-2024",
-		"algorithm":  "RSA-2048",
-		"format":     "PEM",
-		"public_key": publicKey,
-	})
-}
-
-// handleDownloadKeyAPI handles downloading the public key file.
-func (d *Dashboard) handleDownloadKeyAPI(w http.ResponseWriter, r *http.Request) {
-	format := r.URL.Query().Get("format")
-	if format == "" {
-		format = "pem"
+	key, err := d.fetchServerPublicKey()
+	if err != nil {
+		writeBackendError(w, err)
+		return
 	}
-
-	// In production, this would retrieve the actual public key from server
-	publicKey := `-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2a2rwplJu7T5gxWJdLKD
-9WnzlqjFa/L2T2E7L4O7MhQ9K8rVqJuKvB1Z3sJ8F2D4qK3L1MqP9K5PvQ2L8Z3X
-4M7L9Y6Q1J3M2NvR6I7S8Z9T5K4L0Q3M1NwS7J8T6I8U9Z0V6K5M2PxT8K9U7J1
-V7L6M3QyU9L0V8M2R0W7N4S1X0M3S1Y1N5T2Z2O4U3a3O6U4b4P7V5c5P8W6d6Q
-9X7e7Q0Y8f8R1Z9g9S2a0h0T3b1i1U4c2j2V5d3k3W6e4l4X7f5m5Y8g6n6Z9h7
-oEIDAQAB
------END PUBLIC KEY-----`
-
-	filename := fmt.Sprintf("portage-public-key.%s", format)
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(publicKey)))
-	_, _ = w.Write([]byte(publicKey))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"public_key": key})
 }
 
-// handleKeyInfoAPI returns information about the public key.
+// handleDownloadKeyAPI serves the server's real GPG public key as a download.
+func (d *Dashboard) handleDownloadKeyAPI(w http.ResponseWriter, _ *http.Request) {
+	key, err := d.fetchServerPublicKey()
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/pgp-keys")
+	w.Header().Set("Content-Disposition", `attachment; filename="portage-engine.asc"`)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(key)))
+	_, _ = w.Write([]byte(key))
+}
+
+// handleKeyInfoAPI returns whether a signing key is available on the server.
+// It reports the real key's presence rather than fabricated metadata.
 func (d *Dashboard) handleKeyInfoAPI(w http.ResponseWriter, _ *http.Request) {
-	keyInfo := map[string]interface{}{
-		"key_id":      "portage-engine-2024",
-		"algorithm":   "RSA-2048",
-		"format":      "PEM",
-		"fingerprint": "SHA256:ABC123DEF456GHI789JKL012MNO345PQR678STU901VWX",
-		"created_at":  "2024-01-01T00:00:00Z",
-		"expires_at":  "2025-12-31T23:59:59Z",
-		"usage":       "Package signing and verification",
+	key, err := d.fetchServerPublicKey()
+	if err != nil {
+		writeBackendError(w, err)
+		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(keyInfo)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"available":  key != "",
+		"format":     "OpenPGP (armored)",
+		"public_key": key,
+		"usage":      "Package signing and verification",
+	})
 }
 
 // handleBuildersStatusAPI returns builders status from the server.
 func (d *Dashboard) handleBuildersStatusAPI(w http.ResponseWriter, _ *http.Request) {
 	url := fmt.Sprintf("%s/api/v1/builders/status", d.config.ServerURL)
-	resp, err := d.httpClient.Get(url)
+	resp, err := d.serverGet(url)
 	if err != nil {
 		log.Printf("Failed to query builders status: %v", err)
-		// Return sample data on error
-		sampleData := map[string]interface{}{
-			"stats": map[string]interface{}{
-				"total_builders":   3,
-				"online_builders":  2,
-				"offline_builders": 1,
-				"total_capacity":   10,
-				"total_load":       5,
-				"success_rate":     92.5,
-			},
-			"builders": []map[string]interface{}{
-				{
-					"id":             "builder-1",
-					"endpoint":       "http://localhost:9090",
-					"architecture":   "amd64",
-					"status":         "online",
-					"capacity":       4,
-					"current_load":   2,
-					"enabled":        true,
-					"cpu_usage":      45.2,
-					"memory_usage":   62.8,
-					"disk_usage":     55.3,
-					"total_builds":   150,
-					"success_builds": 142,
-					"failed_builds":  8,
-				},
-				{
-					"id":             "builder-2",
-					"endpoint":       "http://localhost:9091",
-					"architecture":   "arm64",
-					"status":         "online",
-					"capacity":       2,
-					"current_load":   1,
-					"enabled":        true,
-					"cpu_usage":      30.5,
-					"memory_usage":   48.2,
-					"disk_usage":     42.7,
-					"total_builds":   85,
-					"success_builds": 80,
-					"failed_builds":  5,
-				},
-				{
-					"id":             "builder-3",
-					"endpoint":       "http://localhost:9092",
-					"architecture":   "amd64",
-					"status":         "offline",
-					"capacity":       4,
-					"current_load":   0,
-					"enabled":        false,
-					"cpu_usage":      0.0,
-					"memory_usage":   0.0,
-					"disk_usage":     0.0,
-					"total_builds":   200,
-					"success_builds": 185,
-					"failed_builds":  15,
-				},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(sampleData)
+		writeBackendError(w, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -461,7 +392,7 @@ func (d *Dashboard) handleBuildersStatusAPI(w http.ResponseWriter, _ *http.Reque
 // handleSchedulerStatus returns scheduler and task assignment status.
 func (d *Dashboard) handleSchedulerStatus(w http.ResponseWriter, _ *http.Request) {
 	url := fmt.Sprintf("%s/api/v1/scheduler/status", d.config.ServerURL)
-	resp, err := d.httpClient.Get(url)
+	resp, err := d.serverGet(url)
 	if err != nil {
 		log.Printf("Failed to query scheduler status: %v", err)
 		sampleStatus := map[string]interface{}{
@@ -552,7 +483,7 @@ func (d *Dashboard) handleArtifactInfo(w http.ResponseWriter, r *http.Request) {
 
 	// Proxy request to server
 	infoURL := fmt.Sprintf("%s/api/v1/artifacts/info/%s", d.config.ServerURL, jobID)
-	resp, err := d.httpClient.Get(infoURL)
+	resp, err := d.serverGet(infoURL)
 	if err != nil {
 		log.Printf("Failed to get artifact info: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to contact server: %v", err), http.StatusBadGateway)
@@ -587,7 +518,7 @@ func (d *Dashboard) handleArtifactDownload(w http.ResponseWriter, r *http.Reques
 
 	// Proxy request to server
 	downloadURL := fmt.Sprintf("%s/api/v1/artifacts/download/%s", d.config.ServerURL, jobID)
-	resp, err := d.httpClient.Get(downloadURL)
+	resp, err := d.serverGet(downloadURL)
 	if err != nil {
 		log.Printf("Failed to download artifact: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to contact server: %v", err), http.StatusBadGateway)
@@ -614,18 +545,12 @@ func (d *Dashboard) handleArtifactDownload(w http.ResponseWriter, r *http.Reques
 
 // fetchClusterStatus fetches cluster status from the server.
 func (d *Dashboard) fetchClusterStatus() (*ClusterStatus, error) {
-	resp, err := d.httpClient.Get(fmt.Sprintf("%s/api/v1/cluster/status", d.config.ServerURL))
+	resp, err := d.serverGet(fmt.Sprintf("%s/api/v1/cluster/status", d.config.ServerURL))
 	if err != nil {
-		// Return sample data on error
+		// Surface the outage to the caller instead of returning fabricated
+		// "healthy" numbers that would mask a backend outage.
 		log.Printf("Failed to fetch cluster status: %v", err)
-		return &ClusterStatus{
-			ActiveBuilds:    2,
-			QueuedBuilds:    5,
-			ActiveInstances: 3,
-			TotalBuilds:     127,
-			SuccessRate:     94.5,
-			LastUpdated:     time.Now(),
-		}, nil
+		return nil, err
 	}
 	defer func() {
 		_ = resp.Body.Close()
@@ -639,30 +564,74 @@ func (d *Dashboard) fetchClusterStatus() (*ClusterStatus, error) {
 	return &status, nil
 }
 
-// authMiddleware handles authentication.
+// authMiddleware verifies the bearer JWT on every request except the login and
+// index pages (the index page must load so a user can reach the login form).
 func (d *Dashboard) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for login endpoint
-		if r.URL.Path == "/login" {
+		// The login endpoint and the static assets/index needed to render the
+		// login form must be reachable without a token.
+		if r.URL.Path == "/login" || r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/static/") {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Allow anonymous access if enabled
-		if d.config.AllowAnonymous && r.Header.Get("Authorization") == "" {
+		token := extractBearer(r.Header.Get("Authorization"))
+
+		// Allow anonymous access if enabled and no token was presented.
+		if d.config.AllowAnonymous && token == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// In production, validate JWT token
-		token := r.Header.Get("Authorization")
 		if token == "" {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
+		if err := verifyToken(d.config.JWTSecret, token, time.Now()); err != nil {
+			http.Error(w, "Unauthorized: invalid or expired token", http.StatusUnauthorized)
+			return
+		}
+
 		next.ServeHTTP(w, r)
 	})
+}
+
+// writeBackendError reports that the backend server is unreachable/unhealthy as
+// an honest HTTP 502, instead of returning fabricated data that would make an
+// outage look like a healthy cluster.
+func writeBackendError(w http.ResponseWriter, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadGateway)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error":   "backend server unreachable",
+		"details": err.Error(),
+	})
+}
+
+// serverGet issues a GET to the backend server, attaching the configured
+// server API key so the dashboard works against a secured server.
+func (d *Dashboard) serverGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if d.config.ServerAPIKey != "" {
+		req.Header.Set("X-API-Key", d.config.ServerAPIKey)
+	}
+	return d.httpClient.Do(req)
+}
+
+// extractBearer returns the token from an "Authorization: Bearer <token>"
+// header, or the raw header value if it has no Bearer prefix (backward compat).
+func extractBearer(header string) string {
+	if header == "" {
+		return ""
+	}
+	if strings.HasPrefix(header, "Bearer ") {
+		return strings.TrimPrefix(header, "Bearer ")
+	}
+	return header
 }
 
 // loggingMiddleware provides request logging.
@@ -1132,6 +1101,110 @@ const buildDetailHTML = `<!DOCTYPE html>
             loadBuildDetail();
             loadLogsPreview();
         }, 5000);
+    </script>
+</body>
+</html>`
+
+// buildsHTML is the page listing all build jobs.
+const buildsHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <title>{{.Title}} - Portage Engine</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .header h1 { color: #333; margin-bottom: 10px; }
+        .header .nav { margin-top: 15px; }
+        .header .nav a { color: #0066cc; text-decoration: none; margin-right: 20px; }
+        .header .nav a:hover { text-decoration: underline; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #eee; font-size: 14px; }
+        th { color: #666; font-size: 12px; text-transform: uppercase; }
+        td a { color: #0066cc; text-decoration: none; }
+        .status-badge { display: inline-block; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+        .status-queued { background: #fff3cd; color: #856404; }
+        .status-building, .status-forwarding, .status-provisioning { background: #cce5ff; color: #004085; }
+        .status-success, .status-completed { background: #d4edda; color: #155724; }
+        .status-failed { background: #f8d7da; color: #721c24; }
+        .empty { color: #999; padding: 20px; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Build Jobs</h1>
+            <div class="nav">
+                <a href="/">← Back to Dashboard</a>
+                <a href="/monitor">Cluster Monitor</a>
+                <a href="/docs">📚 Documentation</a>
+            </div>
+        </div>
+        <div class="card">
+            <table>
+                <thead>
+                    <tr><th>Job ID</th><th>Package</th><th>Version</th><th>Arch</th><th>Status</th><th>Updated</th></tr>
+                </thead>
+                <tbody id="builds-body">
+                    <tr><td colspan="6" class="empty">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+        // cell creates a <td> whose text is set safely (no HTML injection).
+        function cell(text) {
+            var td = document.createElement('td');
+            td.textContent = text == null ? '' : String(text);
+            return td;
+        }
+        async function loadBuilds() {
+            const body = document.getElementById('builds-body');
+            try {
+                const resp = await fetch('/api/builds');
+                const builds = await resp.json();
+                body.replaceChildren();
+                if (!builds || builds.length === 0) {
+                    var er = document.createElement('tr');
+                    var ec = document.createElement('td');
+                    ec.colSpan = 6; ec.className = 'empty'; ec.textContent = 'No build jobs yet';
+                    er.appendChild(ec); body.appendChild(er);
+                    return;
+                }
+                builds.forEach(function(b) {
+                    var tr = document.createElement('tr');
+                    // Job ID as a link (id/text set via properties, not HTML).
+                    var idTd = document.createElement('td');
+                    var a = document.createElement('a');
+                    a.href = '/build/' + encodeURIComponent(b.job_id || '');
+                    a.textContent = b.job_id || '';
+                    idTd.appendChild(a);
+                    tr.appendChild(idTd);
+                    tr.appendChild(cell(b.package_name));
+                    tr.appendChild(cell(b.version));
+                    tr.appendChild(cell(b.arch));
+                    var stTd = document.createElement('td');
+                    var badge = document.createElement('span');
+                    badge.className = 'status-badge status-' + (b.status || 'queued');
+                    badge.textContent = b.status || '';
+                    stTd.appendChild(badge);
+                    tr.appendChild(stTd);
+                    tr.appendChild(cell(b.updated_at ? new Date(b.updated_at).toLocaleString() : ''));
+                    body.appendChild(tr);
+                });
+            } catch (err) {
+                body.replaceChildren();
+                var tr = document.createElement('tr');
+                var td = document.createElement('td');
+                td.colSpan = 6; td.className = 'empty'; td.textContent = 'Failed to load builds';
+                tr.appendChild(td); body.appendChild(tr);
+                console.error('Failed to load builds:', err);
+            }
+        }
+        loadBuilds();
+        setInterval(loadBuilds, 5000);
     </script>
 </body>
 </html>`

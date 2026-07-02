@@ -226,8 +226,9 @@ func TestApplyConfigToSystem(t *testing.T) {
 		}
 	}
 
-	// Check make.conf
-	makeConfPath := filepath.Join(portageDir, "make.conf.d", "00-user")
+	// Check make.conf — overrides are appended to the real make.conf file
+	// (Portage does not source make.conf.d/).
+	makeConfPath := filepath.Join(portageDir, "make.conf")
 	if _, err := os.Stat(makeConfPath); os.IsNotExist(err) {
 		t.Errorf("make.conf file not created: %s", makeConfPath)
 	} else {

@@ -71,7 +71,8 @@ func (g *GentooPackageManager) Name() string {
 
 // InstallCommand returns the emerge install command.
 func (g *GentooPackageManager) InstallCommand(pkg string, options []string) []string {
-	cmd := []string{"emerge", "--ask=n", "--verbose"}
+	cmd := make([]string, 0, 3+len(options)+1)
+	cmd = append(cmd, "emerge", "--ask=n", "--verbose")
 	cmd = append(cmd, options...)
 	cmd = append(cmd, pkg)
 	return cmd
@@ -79,7 +80,8 @@ func (g *GentooPackageManager) InstallCommand(pkg string, options []string) []st
 
 // BuildCommand returns the emerge build command with binary package output.
 func (g *GentooPackageManager) BuildCommand(pkg string, options []string) []string {
-	cmd := []string{"emerge", "--ask=n", "--verbose", "--buildpkg", "--usepkg"}
+	cmd := make([]string, 0, 5+len(options)+1)
+	cmd = append(cmd, "emerge", "--ask=n", "--verbose", "--buildpkg", "--usepkg")
 	cmd = append(cmd, options...)
 	cmd = append(cmd, pkg)
 	return cmd

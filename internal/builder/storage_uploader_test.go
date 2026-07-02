@@ -35,12 +35,12 @@ func TestNewStorageUploader(t *testing.T) {
 			expectEnabled: false,
 		},
 		{
-			name:          "s3 with bucket",
-			storageType:   "s3",
-			s3Bucket:      "test-bucket",
-			s3Region:      "us-east-1",
-			expectError:   false,
-			expectEnabled: true,
+			name:        "s3 with bucket",
+			storageType: "s3",
+			s3Bucket:    "test-bucket",
+			s3Region:    "us-east-1",
+			// S3 backend is not implemented: construction fails fast.
+			expectError: true,
 		},
 		{
 			name:          "http without base url",
@@ -49,11 +49,11 @@ func TestNewStorageUploader(t *testing.T) {
 			expectEnabled: false,
 		},
 		{
-			name:          "http with base url",
-			storageType:   "http",
-			httpBase:      "http://example.com",
-			expectError:   false,
-			expectEnabled: true,
+			name:        "http with base url",
+			storageType: "http",
+			httpBase:    "http://example.com",
+			// HTTP backend is not implemented: construction fails fast.
+			expectError: true,
 		},
 		{
 			name:        "unsupported type",
@@ -125,13 +125,8 @@ func TestStorageUploaderGetURL(t *testing.T) {
 			remotePath:  "/path/to/file.txt",
 			expectError: false,
 		},
-		{
-			name:        "http storage",
-			storageType: "http",
-			httpBase:    "http://example.com",
-			remotePath:  "file.txt",
-			expectError: false,
-		},
+		// (http/s3 backends are not implemented; their constructors error, so
+		// there is no uploader to call GetURL on — covered by TestNewStorageUploader.)
 	}
 
 	for _, tt := range tests {
@@ -173,20 +168,11 @@ func TestStorageUploaderIsEnabled(t *testing.T) {
 	}{
 		{"local", "local", false},
 		{"empty", "", false},
-		{"http", "http", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var uploader *StorageUploader
-			var err error
-
-			if tt.storageType == "http" {
-				uploader, err = NewStorageUploader(tt.storageType, "", "", "", "", "http://example.com")
-			} else {
-				uploader, err = NewStorageUploader(tt.storageType, "", "", "", "", "")
-			}
-
+			uploader, err := NewStorageUploader(tt.storageType, "", "", "", "", "")
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

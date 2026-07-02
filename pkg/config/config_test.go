@@ -327,3 +327,59 @@ MAKE_CONF_PATH=/custom/make.conf
 		}
 	})
 }
+
+// TestUnquoteEnvValue verifies surrounding quotes are stripped (#61).
+func TestUnquoteEnvValue(t *testing.T) {
+	cases := map[string]string{
+		`"quoted"`:      "quoted",
+		`'single'`:      "single",
+		`plain`:         "plain",
+		`"mismatch'`:    `"mismatch'`,
+		`""`:            "",
+		`"with spaces"`: "with spaces",
+		`"a#b"`:         "a#b",
+	}
+	for in, want := range cases {
+		if got := unquoteEnvValue(in); got != want {
+			t.Errorf("unquoteEnvValue(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestLoadServerConfigEnvWithoutFile verifies env vars are honored even when the
+// config file is absent (#39).
+func TestLoadServerConfigEnvWithoutFile(t *testing.T) {
+	t.Setenv("SERVER_PORT", "9999")
+	t.Setenv("API_KEY", "envkey")
+
+	cfg, err := LoadServerConfig("/nonexistent/path/server.conf")
+	if err != nil {
+		t.Fatalf("LoadServerConfig failed: %v", err)
+	}
+	if cfg.Port != 9999 {
+		t.Errorf("env SERVER_PORT ignored when file missing: got Port=%d", cfg.Port)
+	}
+	if cfg.APIKey != "envkey" {
+		t.Errorf("env API_KEY ignored when file missing: got %q", cfg.APIKey)
+	}
+}
+
+// TestLoadEnvFileStripsQuotes verifies quoted values in a conf file are unquoted.
+func TestLoadEnvFileStripsQuotes(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/test.conf"
+	content := "API_KEY=\"quoted-secret\"\nSERVER_PORT=8080\nDATA_DIR='single-quoted'\n"
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	env, err := loadEnvFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env["API_KEY"] != "quoted-secret" {
+		t.Errorf("API_KEY = %q, want quoted-secret", env["API_KEY"])
+	}
+	if env["DATA_DIR"] != "single-quoted" {
+		t.Errorf("DATA_DIR = %q, want single-quoted", env["DATA_DIR"])
+	}
+}

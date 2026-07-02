@@ -194,9 +194,15 @@ func (n *Notifier) sendEmail(notification *BuildNotification) error {
 
 	body := n.formatEmailBody(notification)
 
-	msg := fmt.Sprintf("From: %s\r\n", cfg.From)
-	msg += fmt.Sprintf("To: %s\r\n", strings.Join(cfg.To, ","))
-	msg += fmt.Sprintf("Subject: %s\r\n", subject)
+	// Sanitize every value that goes into a header line so a package name /
+	// version / subject containing CR/LF cannot inject extra headers.
+	to := make([]string, len(cfg.To))
+	for i, addr := range cfg.To {
+		to[i] = sanitizeHeader(addr)
+	}
+	msg := fmt.Sprintf("From: %s\r\n", sanitizeHeader(cfg.From))
+	msg += fmt.Sprintf("To: %s\r\n", strings.Join(to, ","))
+	msg += fmt.Sprintf("Subject: %s\r\n", sanitizeHeader(subject))
 	msg += "Content-Type: text/plain; charset=UTF-8\r\n"
 	msg += "\r\n"
 	msg += body
@@ -204,36 +210,50 @@ func (n *Notifier) sendEmail(notification *BuildNotification) error {
 	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.SMTPHost)
 	addr := fmt.Sprintf("%s:%d", cfg.SMTPHost, cfg.SMTPPort)
 
-	err := smtp.SendMail(addr, auth, cfg.From, cfg.To, []byte(msg))
-	if err != nil {
-		return fmt.Errorf("failed to send email: %w", err)
+	// smtp.SendMail has no timeout, so a hung SMTP server would stall the build
+	// worker forever. Bound it: run the send in a goroutine and abandon it after
+	// emailSendTimeout.
+	done := make(chan error, 1)
+	go func() { done <- smtp.SendMail(addr, auth, cfg.From, cfg.To, []byte(msg)) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("failed to send email: %w", err)
+		}
+	case <-time.After(emailSendTimeout):
+		return fmt.Errorf("email send timed out after %s", emailSendTimeout)
 	}
 
 	log.Printf("Email notification sent to %v", cfg.To)
 	return nil
 }
 
+// emailSendTimeout bounds a single SMTP send so a hung server cannot stall a
+// build worker.
+const emailSendTimeout = 30 * time.Second
+
 // formatEmailBody formats the email body.
 func (n *Notifier) formatEmailBody(notification *BuildNotification) string {
 	var buf bytes.Buffer
 
-	buf.WriteString(fmt.Sprintf("Build Status: %s\n", strings.ToUpper(notification.Status)))
-	buf.WriteString(fmt.Sprintf("Job ID: %s\n", notification.JobID))
-	buf.WriteString(fmt.Sprintf("Package: %s-%s\n", notification.PackageName, notification.Version))
-	buf.WriteString(fmt.Sprintf("Duration: %s\n", notification.Duration))
-	buf.WriteString(fmt.Sprintf("Started: %s\n", notification.StartTime.Format(time.RFC3339)))
-	buf.WriteString(fmt.Sprintf("Finished: %s\n", notification.EndTime.Format(time.RFC3339)))
+	fmt.Fprintf(&buf, "Build Status: %s\n", strings.ToUpper(notification.Status))
+	fmt.Fprintf(&buf, "Job ID: %s\n", notification.JobID)
+	fmt.Fprintf(&buf, "Package: %s-%s\n", notification.PackageName, notification.Version)
+	fmt.Fprintf(&buf, "Duration: %s\n", notification.Duration)
+	fmt.Fprintf(&buf, "Started: %s\n", notification.StartTime.Format(time.RFC3339))
+	fmt.Fprintf(&buf, "Finished: %s\n", notification.EndTime.Format(time.RFC3339))
 
 	if notification.ArtifactURL != "" {
-		buf.WriteString(fmt.Sprintf("\nArtifact: %s\n", notification.ArtifactURL))
+		fmt.Fprintf(&buf, "\nArtifact: %s\n", notification.ArtifactURL)
 	}
 
 	if notification.Error != "" {
-		buf.WriteString(fmt.Sprintf("\nError: %s\n", notification.Error))
+		fmt.Fprintf(&buf, "\nError: %s\n", notification.Error)
 	}
 
 	if notification.BuildLog != "" && len(notification.BuildLog) < 500 {
-		buf.WriteString(fmt.Sprintf("\nBuild Log:\n%s\n", notification.BuildLog))
+		fmt.Fprintf(&buf, "\nBuild Log:\n%s\n", notification.BuildLog)
 	}
 
 	return buf.String()
@@ -418,17 +438,41 @@ func (n *Notifier) sendTelegram(notification *BuildNotification) error {
 	}
 
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", cfg.BotToken)
-	resp, err := n.client.Post(url, "application/json", bytes.NewReader(jsonPayload))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(jsonPayload))
 	if err != nil {
-		return fmt.Errorf("failed to send telegram notification: %w", err)
+		return fmt.Errorf("failed to build telegram request: %w", redactToken(err, cfg.BotToken))
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := n.client.Do(req)
+	if err != nil {
+		// The transport error (*url.Error) embeds the full request URL, which
+		// contains the bot token — redact it before returning/logging.
+		return fmt.Errorf("failed to send telegram notification: %w", redactToken(err, cfg.BotToken))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("telegram returned status %d: %s", resp.StatusCode, string(body))
+		// Report status only; the response body could echo the token.
+		return fmt.Errorf("telegram returned status %d", resp.StatusCode)
 	}
 
 	log.Printf("Telegram notification sent to chat %s", cfg.ChatID)
 	return nil
+}
+
+// sanitizeHeader strips CR and LF from a value destined for an email header,
+// preventing header injection via user-controlled package name / version /
+// subject.
+func sanitizeHeader(v string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(v)
+}
+
+// redactToken returns an error whose message has the bot token replaced with
+// "REDACTED", so a token embedded in a wrapped transport error never leaks.
+func redactToken(err error, token string) error {
+	if err == nil || token == "" {
+		return err
+	}
+	return fmt.Errorf("%s", strings.ReplaceAll(err.Error(), token, "REDACTED"))
 }

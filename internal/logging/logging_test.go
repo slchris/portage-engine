@@ -77,9 +77,7 @@ func TestNew(t *testing.T) {
 				t.Error("Expected non-nil logger")
 				return
 			}
-			if logger != nil {
-				_ = logger.Close()
-			}
+			_ = logger.Close()
 		})
 	}
 }
@@ -458,4 +456,63 @@ func TestMaxBackups(t *testing.T) {
 	if len(files) > 6 { // 5 backups + current
 		t.Errorf("Expected at most 6 log files, got %d", len(files))
 	}
+}
+
+// TestCloseStopsCleanupGoroutine verifies Close is idempotent and stops the
+// background cleanup goroutine (run with -race to catch shutdown races).
+func TestCloseStopsCleanupGoroutine(t *testing.T) {
+	dir := t.TempDir()
+	logger, err := New(&Config{
+		Enabled:    true,
+		Level:      "INFO",
+		Dir:        dir,
+		EnableFile: true,
+		MaxAgeDays: 1,
+		MaxBackups: 1,
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	// Log something to exercise concurrent writes with the cleanup goroutine.
+	logger.Info("hello")
+
+	// Close must succeed and be safe to call multiple times.
+	if err := logger.Close(); err != nil {
+		t.Errorf("first Close returned error: %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Errorf("second Close returned error: %v", err)
+	}
+}
+
+// TestConcurrentSetLevelAndLog exercises SetLevel concurrently with logging to
+// catch races on the shared level/enabled/currentFile fields (run with -race).
+func TestConcurrentSetLevelAndLog(t *testing.T) {
+	dir := t.TempDir()
+	logger, err := New(&Config{
+		Enabled:    true,
+		Level:      "DEBUG",
+		Dir:        dir,
+		EnableFile: true,
+	})
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer func() { _ = logger.Close() }()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			logger.Info("message %d", i)
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		logger.SetLevel(Level(i % 4))
+		_ = logger.GetLevel()
+		_ = logger.IsEnabled()
+	}
+	<-done
 }

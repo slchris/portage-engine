@@ -126,7 +126,7 @@ func TestLocalBuilderListJobs(t *testing.T) {
 	// Submit multiple jobs
 	for i := 0; i < 3; i++ {
 		req := &LocalBuildRequest{
-			PackageName: "test-package",
+			PackageName: "dev-lang/python",
 			Version:     "1.0",
 		}
 		_, err := builder.SubmitBuild(req)
@@ -174,7 +174,7 @@ func TestLocalBuilderGetArtifactPath(t *testing.T) {
 
 	// Submit a job
 	req := &LocalBuildRequest{
-		PackageName: "test-package",
+		PackageName: "dev-lang/python",
 		Version:     "1.0",
 	}
 	jobID, err := builder.SubmitBuild(req)
@@ -202,7 +202,7 @@ func TestLocalBuilderGetArtifactInfo(t *testing.T) {
 
 	// Submit a job
 	req := &LocalBuildRequest{
-		PackageName: "test-package",
+		PackageName: "dev-lang/python",
 		Version:     "1.0",
 	}
 	jobID, err := builder.SubmitBuild(req)
@@ -224,7 +224,7 @@ func TestArtifactInfo(t *testing.T) {
 		FileName:    "test-1.0.tbz2",
 		FilePath:    "/tmp/artifacts/test-1.0.tbz2",
 		FileSize:    1024,
-		PackageName: "test-package",
+		PackageName: "dev-lang/python",
 		Version:     "1.0",
 	}
 
@@ -236,5 +236,87 @@ func TestArtifactInfo(t *testing.T) {
 	}
 	if info.FileSize != 1024 {
 		t.Errorf("Expected FileSize 1024, got %d", info.FileSize)
+	}
+}
+
+// TestLocalBuilderSubmitBuildQueueFull verifies SubmitBuild does a non-blocking
+// send and returns an error (instead of hanging) when the queue is full.
+func TestLocalBuilderSubmitBuildQueueFull(t *testing.T) {
+	// Build a LocalBuilder with a tiny, unconsumed queue (no workers) so it
+	// fills immediately.
+	lb := &LocalBuilder{
+		workers:  0,
+		jobQueue: make(chan *BuildJob, 1),
+		jobs:     make(map[string]*BuildJob),
+	}
+
+	req := &LocalBuildRequest{PackageName: "dev-lang/python", Version: "3.11.0"}
+
+	// First submit fills the single-slot queue.
+	if _, err := lb.SubmitBuild(req); err != nil {
+		t.Fatalf("first SubmitBuild should succeed, got error: %v", err)
+	}
+
+	// Second submit must fail fast rather than block.
+	done := make(chan struct{})
+	var submitErr error
+	go func() {
+		_, submitErr = lb.SubmitBuild(req)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SubmitBuild blocked when queue was full; expected non-blocking error")
+	}
+
+	if submitErr == nil {
+		t.Fatal("expected error when queue is full, got nil")
+	}
+	if submitErr.Error() != "builder queue full" {
+		t.Errorf("expected 'builder queue full' error, got: %v", submitErr)
+	}
+
+	// The rejected job must not be left registered in the jobs map.
+	if len(lb.jobs) != 1 {
+		t.Errorf("expected only the accepted job to remain, got %d jobs", len(lb.jobs))
+	}
+}
+
+// TestReconcileLoadedJobs verifies interrupted "building"/"queued" jobs are
+// marked failed on startup and persisted.
+func TestReconcileLoadedJobs(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewJobStore(dir)
+	if err != nil {
+		t.Fatalf("NewJobStore failed: %v", err)
+	}
+
+	jobs := map[string]*BuildJob{
+		"a": {ID: "a", Status: "building"},
+		"b": {ID: "b", Status: "queued"},
+		"c": {ID: "c", Status: "success"},
+	}
+
+	reconcileLoadedJobs(store, jobs)
+
+	if jobs["a"].Status != "failed" {
+		t.Errorf("expected building job to be reconciled to failed, got %s", jobs["a"].Status)
+	}
+	if jobs["b"].Status != "failed" {
+		t.Errorf("expected queued job to be reconciled to failed, got %s", jobs["b"].Status)
+	}
+	if jobs["c"].Status != "success" {
+		t.Errorf("expected success job to be untouched, got %s", jobs["c"].Status)
+	}
+
+	// Verify the reconciled state was persisted.
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if loaded["a"].Status != "failed" {
+		t.Errorf("expected persisted job a to be failed, got %s", loaded["a"].Status)
 	}
 }

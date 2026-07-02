@@ -124,3 +124,19 @@ func (s *Store) useFlagsMatch(pkgFlags, reqFlags []string) bool {
 func (s *Store) GetPath(pkg *Package) string {
 	return filepath.Join(s.basePath, pkg.Arch, fmt.Sprintf("%s-%s.tbz2", pkg.Name, pkg.Version))
 }
+
+// BasePath returns the on-disk PKGDIR this store manages. It is served to
+// emerge clients as a binhost.
+func (s *Store) BasePath() string {
+	return s.basePath
+}
+
+// RegenerateIndex rebuilds the Portage "Packages" index from the binary
+// packages currently on disk so that `emerge --getbinpkg` can consume this
+// server as a binhost. arch is the default ARCH advertised in the index.
+func (s *Store) RegenerateIndex(arch string) (int, error) {
+	// Serialize index writes with other store mutations.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return GenerateIndex(s.basePath, arch)
+}

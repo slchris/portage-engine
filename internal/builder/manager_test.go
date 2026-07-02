@@ -1,7 +1,12 @@
 package builder
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,8 +40,10 @@ func TestNewManager(t *testing.T) {
 
 // TestSubmitBuildManager tests submitting a build request.
 func TestSubmitBuildManager(t *testing.T) {
+	// No workers so the job stays "queued" for the assertion (a worker would
+	// immediately claim it).
 	cfg := &config.ServerConfig{
-		MaxWorkers: 2,
+		MaxWorkers: 0,
 	}
 
 	mgr := NewManager(cfg)
@@ -616,5 +623,222 @@ func TestExtractVersionFromArtifact(t *testing.T) {
 				t.Errorf("extractVersionFromArtifact(%q) = %q, want %q", tt.artifactPath, result, tt.expected)
 			}
 		})
+	}
+}
+
+// TestCloudBuildRefusesWhenUnconfigured verifies the cloud path fails loudly
+// instead of fabricating a completed build (the old simulation behavior) when
+// no remote builders and no SSH/callback config are present.
+func TestCloudBuildRefusesWhenUnconfigured(t *testing.T) {
+	cfg := &config.ServerConfig{MaxWorkers: 1, CloudProvider: "gcp"}
+	mgr := NewManager(cfg)
+
+	jobID, err := mgr.SubmitBuild(&BuildRequest{
+		PackageName: "dev-lang/python", Version: "3.11", Arch: "amd64", CloudProvider: "gcp",
+	})
+	if err != nil {
+		t.Fatalf("SubmitBuild failed: %v", err)
+	}
+
+	// Wait for the worker to process and reach a terminal state.
+	deadline := time.Now().Add(3 * time.Second)
+	var status *BuildStatus
+	for time.Now().Before(deadline) {
+		status, err = mgr.GetStatus(jobID)
+		if err == nil && status.Status == "failed" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("GetStatus failed: %v", err)
+	}
+	if status.Status != "failed" {
+		t.Fatalf("expected cloud build to FAIL when unconfigured, got %q", status.Status)
+	}
+	if !strings.Contains(status.Error, "CLOUD_SSH_KEY_PATH") &&
+		!strings.Contains(status.Error, "cloud provider") &&
+		!strings.Contains(status.Error, "SERVER_CALLBACK_URL") {
+		t.Errorf("expected an explanatory config error, got %q", status.Error)
+	}
+	// Crucially, it must NOT be marked completed with a fake artifact.
+	if status.Status == "completed" || status.ArtifactPath != "" {
+		t.Errorf("cloud build fabricated success: status=%q artifact=%q", status.Status, status.ArtifactPath)
+	}
+
+	mgr.Shutdown()
+}
+
+// TestBuildProvisionRequest checks config → ProvisionRequest mapping and the
+// guard errors.
+func TestBuildProvisionRequest(t *testing.T) {
+	// Missing SSH key → error.
+	m := &Manager{config: &config.ServerConfig{CloudProvider: "gcp"}}
+	if _, err := m.buildProvisionRequest(&BuildRequest{}); err == nil {
+		t.Error("expected error when CLOUD_SSH_KEY_PATH is unset")
+	}
+
+	// Missing callback → error.
+	m = &Manager{config: &config.ServerConfig{CloudProvider: "gcp", CloudSSHKeyPath: "/k"}}
+	if _, err := m.buildProvisionRequest(&BuildRequest{}); err == nil {
+		t.Error("expected error when SERVER_CALLBACK_URL is unset")
+	}
+
+	// Fully configured → valid request with credentials + TTL.
+	m = &Manager{config: &config.ServerConfig{
+		CloudProvider: "gcp", CloudSSHKeyPath: "/k", CloudSSHUser: "root",
+		ServerCallbackURL: "http://srv:8080", CloudInstanceTTL: 30,
+		CloudGCPKeyFile: "/gcp.json",
+	}}
+	pr, err := m.buildProvisionRequest(&BuildRequest{Arch: "amd64"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pr.Provider != "gcp" || pr.SSH.KeyPath != "/k" || pr.ServerCallback != "http://srv:8080" {
+		t.Errorf("unexpected provision request: %+v", pr)
+	}
+	if pr.TTL != 30*time.Minute {
+		t.Errorf("expected TTL 30m, got %v", pr.TTL)
+	}
+	if pr.Credentials == nil || pr.Credentials.GCPKeyFile != "/gcp.json" {
+		t.Errorf("credentials not mapped: %+v", pr.Credentials)
+	}
+}
+
+// TestConcurrentDuplicateSubmissionsClaimedOnce is the regression test for the
+// non-atomic job-claim race: many identical submissions with multiple workers
+// must each be processed exactly once, and NO job may be stranded in a
+// non-terminal state.
+func TestConcurrentDuplicateSubmissionsClaimedOnce(t *testing.T) {
+	var mu sync.Mutex
+	submitsPerRemoteJob := map[string]int{}
+
+	// A fake remote builder: POST /api/v1/build returns a unique job id and
+	// counts submissions; GET /api/v1/jobs/<id> reports it completed.
+	var counter int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/build" {
+			mu.Lock()
+			counter++
+			id := "r" + strconv.Itoa(counter)
+			submitsPerRemoteJob[id] = 1
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"job_id": id, "status": "queued"})
+			return
+		}
+		// status poll
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id": "x", "status": "completed", "artifact_url": "/binpkgs/x.gpkg.tar",
+		})
+	}))
+	defer srv.Close()
+
+	cfg := &config.ServerConfig{MaxWorkers: 8, RemoteBuilders: []string{srv.URL}}
+	mgr := NewManager(cfg)
+	defer mgr.Shutdown()
+
+	// Submit many IDENTICAL requests concurrently — the exact trigger condition.
+	const n = 40
+	var wg sync.WaitGroup
+	jobIDs := make([]string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id, err := mgr.SubmitBuild(&BuildRequest{PackageName: "dev-lang/python", Version: "3.11", Arch: "amd64"})
+			if err == nil {
+				jobIDs[i] = id
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Give workers time to claim + submit every job. The primary race symptoms
+	// are jobs stuck in "queued" (never claimed) or "claimed" (claimed but the
+	// worker never advanced it) — check for those once the queue has drained.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if claimedOrQueuedCount(mgr, jobIDs) == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// No job may be stranded in "queued" (unclaimed) or "claimed" (claimed but
+	// abandoned). "forwarding" is a normal in-flight state (the async poll runs
+	// on a multi-second ticker), so it is not a strand.
+	for _, id := range jobIDs {
+		if id == "" {
+			continue
+		}
+		st, err := mgr.GetStatus(id)
+		if err != nil {
+			t.Errorf("job %s missing: %v", id, err)
+			continue
+		}
+		if st.Status == "queued" || st.Status == "claimed" {
+			t.Errorf("job %s stranded in non-terminal state %q", id, st.Status)
+		}
+	}
+
+	// Each remote job must have been submitted exactly once (no double-process).
+	mu.Lock()
+	defer mu.Unlock()
+	for id, c := range submitsPerRemoteJob {
+		if c != 1 {
+			t.Errorf("remote job %s submitted %d times (expected 1)", id, c)
+		}
+	}
+}
+
+// claimedOrQueuedCount counts jobs still stuck in queued/claimed — the states
+// that indicate the claim race (unclaimed or claimed-but-abandoned).
+func claimedOrQueuedCount(m *Manager, ids []string) int {
+	c := 0
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		st, err := m.GetStatus(id)
+		if err != nil {
+			continue
+		}
+		if st.Status == "queued" || st.Status == "claimed" {
+			c++
+		}
+	}
+	return c
+}
+
+// TestSubmitBuildFullQueueLeavesNoOrphan verifies that when the work queue is
+// full, SubmitBuild returns an error AND does not leave a permanently "queued"
+// orphan job in the map.
+func TestSubmitBuildFullQueueLeavesNoOrphan(t *testing.T) {
+	// Zero workers so nothing drains the queue; capacity is 100.
+	cfg := &config.ServerConfig{MaxWorkers: 0}
+	mgr := NewManager(cfg)
+	defer mgr.Shutdown()
+
+	// Fill the queue to capacity.
+	accepted := 0
+	for i := 0; i < 100; i++ {
+		if _, err := mgr.SubmitBuild(&BuildRequest{PackageName: "cat/pkg", Version: "1." + strconv.Itoa(i), Arch: "amd64"}); err == nil {
+			accepted++
+		}
+	}
+
+	before := len(mgr.ListAllBuilds())
+
+	// The next submission must fail (queue full) and must NOT add a job.
+	_, err := mgr.SubmitBuild(&BuildRequest{PackageName: "cat/overflow", Version: "1", Arch: "amd64"})
+	if err == nil {
+		t.Fatal("expected an error when the queue is full")
+	}
+
+	after := len(mgr.ListAllBuilds())
+	if after != before {
+		t.Errorf("full-queue submission left an orphan job: before=%d after=%d", before, after)
 	}
 }
