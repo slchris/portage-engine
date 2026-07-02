@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // Signer handles GPG signing of packages.
@@ -17,10 +18,14 @@ type Signer struct {
 	keyPath    string
 	enabled    bool
 	gnupgHome  string // Custom GNUPG_HOME directory
-	publicKey  string // Cached public key in ASCII armor format
 	autoCreate bool   // Auto-create key if not exists
 	keyName    string // Name for auto-generated key
 	keyEmail   string // Email for auto-generated key
+
+	// pubKeyMu guards the cached public key, which may be populated
+	// concurrently by HTTP handlers calling GetPublicKey.
+	pubKeyMu  sync.Mutex
+	publicKey string // Cached public key in ASCII armor format
 }
 
 // SignerOption is a functional option for configuring the Signer.
@@ -220,6 +225,9 @@ func (s *Signer) buildBaseArgs() []string {
 
 // GetPublicKey returns the public key in ASCII armor format.
 func (s *Signer) GetPublicKey() (string, error) {
+	s.pubKeyMu.Lock()
+	defer s.pubKeyMu.Unlock()
+
 	if s.publicKey != "" {
 		return s.publicKey, nil
 	}

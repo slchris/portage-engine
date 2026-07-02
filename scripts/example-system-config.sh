@@ -18,7 +18,11 @@ if [ ! -d "/etc/portage" ]; then
     PORTAGE_DIR="./example-portage"
     mkdir -p "$PORTAGE_DIR"
 
-    # Create example make.conf
+    # Create example make.conf.
+    # NOTE: -march=native is fine for a single machine building for ITSELF, but
+    # NOT for a binhost that serves multiple consumers — packages would be built
+    # for the build host's exact CPU and crash (SIGILL) on others. The build
+    # farm uses a fixed baseline (see internal/iac/cloud_init.go marchForArch).
     cat > "$PORTAGE_DIR/make.conf" <<EOF
 # Example make.conf
 CFLAGS="-O2 -pipe -march=native"

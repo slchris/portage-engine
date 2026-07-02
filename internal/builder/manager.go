@@ -27,6 +27,10 @@ type BuildRequest struct {
 	UseFlags      []string          `json:"use_flags"`
 	CloudProvider string            `json:"cloud_provider"`
 	MachineSpec   map[string]string `json:"machine_spec"`
+	// ConfigBundle, when set, carries the full Portage configuration to build
+	// with. It is forwarded verbatim to the remote builder so the build applies
+	// the exact USE flags / make.conf / repos the client specified.
+	ConfigBundle *ConfigBundle `json:"config_bundle,omitempty"`
 }
 
 // BuildResponse represents a build request response.
@@ -50,25 +54,44 @@ type BuildStatus struct {
 	Log          string    `json:"log,omitempty"`
 }
 
+// queuedJob pairs a build request with the job ID assigned at submission, so a
+// worker processes exactly the job it dequeued instead of re-deriving one by
+// scanning for a matching package (which let concurrent workers double-process
+// one job and strand another).
+type queuedJob struct {
+	jobID string
+	req   *BuildRequest
+}
+
 // Manager manages build requests and infrastructure provisioning.
 type Manager struct {
 	config       *config.ServerConfig
 	iacMgr       *iac.Manager
 	jobs         map[string]*BuildStatus
 	jobsMu       sync.RWMutex
-	workQueue    chan *BuildRequest
+	workQueue    chan *queuedJob
 	remoteBuilds map[string]string // jobID -> builderURL
 }
 
 // NewManager creates a new build manager.
 func NewManager(cfg *config.ServerConfig) *Manager {
+	var iacOpts []iac.ManagerOption
+	if cfg.CloudInstanceTTL > 0 {
+		iacOpts = append(iacOpts, iac.WithDefaultTTL(time.Duration(cfg.CloudInstanceTTL)*time.Minute))
+	}
+
 	mgr := &Manager{
 		config:       cfg,
-		iacMgr:       iac.NewManager(),
+		iacMgr:       iac.NewManager(iacOpts...),
 		jobs:         make(map[string]*BuildStatus),
-		workQueue:    make(chan *BuildRequest, 100),
+		workQueue:    make(chan *queuedJob, 100),
 		remoteBuilds: make(map[string]string),
 	}
+
+	// Start the IaC cleanup routine so expired / orphaned cloud instances are
+	// reclaimed (without this, TTL auto-termination never runs and leaked VMs
+	// bill forever).
+	mgr.iacMgr.StartCleanupRoutine()
 
 	// Start worker goroutines
 	for i := 0; i < cfg.MaxWorkers; i++ {
@@ -78,8 +101,65 @@ func NewManager(cfg *config.ServerConfig) *Manager {
 	return mgr
 }
 
+// GetJobsSnapshot returns a copy of all jobs for persistence.
+func (m *Manager) GetJobsSnapshot() map[string]*BuildStatus {
+	m.jobsMu.RLock()
+	defer m.jobsMu.RUnlock()
+
+	snapshot := make(map[string]*BuildStatus, len(m.jobs))
+	for k, v := range m.jobs {
+		statusCopy := *v
+		snapshot[k] = &statusCopy
+	}
+	return snapshot
+}
+
+// LoadJobs loads a previously persisted set of jobs into the manager.
+// Only non-terminal jobs that are not too old are marked as stale.
+func (m *Manager) LoadJobs(jobs map[string]*BuildStatus) {
+	m.jobsMu.Lock()
+	defer m.jobsMu.Unlock()
+
+	for id, job := range jobs {
+		// Mark in-progress AND still-queued jobs as failed-on-restart: we cannot
+		// resume in-progress work, and a persisted "queued" job cannot be
+		// re-enqueued (BuildStatus does not retain the original request), so
+		// leaving it "queued" would strand it forever and inflate QueuedBuilds.
+		switch job.Status {
+		case "queued", "claimed", "building", "provisioning", "forwarding":
+			job.Status = "failed"
+			job.Error = "server restarted before the job completed; please resubmit"
+			job.UpdatedAt = time.Now()
+		}
+		m.jobs[id] = job
+	}
+}
+
+// Shutdown gracefully shuts down the manager.
+// It closes the work queue and waits for IaC cleanup.
+func (m *Manager) Shutdown() {
+	close(m.workQueue)
+	// Give the IaC manager a chance to clean up
+	m.iacMgr.StopCleanupRoutine()
+}
+
 // SubmitBuild submits a new build request.
 func (m *Manager) SubmitBuild(req *BuildRequest) (string, error) {
+	// Validate the untrusted package fields early (defense-in-depth: the builder
+	// validates again, but rejecting here avoids provisioning/forwarding for a
+	// bad request and rejects atom/option injection at the server boundary).
+	if !atomPattern.MatchString(req.PackageName) {
+		return "", fmt.Errorf("invalid package name %q", req.PackageName)
+	}
+	if req.Version != "" && !versionPattern.MatchString(req.Version) {
+		return "", fmt.Errorf("invalid package version %q", req.Version)
+	}
+	for _, flag := range req.UseFlags {
+		if !useFlagPattern.MatchString(flag) {
+			return "", fmt.Errorf("invalid USE flag %q", flag)
+		}
+	}
+
 	jobID := uuid.New().String()
 
 	status := &BuildStatus{
@@ -96,11 +176,16 @@ func (m *Manager) SubmitBuild(req *BuildRequest) (string, error) {
 	m.jobs[jobID] = status
 	m.jobsMu.Unlock()
 
-	// Add to work queue
+	// Enqueue the job ID alongside the request so the worker processes exactly
+	// this job. If the queue is full, remove the just-added job so it does not
+	// linger as a permanently "queued" orphan.
 	select {
-	case m.workQueue <- req:
+	case m.workQueue <- &queuedJob{jobID: jobID, req: req}:
 		return jobID, nil
 	default:
+		m.jobsMu.Lock()
+		delete(m.jobs, jobID)
+		m.jobsMu.Unlock()
 		return "", fmt.Errorf("work queue is full")
 	}
 }
@@ -127,14 +212,17 @@ func extractVersionFromArtifact(artifactPath string) string {
 // GetStatus returns the status of a build job.
 // It first checks local jobs, then queries remote builders if not found locally.
 func (m *Manager) GetStatus(jobID string) (*BuildStatus, error) {
-	// Check local jobs first
+	// Check local jobs first. Return a copy taken under the lock so callers
+	// (e.g. the JSON-encoding status handler) never read the live struct while
+	// updateStatus is writing it.
 	m.jobsMu.RLock()
 	status, exists := m.jobs[jobID]
-	m.jobsMu.RUnlock()
-
 	if exists {
-		return status, nil
+		statusCopy := *status
+		m.jobsMu.RUnlock()
+		return &statusCopy, nil
 	}
+	m.jobsMu.RUnlock()
 
 	// Not found locally, try remote builders
 	if len(m.config.RemoteBuilders) > 0 {
@@ -154,7 +242,7 @@ func (m *Manager) fetchRemoteJobStatus(jobID string) *BuildStatus {
 	for _, builderAddr := range m.config.RemoteBuilders {
 		baseURL := normalizeBuilderURL(builderAddr)
 		url := fmt.Sprintf("%s/api/v1/jobs/%s", baseURL, jobID)
-		resp, err := client.Get(url)
+		resp, err := m.builderGet(client, url)
 		if err != nil {
 			continue
 		}
@@ -220,105 +308,318 @@ func (m *Manager) fetchRemoteJobStatus(jobID string) *BuildStatus {
 	return nil
 }
 
-// worker processes build requests from the work queue.
+// claimJob atomically transitions a job from "queued" to "claimed" under the
+// write lock. It returns true only for the caller that performed the
+// transition; a job that is missing or already past "queued" returns false.
+func (m *Manager) claimJob(jobID string) bool {
+	m.jobsMu.Lock()
+	defer m.jobsMu.Unlock()
+
+	job, ok := m.jobs[jobID]
+	if !ok || job.Status != "queued" {
+		return false
+	}
+	job.Status = "claimed"
+	job.UpdatedAt = time.Now()
+	return true
+}
+
+// worker processes queued jobs from the work queue.
 func (m *Manager) worker() {
-	for req := range m.workQueue {
-		m.processBuild(req)
+	for qj := range m.workQueue {
+		m.processBuild(qj)
 	}
 }
 
-// processBuild processes a single build request.
-func (m *Manager) processBuild(req *BuildRequest) {
-	// Find job ID for this request
-	var jobID string
-	m.jobsMu.RLock()
-	for id, job := range m.jobs {
-		if job.PackageName == req.PackageName && job.Version == req.Version && job.Arch == req.Arch && job.Status == "queued" {
-			jobID = id
-			break
-		}
-	}
-	m.jobsMu.RUnlock()
+// processBuild processes a single queued job. It atomically claims the job
+// (queued -> claimed) so that even if the same job were enqueued twice, only one
+// worker proceeds — no scanning, no double-processing.
+func (m *Manager) processBuild(qj *queuedJob) {
+	jobID := qj.jobID
+	req := qj.req
 
-	if jobID == "" {
+	if !m.claimJob(jobID) {
+		// Already claimed (or gone) — another worker owns it, or it was removed.
 		return
 	}
 
-	// Check if we have remote builders configured
+	// Prefer a configured static remote builder.
 	if len(m.config.RemoteBuilders) > 0 {
-		// Use remote builder instead of creating cloud instance
 		m.submitToRemoteBuilder(jobID, req)
 		return
 	}
 
-	// No remote builders, use cloud provisioning
-	m.updateStatus(jobID, "provisioning", "", "")
+	// Otherwise provision a cloud builder on demand and run the build there.
+	m.processCloudBuild(jobID, req)
+}
 
-	// Provision infrastructure
-	provReq := &iac.ProvisionRequest{
-		Provider: req.CloudProvider,
-		Arch:     req.Arch,
-		Spec:     req.MachineSpec,
+// processCloudBuild provisions a cloud instance, deploys a builder on it, runs
+// the build there, and tears the instance down afterward. It runs synchronously
+// in the worker goroutine and always terminates the instance (via defer) so a
+// build failure never leaks a billed VM.
+func (m *Manager) processCloudBuild(jobID string, req *BuildRequest) {
+	provReq, err := m.buildProvisionRequest(req)
+	if err != nil {
+		// Refuse rather than fabricate success when cloud builds are not
+		// configured (previously this path faked a completed build).
+		m.updateStatus(jobID, "failed", "", err.Error())
+		return
 	}
 
+	m.updateStatus(jobID, "provisioning", "", "")
 	instance, err := m.iacMgr.Provision(provReq)
 	if err != nil {
-		m.updateStatus(jobID, "failed", "", err.Error())
+		m.updateStatus(jobID, "failed", "", fmt.Sprintf("provisioning failed: %v", err))
+		return
+	}
+
+	// Always tear the instance down when we are done with it.
+	defer func() {
+		if termErr := m.iacMgr.Terminate(instance.ID); termErr != nil {
+			// Terminate keeps the instance tracked for the cleanup routine to
+			// retry; just log here.
+			fmt.Printf("Warning: failed to terminate instance %s: %v\n", instance.ID, termErr)
+		}
+	}()
+
+	if instance.BuilderEndpoint == "" {
+		m.updateStatus(jobID, "failed", instance.ID, "provisioned instance has no builder endpoint")
 		return
 	}
 
 	m.updateStatus(jobID, "building", instance.ID, "")
 
-	// In a real implementation, this would:
-	// 1. Connect to the instance
-	// 2. Install portage and dependencies
-	// 3. Build the package with specified USE flags
-	// 4. Upload the binary package to binpkg server
-	// 5. Clean up the instance
+	// Mark the instance active so the TTL cleanup does not reclaim it mid-build.
+	m.iacMgr.SetInstanceActiveTasks(instance.ID, 1)
+	defer m.iacMgr.SetInstanceActiveTasks(instance.ID, 0)
 
-	// Simulate build time
-	time.Sleep(5 * time.Second)
-
-	// Update status to completed
-	artifactPath := fmt.Sprintf("/binpkgs/%s/%s-%s-%s.tbz2", req.Arch, req.PackageName, req.Version, req.Arch)
-	m.updateStatus(jobID, "completed", instance.ID, "")
-
-	m.jobsMu.Lock()
-	if job, exists := m.jobs[jobID]; exists {
-		job.ArtifactPath = artifactPath
+	// Submit and wait for the build on the freshly provisioned builder, then
+	// pull the resulting artifact back to the server's binpkg dir.
+	if err := m.runBuildOnInstance(jobID, instance, req); err != nil {
+		m.updateStatus(jobID, "failed", instance.ID, err.Error())
+		return
 	}
-	m.jobsMu.Unlock()
-
-	// Cleanup instance
-	_ = m.iacMgr.Terminate(instance.ID)
 }
 
-// submitToRemoteBuilder forwards build request to configured remote builder.
+// buildProvisionRequest assembles a ProvisionRequest from server config, or
+// returns an error explaining what is missing (so the caller can fail loudly
+// instead of provisioning a VM that can never build anything).
+func (m *Manager) buildProvisionRequest(req *BuildRequest) (*iac.ProvisionRequest, error) {
+	provider := req.CloudProvider
+	if provider == "" {
+		provider = m.config.CloudProvider
+	}
+	if provider == "" {
+		return nil, fmt.Errorf("no remote builders configured and no cloud provider set (set REMOTE_BUILDERS or CLOUD_DEFAULT_PROVIDER)")
+	}
+	if m.config.CloudSSHKeyPath == "" {
+		return nil, fmt.Errorf("cloud build requires CLOUD_SSH_KEY_PATH so the builder can be deployed to the instance")
+	}
+	if m.config.ServerCallbackURL == "" {
+		return nil, fmt.Errorf("cloud build requires SERVER_CALLBACK_URL so the deployed builder can reach this server")
+	}
+
+	ttl := time.Duration(m.config.CloudInstanceTTL) * time.Minute
+
+	// Point the deployed builder's Portage at this server's binhost so it can
+	// reuse already-built dependencies.
+	binhost := ""
+	if m.config.ServerCallbackURL != "" {
+		binhost = strings.TrimRight(m.config.ServerCallbackURL, "/") + "/binpkgs"
+	}
+
+	return &iac.ProvisionRequest{
+		Provider:       provider,
+		Arch:           req.Arch,
+		Spec:           req.MachineSpec,
+		Credentials:    m.cloudCredentials(),
+		SSH:            &iac.SSHConfig{KeyPath: m.config.CloudSSHKeyPath, User: m.config.CloudSSHUser},
+		ServerCallback: m.config.ServerCallbackURL,
+		BuilderPort:    9090,
+		BuilderToken:   m.config.BuilderToken,
+		BinpkgHost:     binhost,
+		TTL:            ttl,
+	}, nil
+}
+
+// cloudCredentials maps server config into IaC cloud credentials.
+func (m *Manager) cloudCredentials() *iac.CloudCredentials {
+	return &iac.CloudCredentials{
+		AliyunAccessKey: m.config.CloudAliyunAK,
+		AliyunSecretKey: m.config.CloudAliyunSK,
+		GCPKeyFile:      m.config.CloudGCPKeyFile,
+		AWSAccessKey:    m.config.CloudAWSAccessKey,
+		AWSSecretKey:    m.config.CloudAWSSecretKey,
+		PVETokenID:      m.config.CloudPVETokenID,
+		PVETokenSecret:  m.config.CloudPVETokenSecret,
+	}
+}
+
+// runBuildOnInstance submits the build to a provisioned instance's builder and
+// blocks until it reaches a terminal state, updating the local job as it goes.
+func (m *Manager) runBuildOnInstance(jobID string, instance *iac.Instance, req *BuildRequest) error {
+	baseURL := normalizeBuilderURL(instance.BuilderEndpoint)
+
+	remoteJobID, err := m.postBuildToBuilder(baseURL, req)
+	if err != nil {
+		return fmt.Errorf("failed to submit build to instance: %w", err)
+	}
+
+	// Poll until terminal, with an overall timeout tied to the instance TTL.
+	deadline := time.Now().Add(2 * time.Hour)
+	if instance.TTL > 0 {
+		deadline = time.Now().Add(instance.TTL)
+	}
+	statusURL := fmt.Sprintf("%s/api/v1/jobs/%s", baseURL, remoteJobID)
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("build timed out on instance %s", instance.ID)
+		}
+		<-ticker.C
+
+		status, errMsg, artifact, terminal, err := m.fetchInstanceJob(statusURL)
+		if err != nil {
+			return fmt.Errorf("failed to poll instance builder: %w", err)
+		}
+		m.iacMgr.UpdateInstanceActivity(instance.ID)
+		m.updateStatus(jobID, status, instance.ID, errMsg)
+
+		if terminal {
+			if status == "failed" {
+				return fmt.Errorf("remote build failed: %s", errMsg)
+			}
+			// Success: record the artifact reference.
+			if artifact != "" {
+				m.jobsMu.Lock()
+				if job, ok := m.jobs[jobID]; ok {
+					job.ArtifactPath = artifact
+				}
+				m.jobsMu.Unlock()
+			}
+			return nil
+		}
+	}
+}
+
+// postBuildToBuilder submits a build to a builder base URL and returns its job ID.
+func (m *Manager) postBuildToBuilder(baseURL string, req *BuildRequest) (string, error) {
+	localReq := LocalBuildRequest{
+		PackageName:  req.PackageName,
+		Version:      req.Version,
+		Arch:         req.Arch,
+		UseFlags:     make(map[string]string),
+		Environment:  make(map[string]string),
+		ConfigBundle: req.ConfigBundle,
+	}
+	for _, flag := range req.UseFlags {
+		if name, found := strings.CutPrefix(flag, "-"); found {
+			localReq.UseFlags[name] = "disabled"
+		} else {
+			localReq.UseFlags[flag] = "enabled"
+		}
+	}
+
+	data, err := json.Marshal(localReq)
+	if err != nil {
+		return "", err
+	}
+
+	httpReq, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/build", bytes.NewBuffer(data))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	setBuilderAuth(httpReq, m.config.BuilderToken)
+
+	resp, err := builderHTTPClient.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("builder returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var buildResp BuildResponse
+	if err := json.NewDecoder(resp.Body).Decode(&buildResp); err != nil {
+		return "", err
+	}
+	if buildResp.JobID == "" {
+		return "", fmt.Errorf("builder did not return a job id")
+	}
+	return buildResp.JobID, nil
+}
+
+// fetchInstanceJob queries a builder job's status once.
+func (m *Manager) fetchInstanceJob(statusURL string) (status, errMsg, artifact string, terminal bool, err error) {
+	resp, err := m.getFromBuilder(statusURL)
+	if err != nil {
+		return "", "", "", false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", false, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	var job struct {
+		Status      string `json:"status"`
+		Error       string `json:"error"`
+		Log         string `json:"log"`
+		ArtifactURL string `json:"artifact_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+		return "", "", "", false, err
+	}
+
+	msg := job.Error
+	if msg == "" {
+		msg = job.Log
+	}
+	term := job.Status == "completed" || job.Status == "failed" || job.Status == "success"
+	return job.Status, msg, job.ArtifactURL, term, nil
+}
+
+// submitToRemoteBuilder forwards a build request to the first configured static
+// remote builder.
 func (m *Manager) submitToRemoteBuilder(jobID string, req *BuildRequest) {
-	// Select first available remote builder (round-robin could be added later)
 	if len(m.config.RemoteBuilders) == 0 {
 		m.updateStatus(jobID, "failed", "", "no remote builders configured")
 		return
 	}
+	m.submitToBuilderAt(jobID, "", normalizeBuilderURL(m.config.RemoteBuilders[0]), req)
+}
 
-	builder := m.config.RemoteBuilders[0]
-	baseURL := normalizeBuilderURL(builder)
+// submitToBuilderAt forwards a build request to a specific builder base URL and
+// starts polling it. builderAddr is the address recorded for status polling; if
+// empty, baseURL is used.
+func (m *Manager) submitToBuilderAt(jobID, builderAddr, baseURL string, req *BuildRequest) {
+	if builderAddr == "" {
+		builderAddr = baseURL
+	}
 	builderURL := fmt.Sprintf("%s/api/v1/build", baseURL)
 
 	m.updateStatus(jobID, "forwarding", "", "")
 
 	// Convert BuildRequest to LocalBuildRequest format
 	localReq := LocalBuildRequest{
-		PackageName: req.PackageName, // Already in category/package format from server
-		Version:     req.Version,
-		UseFlags:    make(map[string]string),
-		Environment: make(map[string]string),
+		PackageName:  req.PackageName, // Already in category/package format from server
+		Version:      req.Version,
+		Arch:         req.Arch,
+		UseFlags:     make(map[string]string),
+		Environment:  make(map[string]string),
+		ConfigBundle: req.ConfigBundle, // Forward the full config bundle when present.
 	}
 
 	// Convert UseFlags from []string to map[string]string
 	for _, flag := range req.UseFlags {
-		if strings.HasPrefix(flag, "-") {
-			localReq.UseFlags[strings.TrimPrefix(flag, "-")] = "disabled"
+		if name, found := strings.CutPrefix(flag, "-"); found {
+			localReq.UseFlags[name] = "disabled"
 		} else {
 			localReq.UseFlags[flag] = "enabled"
 		}
@@ -331,8 +632,16 @@ func (m *Manager) submitToRemoteBuilder(jobID string, req *BuildRequest) {
 		return
 	}
 
-	// Forward to remote builder
-	resp, err := http.Post(builderURL, "application/json", bytes.NewBuffer(data))
+	// Forward to remote builder with the shared token and a bounded timeout.
+	httpReq, err := http.NewRequest(http.MethodPost, builderURL, bytes.NewBuffer(data))
+	if err != nil {
+		m.updateStatus(jobID, "failed", "", fmt.Sprintf("failed to build request: %v", err))
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	setBuilderAuth(httpReq, m.config.BuilderToken)
+
+	resp, err := builderHTTPClient.Do(httpReq)
 	if err != nil {
 		m.updateStatus(jobID, "failed", "", fmt.Sprintf("failed to forward to builder: %v", err))
 		return
@@ -358,7 +667,7 @@ func (m *Manager) submitToRemoteBuilder(jobID string, req *BuildRequest) {
 	m.jobsMu.Unlock()
 
 	// Start polling remote builder for status
-	go m.pollRemoteBuilder(jobID, builder, buildResp.JobID)
+	go m.pollRemoteBuilder(jobID, builderAddr, buildResp.JobID)
 }
 
 // pollRemoteBuilder polls remote builder for job status.
@@ -370,9 +679,14 @@ func (m *Manager) pollRemoteBuilder(localJobID, builderAddr, remoteJobID string)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		resp, err := http.Get(statusURL)
+		resp, err := m.getFromBuilder(statusURL)
 		if err != nil {
 			m.updateStatus(localJobID, "failed", "", fmt.Sprintf("failed to poll builder: %v", err))
+			return
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			m.updateStatus(localJobID, "failed", "", fmt.Sprintf("builder returned status %d while polling", resp.StatusCode))
 			return
 		}
 
@@ -440,7 +754,10 @@ func (m *Manager) ListAllBuilds() []*BuildStatus {
 	m.jobsMu.RLock()
 	localBuilds := make([]*BuildStatus, 0, len(m.jobs))
 	for _, job := range m.jobs {
-		localBuilds = append(localBuilds, job)
+		// Copy under the lock so concurrent updateStatus writes don't race the
+		// caller's reads / JSON encoding.
+		jobCopy := *job
+		localBuilds = append(localBuilds, &jobCopy)
 	}
 	m.jobsMu.RUnlock()
 
@@ -481,7 +798,7 @@ func (m *Manager) fetchRemoteBuilderJobs() []*BuildStatus {
 
 			baseURL := normalizeBuilderURL(builderAddr)
 			url := fmt.Sprintf("%s/api/v1/jobs", baseURL)
-			resp, err := client.Get(url)
+			resp, err := m.builderGet(client, url)
 			if err != nil {
 				return
 			}
@@ -571,7 +888,7 @@ func (m *Manager) GetClusterStatus() *ClusterStatus {
 	for _, job := range m.jobs {
 		status.TotalBuilds++
 		switch job.Status {
-		case "building", "provisioning":
+		case "claimed", "building", "provisioning", "forwarding":
 			status.ActiveBuilds++
 		case "queued":
 			status.QueuedBuilds++
@@ -623,7 +940,7 @@ func (m *Manager) fetchRemoteBuilderStats() *ClusterStatus {
 
 			baseURL := normalizeBuilderURL(addr)
 			url := fmt.Sprintf("%s/api/v1/status", baseURL)
-			resp, err := client.Get(url)
+			resp, err := m.builderGet(client, url)
 			if err != nil {
 				return
 			}
@@ -666,14 +983,16 @@ func (m *Manager) fetchRemoteBuilderStats() *ClusterStatus {
 
 // GetBuildLogs returns logs for a specific build job.
 func (m *Manager) GetBuildLogs(jobID string) (string, error) {
-	// First check local jobs
+	// First check local jobs. Copy under the lock so formatLocalLogs never reads
+	// the live struct while updateStatus is writing it.
 	m.jobsMu.RLock()
 	status, exists := m.jobs[jobID]
-	m.jobsMu.RUnlock()
-
 	if exists {
-		return m.formatLocalLogs(status), nil
+		statusCopy := *status
+		m.jobsMu.RUnlock()
+		return m.formatLocalLogs(&statusCopy), nil
 	}
+	m.jobsMu.RUnlock()
 
 	// Try to fetch from remote builders
 	logs, err := m.fetchRemoteBuilderLogs(jobID)
@@ -732,7 +1051,7 @@ func (m *Manager) fetchRemoteBuilderLogs(jobID string) (string, error) {
 	for _, builder := range m.config.RemoteBuilders {
 		baseURL := normalizeBuilderURL(builder)
 		url := fmt.Sprintf("%s/api/v1/jobs/%s", baseURL, jobID)
-		resp, err := client.Get(url)
+		resp, err := m.builderGet(client, url)
 		if err != nil {
 			continue
 		}
@@ -800,7 +1119,7 @@ func (m *Manager) GetSchedulerStatus() map[string]interface{} {
 
 	for jobID, job := range m.jobs {
 		switch job.Status {
-		case "building", "provisioning":
+		case "claimed", "building", "provisioning", "forwarding":
 			runningTasks++
 			if job.InstanceID != "" {
 				tasksByBuilder[job.InstanceID] = append(tasksByBuilder[job.InstanceID], jobID)
@@ -810,7 +1129,7 @@ func (m *Manager) GetSchedulerStatus() map[string]interface{} {
 		}
 	}
 
-	builders := []map[string]interface{}{}
+	builders := make([]map[string]interface{}, 0, len(tasksByBuilder))
 	for builderID, tasks := range tasksByBuilder {
 		builders = append(builders, map[string]interface{}{
 			"id":           builderID,
@@ -851,4 +1170,30 @@ func normalizeBuilderURL(address string) string {
 		return address
 	}
 	return fmt.Sprintf("http://%s", address)
+}
+
+// builderHTTPClient is used for all server→builder calls. Unlike http.DefaultClient
+// it has a timeout, so a hung builder cannot block a worker goroutine forever.
+var builderHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+// authHeader sets the shared builder token on an outbound request when configured.
+func setBuilderAuth(req *http.Request, token string) {
+	if token != "" {
+		req.Header.Set("X-API-Key", token)
+	}
+}
+
+// getFromBuilder issues an authenticated GET to a builder endpoint.
+func (m *Manager) getFromBuilder(url string) (*http.Response, error) {
+	return m.builderGet(builderHTTPClient, url)
+}
+
+// builderGet issues an authenticated GET using the supplied client.
+func (m *Manager) builderGet(client *http.Client, url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	setBuilderAuth(req, m.config.BuilderToken)
+	return client.Do(req)
 }

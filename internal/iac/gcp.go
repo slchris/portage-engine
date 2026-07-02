@@ -730,7 +730,10 @@ func (p *GCPProvisioner) GenerateMainTFWithCloudInit(spec *GCPInstanceSpec, inst
 	initConfig.InstanceID = instanceName
 
 	startupScript := GenerateCloudInitScript(initConfig)
-	// Escape the script for Terraform heredoc
+	// Escape the script for a Terraform (unquoted) heredoc: Terraform interprets
+	// ${ and %{ as interpolation/template sequences, so they must be escaped to
+	// $${ and %%{ respectively. Terraform has no shell-style quoted-heredoc
+	// (<<-'DELIM') syntax, so we must escape rather than rely on quoting.
 	escapedScript := strings.ReplaceAll(startupScript, "${", "$${")
 	escapedScript = strings.ReplaceAll(escapedScript, "%{", "%%{")
 
@@ -781,9 +784,9 @@ resource "google_compute_instance" "portage_builder" {
     managed = "terraform"
   }
 
-  metadata_startup_script = <<-'CLOUDINIT'
+  metadata_startup_script = <<-CLOUDINIT
 %s
-CLOUDINIT
+  CLOUDINIT
 }
 
 output "instance_name" {

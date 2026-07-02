@@ -1,11 +1,21 @@
-// Package main provides a command-line tool for submitting build requests.
+// Package main provides the Portage Engine client.
+//
+// The client is a management/request tool, NOT the way packages are consumed.
+// Consuming prebuilt packages is done natively by Portage: run `configure` once
+// to point /etc/portage/binrepos.conf at the server's binhost, then use the
+// normal `emerge --getbinpkg <pkg>` (emerge fetches from the binhost and falls
+// back to a source build automatically). Portage has no native "request a
+// build" mechanism, so the `build`/`status` subcommands cover that gap.
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -13,191 +23,388 @@ import (
 	"github.com/slchris/portage-engine/internal/builder"
 )
 
-var (
-	serverURL      = flag.String("server", "http://localhost:8080", "Server URL")
-	packageName    = flag.String("package", "", "Package name (e.g., dev-lang/python)")
-	packageVersion = flag.String("version", "", "Package version")
-	useFlags       = flag.String("use", "", "USE flags (comma-separated)")
-	keywords       = flag.String("keywords", "", "Keywords (comma-separated)")
-	configFile     = flag.String("config", "", "Portage configuration file (JSON)")
-	portageDir     = flag.String("portage-dir", "", "Read configuration from Portage directory (e.g., /etc/portage)")
-	arch           = flag.String("arch", "amd64", "Target architecture")
-	profile        = flag.String("profile", "default/linux/amd64/23.0", "Portage profile")
-	outputBundle   = flag.String("output", "", "Output configuration bundle path")
-	userID         = flag.String("user", "default", "User ID")
-	description    = flag.String("desc", "", "Build description")
-)
+const httpTimeout = 60 * time.Second
 
 func main() {
-	flag.Parse()
-
-	if *packageName == "" && *configFile == "" && *portageDir == "" {
+	log.SetFlags(0)
+	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	config := loadPortageConfig()
-	useFlagsList := parseFlags(*useFlags)
-	keywordsList := parseFlags(*keywords)
-	packageSpecs := createPackageSpecs(useFlagsList, keywordsList)
+	cmd := os.Args[1]
+	args := os.Args[2:]
 
-	bundle := createConfigBundle(config, packageSpecs)
+	switch cmd {
+	case "configure":
+		runConfigure(args)
+	case "build":
+		runBuild(args)
+	case "status":
+		runStatus(args)
+	case "bundle":
+		runBundle(args)
+	case "-h", "--help", "help":
+		printUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
+		printUsage()
+		os.Exit(1)
+	}
+}
 
-	if *outputBundle != "" {
-		exportBundle(bundle)
-		return
+func printUsage() {
+	fmt.Print(`Portage Engine client
+
+Usage: portage-client <command> [flags]
+
+Commands:
+  configure   Point Portage at the server's binhost (writes binrepos.conf).
+              After this, install packages the normal way:
+                emerge --getbinpkg <pkg>
+              (or add FEATURES="getbinpkg" to make.conf to make it automatic).
+
+  build       Request the server build a package (Portage has no native way to
+              do this). Optionally wait for completion with -wait.
+
+  status      Show the status of a previously requested build job.
+
+  bundle      Generate a Portage config bundle file (USE flags, make.conf, ...)
+              without submitting a build.
+
+Run 'portage-client <command> -h' for command-specific flags.
+
+Examples:
+  # One-time: configure the consume path, then install natively.
+  sudo portage-client configure -server=http://binhost:8080
+  emerge --getbinpkg dev-lang/python
+
+  # Ask the server to build a package with specific USE flags, and wait.
+  portage-client build -package=dev-lang/python -version=3.11 -use=ssl,threads -wait
+
+  # Check a job later.
+  portage-client status -job=<job-id>
+`)
+}
+
+// --- configure: write binrepos.conf for the native consume path ---
+
+func runConfigure(args []string) {
+	fs := flag.NewFlagSet("configure", flag.ExitOnError)
+	server := fs.String("server", "http://localhost:8080", "Server URL (binhost base)")
+	name := fs.String("name", "portage-engine", "binrepo name")
+	priority := fs.Int("priority", 1, "binrepo priority")
+	out := fs.String("out", "/etc/portage/binrepos.conf/portage-engine.conf", "Output binrepos.conf path")
+	verify := fs.Bool("verify-signature", true, "Require GPG signature verification")
+	_ = fs.Parse(args)
+
+	base := strings.TrimRight(*server, "/")
+	content := fmt.Sprintf("[%s]\npriority = %d\nsync-uri = %s/binpkgs\nverify-signature = %t\n",
+		*name, *priority, base, *verify)
+
+	// binrepos.conf lives under /etc/portage and must be world-readable so
+	// Portage (and emerge run as any user) can read the binhost definition.
+	if err := os.MkdirAll(dirOf(*out), 0o755); err != nil { // #nosec G301 -- Portage config dir must be world-readable.
+		log.Fatalf("failed to create %s: %v", dirOf(*out), err)
+	}
+	if err := os.WriteFile(*out, []byte(content), 0o644); err != nil { // #nosec G306 -- Portage config file must be world-readable.
+		log.Fatalf("failed to write %s: %v", *out, err)
 	}
 
-	submitBuildRequest(bundle)
+	fmt.Printf("Wrote %s:\n\n%s\n", *out, content)
+	fmt.Println("Next: enable binary fetching, then install as usual, e.g.:")
+	fmt.Println("  emerge --getbinpkg <pkg>")
+	fmt.Println("  # or add to /etc/portage/make.conf:  FEATURES=\"getbinpkg\"")
 }
 
-// printUsage prints usage information.
-func printUsage() {
-	fmt.Println("Usage:")
-	flag.PrintDefaults()
-	fmt.Println("\nExamples:")
-	fmt.Println("  # Simple build with USE flags:")
-	fmt.Println("  portage-client -package=dev-lang/python -version=3.11 -use=ssl,threads")
-	fmt.Println("")
-	fmt.Println("  # Build with custom configuration:")
-	fmt.Println("  portage-client -config=myconfig.json -package=dev-lang/python")
-	fmt.Println("")
-	fmt.Println("  # Build using system Portage configuration:")
-	fmt.Println("  portage-client -portage-dir=/etc/portage -package=dev-lang/python")
-	fmt.Println("")
-	fmt.Println("  # Generate configuration bundle from system:")
-	fmt.Println("  portage-client -portage-dir=/etc/portage -package=dev-lang/python -output=bundle.tar.gz")
+func dirOf(path string) string {
+	if i := strings.LastIndex(path, "/"); i > 0 {
+		return path[:i]
+	}
+	return "."
 }
 
-// loadPortageConfig loads Portage configuration from various sources.
-func loadPortageConfig() *builder.PortageConfig {
-	switch {
-	case *portageDir != "":
-		return loadFromPortageDir()
-	case *configFile != "":
-		config, err := loadConfigFromFile(*configFile)
+// --- build: request the server build a package ---
+
+func runBuild(args []string) {
+	fs := flag.NewFlagSet("build", flag.ExitOnError)
+	server := fs.String("server", "http://localhost:8080", "Server URL")
+	apiKey := fs.String("api-key", os.Getenv("PORTAGE_ENGINE_API_KEY"), "API key (or PORTAGE_ENGINE_API_KEY)")
+	packageName := fs.String("package", "", "Package atom (e.g., dev-lang/python)")
+	packageVersion := fs.String("version", "", "Package version")
+	useFlags := fs.String("use", "", "USE flags (comma-separated)")
+	keywords := fs.String("keywords", "", "Keywords (comma-separated)")
+	configFile := fs.String("config", "", "Portage configuration file (JSON)")
+	portageDir := fs.String("portage-dir", "", "Read configuration from a Portage directory (e.g., /etc/portage)")
+	arch := fs.String("arch", "amd64", "Target architecture")
+	profile := fs.String("profile", "default/linux/amd64/23.0", "Portage profile")
+	userID := fs.String("user", "default", "User ID")
+	description := fs.String("desc", "", "Build description")
+	wait := fs.Bool("wait", false, "Wait for the build to complete")
+	_ = fs.Parse(args)
+
+	if *packageName == "" && *configFile == "" && *portageDir == "" {
+		log.Fatal("build: one of -package, -config, or -portage-dir is required")
+	}
+
+	config := loadPortageConfig(*portageDir, *configFile)
+	specs := createPackageSpecs(*packageName, *packageVersion, parseCSV(*useFlags), parseCSV(*keywords))
+	bundle := createConfigBundle(config, specs, *userID, *arch, *profile, *description)
+
+	base := strings.TrimRight(*server, "/")
+	client := &http.Client{Timeout: httpTimeout}
+
+	var failures int
+	for _, pkg := range bundle.Packages.Packages {
+		req := &builder.LocalBuildRequest{PackageName: pkg.Atom, Version: pkg.Version, ConfigBundle: bundle}
+		jobID, err := postSubmit(client, base, *apiKey, req)
 		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
+			log.Printf("build submit failed for %s: %v", pkg.Atom, err)
+			failures++
+			continue
+		}
+		fmt.Printf("Build submitted for %s (job ID: %s)\n", pkg.Atom, jobID)
+
+		if *wait {
+			if err := pollStatus(client, base, *apiKey, jobID); err != nil {
+				log.Printf("build %s did not complete successfully: %v", jobID, err)
+				failures++
+			}
+		}
+	}
+	if failures > 0 {
+		os.Exit(1)
+	}
+}
+
+// --- status: query one job ---
+
+func runStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	server := fs.String("server", "http://localhost:8080", "Server URL")
+	apiKey := fs.String("api-key", os.Getenv("PORTAGE_ENGINE_API_KEY"), "API key (or PORTAGE_ENGINE_API_KEY)")
+	jobID := fs.String("job", "", "Job ID")
+	_ = fs.Parse(args)
+
+	if *jobID == "" {
+		log.Fatal("status: -job is required")
+	}
+
+	base := strings.TrimRight(*server, "/")
+	client := &http.Client{Timeout: httpTimeout}
+	status, errMsg, _, err := fetchStatus(client, base, *apiKey, *jobID)
+	if err != nil {
+		log.Fatalf("failed to fetch status: %v", err)
+	}
+	fmt.Printf("Job %s: %s\n", *jobID, status)
+	if errMsg != "" {
+		fmt.Printf("  error: %s\n", errMsg)
+	}
+}
+
+// --- bundle: generate a config bundle file ---
+
+func runBundle(args []string) {
+	fs := flag.NewFlagSet("bundle", flag.ExitOnError)
+	packageName := fs.String("package", "", "Package atom (e.g., dev-lang/python)")
+	packageVersion := fs.String("version", "", "Package version")
+	useFlags := fs.String("use", "", "USE flags (comma-separated)")
+	keywords := fs.String("keywords", "", "Keywords (comma-separated)")
+	configFile := fs.String("config", "", "Portage configuration file (JSON)")
+	portageDir := fs.String("portage-dir", "", "Read configuration from a Portage directory")
+	arch := fs.String("arch", "amd64", "Target architecture")
+	profile := fs.String("profile", "default/linux/amd64/23.0", "Portage profile")
+	userID := fs.String("user", "default", "User ID")
+	description := fs.String("desc", "", "Build description")
+	out := fs.String("out", "", "Output bundle path (required)")
+	_ = fs.Parse(args)
+
+	if *out == "" {
+		log.Fatal("bundle: -out is required")
+	}
+
+	config := loadPortageConfig(*portageDir, *configFile)
+	specs := createPackageSpecs(*packageName, *packageVersion, parseCSV(*useFlags), parseCSV(*keywords))
+	bundle := createConfigBundle(config, specs, *userID, *arch, *profile, *description)
+
+	transfer := builder.NewConfigTransfer("")
+	if err := transfer.ExportBundle(bundle, *out); err != nil {
+		log.Fatalf("failed to export bundle: %v", err)
+	}
+	fmt.Printf("Configuration bundle saved to: %s\n", *out)
+}
+
+// --- shared helpers ---
+
+func loadPortageConfig(portageDir, configFile string) *builder.PortageConfig {
+	switch {
+	case portageDir != "":
+		transfer := builder.NewConfigTransfer("")
+		config, err := transfer.ReadSystemPortageConfig(portageDir)
+		if err != nil {
+			log.Fatalf("failed to read Portage configuration from %s: %v", portageDir, err)
+		}
+		log.Printf("Loaded configuration from %s (%d package.use entries, %d repos)",
+			portageDir, len(config.PackageUse), len(config.Repos))
+		return config
+	case configFile != "":
+		config, err := loadConfigFromFile(configFile)
+		if err != nil {
+			log.Fatalf("failed to load config: %v", err)
 		}
 		return config
 	default:
-		return createEmptyConfig()
+		return &builder.PortageConfig{
+			PackageUse:      make(map[string][]string),
+			PackageKeywords: make(map[string][]string),
+			MakeConf:        make(map[string]string),
+			Environment:     make(map[string]string),
+		}
 	}
 }
 
-// loadFromPortageDir loads config from system Portage directory.
-func loadFromPortageDir() *builder.PortageConfig {
-	transfer := builder.NewConfigTransfer("")
-	config, err := transfer.ReadSystemPortageConfig(*portageDir)
-	if err != nil {
-		log.Fatalf("Failed to read Portage configuration from %s: %v", *portageDir, err)
-	}
-	log.Printf("Successfully loaded configuration from %s", *portageDir)
-	log.Printf("Found %d package.use entries, %d repos", len(config.PackageUse), len(config.Repos))
-	return config
-}
-
-// createEmptyConfig creates an empty Portage configuration.
-func createEmptyConfig() *builder.PortageConfig {
-	return &builder.PortageConfig{
-		PackageUse:      make(map[string][]string),
-		PackageKeywords: make(map[string][]string),
-		MakeConf:        make(map[string]string),
-		Environment:     make(map[string]string),
-	}
-}
-
-// parseFlags parses comma-separated flags.
-func parseFlags(flags string) []string {
-	if flags == "" {
+func parseCSV(s string) []string {
+	if s == "" {
 		return nil
 	}
-
-	parts := strings.Split(flags, ",")
-	for i, part := range parts {
-		parts[i] = strings.TrimSpace(part)
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
 	}
-	return parts
+	return out
 }
 
-// createPackageSpecs creates package specifications.
-func createPackageSpecs(useFlagsList, keywordsList []string) []builder.PackageSpec {
-	if *packageName == "" {
+func createPackageSpecs(name, version string, useFlags, keywords []string) []builder.PackageSpec {
+	if name == "" {
 		return []builder.PackageSpec{}
 	}
-
-	spec := builder.PackageSpec{
-		Atom:     *packageName,
-		Version:  *packageVersion,
-		UseFlags: useFlagsList,
-		Keywords: keywordsList,
-	}
-	return []builder.PackageSpec{spec}
+	return []builder.PackageSpec{{
+		Atom:     name,
+		Version:  version,
+		UseFlags: useFlags,
+		Keywords: keywords,
+	}}
 }
 
-// createConfigBundle creates a configuration bundle.
-func createConfigBundle(config *builder.PortageConfig, packageSpecs []builder.PackageSpec) *builder.ConfigBundle {
-	packages := &builder.BuildPackageSpec{
-		Packages: packageSpecs,
-	}
-
+func createConfigBundle(config *builder.PortageConfig, specs []builder.PackageSpec, userID, arch, profile, desc string) *builder.ConfigBundle {
+	packages := &builder.BuildPackageSpec{Packages: specs}
 	metadata := builder.BundleMetadata{
-		UserID:      *userID,
-		TargetArch:  *arch,
-		Profile:     *profile,
+		UserID:      userID,
+		TargetArch:  arch,
+		Profile:     profile,
 		CreatedAt:   time.Now().Format(time.RFC3339),
-		Description: *description,
+		Description: desc,
 	}
-
 	transfer := builder.NewConfigTransfer("")
 	bundle, err := transfer.CreateConfigBundle(config, packages, metadata)
 	if err != nil {
-		log.Fatalf("Failed to create config bundle: %v", err)
+		log.Fatalf("failed to create config bundle: %v", err)
 	}
-
 	return bundle
 }
 
-// exportBundle exports the bundle to a file.
-func exportBundle(bundle *builder.ConfigBundle) {
-	transfer := builder.NewConfigTransfer("")
-	if err := transfer.ExportBundle(bundle, *outputBundle); err != nil {
-		log.Fatalf("Failed to export bundle: %v", err)
-	}
-	fmt.Printf("Configuration bundle saved to: %s\n", *outputBundle)
-}
-
-// loadConfigFromFile loads Portage configuration from a JSON file.
 func loadConfigFromFile(path string) (*builder.PortageConfig, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- user-provided config path.
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
-
 	var config builder.PortageConfig
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
-
 	return &config, nil
 }
 
-// submitBuildRequest submits a build request to the server.
-func submitBuildRequest(bundle *builder.ConfigBundle) {
-	client := builder.NewBuilderClient(*serverURL)
-
-	for _, pkg := range bundle.Packages.Packages {
-		req := &builder.LocalBuildRequest{
-			PackageName:  pkg.Atom,
-			Version:      pkg.Version,
-			ConfigBundle: bundle,
-		}
-
-		jobID, err := client.SubmitBuild(req)
-		if err != nil {
-			log.Fatalf("Failed to submit build: %v", err)
-		}
-
-		fmt.Printf("Build submitted for %s (job ID: %s)\n", pkg.Atom, jobID)
+// postSubmit POSTs a config-bundle build to /api/v1/builds/submit.
+func postSubmit(c *http.Client, base, apiKey string, req *builder.LocalBuildRequest) (string, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
 	}
+
+	httpReq, err := http.NewRequest(http.MethodPost, base+"/api/v1/builds/submit", bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		httpReq.Header.Set("X-API-Key", apiKey)
+	}
+
+	resp, err := c.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var out struct {
+		JobID  string `json:"job_id"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	if out.JobID == "" {
+		return "", fmt.Errorf("server did not return a job_id")
+	}
+	return out.JobID, nil
+}
+
+// pollStatus polls until the job succeeds or fails.
+func pollStatus(c *http.Client, base, apiKey, jobID string) error {
+	for {
+		status, errMsg, terminal, err := fetchStatus(c, base, apiKey, jobID)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("  [%s] status: %s\n", jobID, status)
+		if terminal {
+			if status == "failed" {
+				return fmt.Errorf("build failed: %s", errMsg)
+			}
+			return nil
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+// fetchStatus queries the status endpoint once.
+func fetchStatus(c *http.Client, base, apiKey, jobID string) (status, errMsg string, terminal bool, err error) {
+	httpReq, err := http.NewRequest(http.MethodGet, base+"/api/v1/packages/status?job_id="+jobID, nil)
+	if err != nil {
+		return "", "", false, err
+	}
+	if apiKey != "" {
+		httpReq.Header.Set("X-API-Key", apiKey)
+	}
+
+	resp, err := c.Do(httpReq)
+	if err != nil {
+		return "", "", false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", "", false, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var out struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", "", false, fmt.Errorf("decode status: %w", err)
+	}
+
+	term := out.Status == "success" || out.Status == "completed" || out.Status == "failed"
+	return out.Status, out.Error, term, nil
 }

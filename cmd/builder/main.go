@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,9 +26,36 @@ func main() {
 	bldr := builder.NewLocalBuilder(cfg.Workers, signer, cfg)
 
 	mux := setupHTTPHandlers(bldr)
-	server := startServer(cfg, mux)
+	handler := authMiddleware(cfg.AuthToken, mux)
+	server := startServer(cfg, handler)
 
 	waitForShutdown(server, bldr)
+}
+
+// authMiddleware requires a shared token on every endpoint except /health.
+// The token is presented as "X-API-Key: <token>" or "Authorization: Bearer <token>".
+// If token is empty, auth is disabled (a startup warning is logged separately).
+func authMiddleware(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if token == "" || r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		provided := r.Header.Get("X-API-Key")
+		if provided == "" {
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+				provided = strings.TrimPrefix(auth, "Bearer ")
+			}
+		}
+
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			http.Error(w, "unauthorized: invalid or missing builder token", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // loadConfig loads and parses configuration.
@@ -44,21 +73,52 @@ func loadConfig() *config.BuilderConfig {
 		cfg.Port = *port
 	}
 
+	for _, w := range cfg.Validate() {
+		log.Printf("WARNING: %s", w)
+	}
+
 	log.Printf("Starting Portage Builder Service on port %d", cfg.Port)
 	return cfg
 }
 
-// initGPGSigner initializes GPG signer if enabled.
+// initGPGSigner initializes the GPG signer if enabled. It ensures a signing
+// keypair exists in the builder's GNUPGHOME (auto-creating one when no key ID is
+// configured) so emerge's native binpkg-signing has a private key to sign with,
+// and propagates the resolved key ID into the config for the executor.
 func initGPGSigner(cfg *config.BuilderConfig) *gpg.Signer {
 	if !cfg.GPGEnabled {
 		return nil
 	}
 
-	signer := gpg.NewSigner(cfg.GPGKeyID, cfg.GPGKeyPath, true)
+	// GPG setup failures disable signing with a loud warning rather than
+	// crashing the builder: an environment without gpg / entropy / a writable
+	// GPG_HOME can still run builds (they will just be unsigned).
 	if err := gpg.CheckGPG(); err != nil {
-		log.Fatalf("GPG check failed: %v", err)
+		log.Printf("WARNING: GPG unavailable (%v); builds will be UNSIGNED", err)
+		cfg.GPGEnabled = false
+		return nil
 	}
-	log.Printf("GPG signing enabled with key: %s", cfg.GPGKeyID)
+
+	opts := []gpg.SignerOption{}
+	if cfg.GPGHome != "" {
+		opts = append(opts, gpg.WithGnupgHome(cfg.GPGHome))
+	}
+	// If no key ID is configured, auto-create a builder signing key.
+	if cfg.GPGKeyID == "" {
+		opts = append(opts, gpg.WithAutoCreate("Portage Engine Builder", "builder@portage-engine"))
+	}
+
+	signer := gpg.NewSigner(cfg.GPGKeyID, cfg.GPGKeyPath, true, opts...)
+	if err := signer.Initialize(); err != nil {
+		log.Printf("WARNING: failed to initialize GPG signing key (%v); builds will be UNSIGNED", err)
+		cfg.GPGEnabled = false
+		cfg.GPGKeyID = ""
+		return nil
+	}
+
+	// Propagate the resolved key ID so the build executor enables binpkg-signing.
+	cfg.GPGKeyID = signer.KeyID()
+	log.Printf("GPG signing enabled with key: %s (GNUPGHOME=%s)", cfg.GPGKeyID, cfg.GPGHome)
 	return signer
 }
 
@@ -193,10 +253,10 @@ func setupHTTPHandlers(bldr *builder.LocalBuilder) *http.ServeMux {
 }
 
 // startServer starts the HTTP server.
-func startServer(cfg *config.BuilderConfig, mux *http.ServeMux) *http.Server {
+func startServer(cfg *config.BuilderConfig, handler http.Handler) *http.Server {
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           loggingMiddleware(mux),
+		Handler:           loggingMiddleware(handler),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

@@ -1028,6 +1028,15 @@ func TestGCPProvisioner_GenerateMainTFWithCloudInit(t *testing.T) {
 	if !strings.Contains(tf, "9090") {
 		t.Error("Missing builder port in startup script")
 	}
+
+	// Finding #49: the heredoc must be Terraform-valid, not a shell-style quoted
+	// heredoc (<<-'CLOUDINIT'), which is not valid HCL.
+	if strings.Contains(tf, "<<-'CLOUDINIT'") || strings.Contains(tf, `<<-"CLOUDINIT"`) {
+		t.Error("Generated TF uses shell-style quoted heredoc, which is invalid HCL")
+	}
+	if !strings.Contains(tf, "<<-CLOUDINIT") {
+		t.Error("Generated TF should use an unquoted Terraform heredoc")
+	}
 }
 
 func TestGCPProvisioner_GenerateMainTFWithCloudInit_CustomConfig(t *testing.T) {

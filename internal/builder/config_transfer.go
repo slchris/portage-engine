@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -596,18 +597,34 @@ func (ct *ConfigTransfer) addPackageUnmaskToTar(tw *tar.Writer, packageUnmask []
 	return ct.addFileToTar(tw, "etc/portage/package.unmask/00-user", []byte(content))
 }
 
-// addMakeConfToTar adds make.conf to tarball.
+// makeConfFragmentPath is where the user's make.conf overrides are stored inside
+// the config bundle. Portage does NOT source make.conf.d/, so the executor
+// appends this fragment to the container's real /etc/portage/make.conf instead
+// of relying on a make.conf.d drop-in.
+const makeConfFragmentPath = "etc/portage/make.conf.portage-engine"
+
+// renderMakeConf renders a make.conf fragment from the given settings.
+func renderMakeConf(makeConf map[string]string) []byte {
+	lines := make([]string, 0, len(makeConf)+1)
+	lines = append(lines, "# Appended by portage-engine (user make.conf overrides)")
+	// Emit keys in sorted order for deterministic output.
+	keys := make([]string, 0, len(makeConf))
+	for k := range makeConf {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		lines = append(lines, fmt.Sprintf("%s=\"%s\"", key, makeConf[key]))
+	}
+	return []byte(strings.Join(lines, "\n") + "\n")
+}
+
+// addMakeConfToTar adds the make.conf override fragment to the tarball.
 func (ct *ConfigTransfer) addMakeConfToTar(tw *tar.Writer, makeConf map[string]string) error {
 	if len(makeConf) == 0 {
 		return nil
 	}
-
-	lines := make([]string, 0, len(makeConf))
-	for key, value := range makeConf {
-		lines = append(lines, fmt.Sprintf("%s=\"%s\"", key, value))
-	}
-	content := strings.Join(lines, "\n") + "\n"
-	return ct.addFileToTar(tw, "etc/portage/make.conf.d/00-user", []byte(content))
+	return ct.addFileToTar(tw, makeConfFragmentPath, renderMakeConf(makeConf))
 }
 
 // addReposConfToTar adds repos.conf to tarball.
@@ -824,21 +841,24 @@ func (ct *ConfigTransfer) writePackageUnmask(portageDir string, packageUnmask []
 	return nil
 }
 
-// writeMakeConf writes make.conf configuration.
+// writeMakeConf appends the make.conf overrides to the real make.conf. Portage
+// only reads the make.conf file itself (not make.conf.d/), so we append to it
+// rather than dropping a file into make.conf.d, and we append rather than
+// overwrite so the stage3's CHOST/CFLAGS/etc. are preserved.
 func (ct *ConfigTransfer) writeMakeConf(portageDir string, makeConf map[string]string) error {
 	if len(makeConf) == 0 {
 		return nil
 	}
 
-	lines := make([]string, 0, len(makeConf))
-	for key, value := range makeConf {
-		lines = append(lines, fmt.Sprintf("%s=\"%s\"", key, value))
+	path := filepath.Join(portageDir, "make.conf")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644) // #nosec G302 -- make.conf must be world-readable.
+	if err != nil {
+		return fmt.Errorf("failed to open make.conf: %w", err)
 	}
-	content := strings.Join(lines, "\n") + "\n"
-	path := filepath.Join(portageDir, "make.conf.d", "00-user")
+	defer func() { _ = f.Close() }()
 
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		return fmt.Errorf("failed to write make.conf: %w", err)
+	if _, err := f.Write(append([]byte("\n"), renderMakeConf(makeConf)...)); err != nil {
+		return fmt.Errorf("failed to append make.conf: %w", err)
 	}
 	return nil
 }

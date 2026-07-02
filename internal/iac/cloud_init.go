@@ -21,6 +21,7 @@ type CloudInitConfig struct {
 	// Builder service configuration
 	BuilderBinaryURL  string `json:"builder_binary_url"`
 	BuilderPort       int    `json:"builder_port"`
+	BuilderToken      string `json:"builder_token"`
 	ServerCallbackURL string `json:"server_callback_url"`
 	InstanceID        string `json:"instance_id"`
 	Architecture      string `json:"architecture"`
@@ -58,6 +59,34 @@ func DefaultCloudInitConfig() *CloudInitConfig {
 		SwapSizeGB:        4,
 		EnableFirewall:    true,
 		ExtraPackages:     []string{},
+	}
+}
+
+// shellSingleQuote wraps s in single quotes for safe use as a shell word,
+// escaping any embedded single quotes.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// heredocEscape escapes $, backtick, and backslash so a value embedded in an
+// UNQUOTED heredoc lands literally instead of being shell-expanded.
+func heredocEscape(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, "`", "\\`", `$`, `\$`)
+	return r.Replace(s)
+}
+
+// marchForArch returns a safe, portable -march baseline for the given arch.
+// It never returns "native": a binhost farm must produce packages that run on
+// any consumer of that arch, not just the exact CPU that happened to build them.
+func marchForArch(arch string) string {
+	switch arch {
+	case "arm64", "aarch64":
+		return "armv8-a"
+	case "amd64", "x86_64", "":
+		// x86-64-v2 (SSE4.2/POPCNT) is broadly compatible with modern x86-64.
+		return "x86-64-v2"
+	default:
+		return "x86-64-v2"
 	}
 }
 
@@ -181,7 +210,7 @@ fi
 `)
 
 	// Create directories
-	sb.WriteString(fmt.Sprintf(`# Create directories
+	fmt.Fprintf(&sb, `# Create directories
 log "Creating directories..."
 mkdir -p %s
 mkdir -p %s
@@ -189,11 +218,11 @@ mkdir -p %s
 mkdir -p /opt/portage-builder
 mkdir -p /var/log/portage-engine
 
-`, config.DataDir, config.WorkDir, config.ArtifactDir))
+`, config.DataDir, config.WorkDir, config.ArtifactDir)
 
 	// Setup swap
 	if config.SwapSizeGB > 0 {
-		sb.WriteString(fmt.Sprintf(`# Setup swap
+		fmt.Fprintf(&sb, `# Setup swap
 setup_swap() {
     if [ ! -f /swapfile ]; then
         log "Creating %dGB swap file..."
@@ -207,7 +236,7 @@ setup_swap() {
 }
 setup_swap
 
-`, config.SwapSizeGB, config.SwapSizeGB, config.SwapSizeGB))
+`, config.SwapSizeGB, config.SwapSizeGB, config.SwapSizeGB)
 	}
 
 	// Pull Docker image
@@ -216,15 +245,28 @@ setup_swap
 		dockerImage = config.DockerRegistry + "/" + config.DockerImage
 	}
 
-	sb.WriteString(fmt.Sprintf(`# Pull Gentoo Docker image
+	fmt.Fprintf(&sb, `# Pull Gentoo Docker image
 log "Pulling Docker image: %s"
 docker pull %s || error_exit "Failed to pull Docker image"
 log "Docker image pulled successfully"
 
-`, dockerImage, dockerImage))
+`, dockerImage, dockerImage)
 
-	// Setup Portage configuration
-	sb.WriteString(fmt.Sprintf(`# Setup Portage directories and configuration
+	// Setup Portage configuration.
+	//
+	// NPROC and MARCH are resolved by the shell BEFORE the heredoc and the
+	// heredoc is unquoted, so ${NPROC}/${MARCH} expand to concrete values.
+	// Portage's make.conf parser does NOT evaluate $() command substitution, so
+	// writing "$(nproc)" literally would break emerge — we must resolve it here.
+	// MARCH is a fixed baseline per advertised arch (never -march=native), so
+	// packages built on any instance run on any consumer of that arch.
+	march := marchForArch(config.Architecture)
+	binhostLine := ""
+	if config.PortageBinpkgHost != "" {
+		binhostLine = fmt.Sprintf("PORTAGE_BINHOST=\"%s\"\n", config.PortageBinpkgHost)
+	}
+
+	fmt.Fprintf(&sb, `# Setup Portage directories and configuration
 log "Setting up Portage configuration..."
 
 # Create portage directories
@@ -232,13 +274,17 @@ mkdir -p %s/repos/gentoo
 mkdir -p %s/distfiles
 mkdir -p %s/packages
 
-# Create make.conf for the container
-cat > %s/make.conf <<'MAKECONF'
+# Resolve CPU count and march baseline at run time (Portage cannot evaluate $()).
+NPROC="$(nproc)"
+MARCH="%s"
+
+# Create make.conf for the container (unquoted heredoc: ${NPROC}/${MARCH} expand).
+cat > %s/make.conf <<MAKECONF
 # Portage Engine Builder Configuration
-CFLAGS="-O2 -pipe -march=native"
-CXXFLAGS="${CFLAGS}"
-MAKEOPTS="-j$(nproc)"
-EMERGE_DEFAULT_OPTS="--jobs=$(nproc) --load-average=$(nproc).0"
+CFLAGS="-O2 -pipe -march=${MARCH}"
+CXXFLAGS="\${CFLAGS}"
+MAKEOPTS="-j${NPROC}"
+EMERGE_DEFAULT_OPTS="--jobs=${NPROC} --load-average=${NPROC}"
 
 # Portage directories
 PORTDIR="/var/db/repos/gentoo"
@@ -252,22 +298,30 @@ FEATURES="buildpkg binpkg-multi-instance parallel-fetch parallel-install"
 GENTOO_MIRRORS="%s"
 
 # Binary packages host
-`, config.DataDir, config.DataDir, config.DataDir, config.DataDir, config.PortageMirror))
+%sMAKECONF
 
-	if config.PortageBinpkgHost != "" {
-		sb.WriteString(fmt.Sprintf(`PORTAGE_BINHOST="%s"
-`, config.PortageBinpkgHost))
-	}
+log "Portage configuration created (march=${MARCH}, jobs=${NPROC})"
 
-	sb.WriteString(`MAKECONF
+`, config.DataDir, config.DataDir, config.DataDir, march, config.DataDir, config.PortageMirror, binhostLine)
 
-log "Portage configuration created"
+	// Build a real /etc/portage in DataDir so the builder's bind mount has a
+	// valid profile symlink + our make.conf. Without this the container gets an
+	// empty /etc/portage and every emerge fails ("make.profile is not a symlink").
+	fmt.Fprintf(&sb, `# Seed a valid /etc/portage for the build container
+log "Preparing container /etc/portage..."
+mkdir -p %s/portage
+# Copy the stage3 image's /etc/portage (profile symlink, repos.conf, etc).
+docker run --rm -v %s/portage:/out %s \
+    sh -c 'cp -a /etc/portage/. /out/ 2>/dev/null || true' || log "Warning: could not seed /etc/portage from image"
+# Overlay our generated make.conf.
+cp %s/make.conf %s/portage/make.conf
+log "Container /etc/portage prepared"
 
-`)
+`, config.DataDir, config.DataDir, dockerImage, config.DataDir, config.DataDir)
 
 	// Sync Portage tree
 	if config.PortageTreeSync {
-		sb.WriteString(fmt.Sprintf(`# Sync Portage tree
+		fmt.Fprintf(&sb, `# Sync Portage tree
 log "Syncing Portage tree..."
 docker run --rm \
     -v %s/repos/gentoo:/var/db/repos/gentoo \
@@ -276,32 +330,54 @@ docker run --rm \
 
 log "Portage tree sync complete"
 
-`, config.DataDir, dockerImage))
+`, config.DataDir, dockerImage)
 	}
 
 	// Download builder binary if URL provided
 	if config.BuilderBinaryURL != "" {
-		sb.WriteString(fmt.Sprintf(`# Download builder binary
+		fmt.Fprintf(&sb, `# Download builder binary
 log "Downloading builder binary..."
 curl -fsSL -o /opt/portage-builder/portage-builder "%s" || error_exit "Failed to download builder"
 chmod +x /opt/portage-builder/portage-builder
 log "Builder binary downloaded"
 
-`, config.BuilderBinaryURL))
+`, config.BuilderBinaryURL)
 	}
 
-	// Create builder configuration
-	instanceID := config.InstanceID
-	if instanceID == "" {
-		instanceID = "$(hostname)"
+	// Create builder configuration.
+	//
+	// The directory must exist BEFORE the write (the script runs under `set -e`,
+	// so a redirection into a missing directory would abort the whole bootstrap).
+	// INSTANCE_ID is resolved by the shell (`$(hostname)` when unset) via an
+	// unquoted heredoc, so the builder registers with a real ID rather than the
+	// literal string "$(hostname)" (systemd EnvironmentFile does no expansion).
+	//
+	// PORTAGE_*_PATH / MAKE_CONF_PATH point the builder at the synced tree and
+	// generated make.conf in DataDir, so the build container mounts real content
+	// instead of empty host dirs (/var/db/repos, /etc/portage don't exist on the
+	// Ubuntu/CentOS host).
+	// INSTANCE_ID_VAL is a shell assignment: single-quote a supplied value, or
+	// use the unquoted $(hostname) command substitution when unset.
+	instanceIDAssign := "$(hostname)"
+	if config.InstanceID != "" {
+		instanceIDAssign = shellSingleQuote(config.InstanceID)
 	}
 
-	sb.WriteString(fmt.Sprintf(`# Create builder configuration
+	// The remaining values are embedded inside an unquoted heredoc, so they must
+	// be escaped so $, `, and \ land literally (not shell-expanded).
+	tokenLine := ""
+	if config.BuilderToken != "" {
+		tokenLine = fmt.Sprintf("BUILDER_TOKEN=%s\n", heredocEscape(config.BuilderToken))
+	}
+
+	fmt.Fprintf(&sb, `# Create builder configuration
 log "Creating builder configuration..."
-cat > /etc/portage-engine/builder.conf <<'BUILDERCONF'
+mkdir -p /etc/portage-engine
+INSTANCE_ID_VAL=%s
+cat > /etc/portage-engine/builder.conf <<BUILDERCONF
 # Portage Builder Configuration
 BUILDER_PORT=%d
-INSTANCE_ID=%s
+INSTANCE_ID=${INSTANCE_ID_VAL}
 ARCHITECTURE=%s
 USE_DOCKER=true
 DOCKER_IMAGE=%s
@@ -311,12 +387,17 @@ DATA_DIR=%s
 PERSISTENCE_ENABLED=true
 RETENTION_DAYS=7
 SERVER_URL=%s
+%sPORTAGE_REPOS_PATH=%s/repos
+PORTAGE_CONF_PATH=%s/portage
+MAKE_CONF_PATH=%s/make.conf
 BUILDERCONF
 
 log "Builder configuration created"
 
-`, config.BuilderPort, instanceID, config.Architecture, dockerImage,
-		config.WorkDir, config.ArtifactDir, config.DataDir, config.ServerCallbackURL))
+`, instanceIDAssign, config.BuilderPort, heredocEscape(config.Architecture), heredocEscape(dockerImage),
+		heredocEscape(config.WorkDir), heredocEscape(config.ArtifactDir), heredocEscape(config.DataDir),
+		heredocEscape(config.ServerCallbackURL), tokenLine,
+		config.DataDir, config.DataDir, config.DataDir)
 
 	// Create systemd service
 	sb.WriteString(`# Create systemd service
@@ -340,7 +421,6 @@ StandardError=append:/var/log/portage-engine/builder.log
 WantedBy=multi-user.target
 SERVICEUNIT
 
-mkdir -p /etc/portage-engine
 systemctl daemon-reload
 
 `)
@@ -360,7 +440,7 @@ fi
 
 	// Configure firewall if enabled
 	if config.EnableFirewall {
-		sb.WriteString(fmt.Sprintf(`# Configure firewall
+		fmt.Fprintf(&sb, `# Configure firewall
 configure_firewall() {
     log "Configuring firewall..."
 
@@ -391,13 +471,13 @@ configure_firewall() {
 }
 configure_firewall
 
-`, config.BuilderPort, config.BuilderPort, config.BuilderPort))
+`, config.BuilderPort, config.BuilderPort, config.BuilderPort)
 	}
 
 	// Install extra packages
 	if len(config.ExtraPackages) > 0 {
 		pkgs := strings.Join(config.ExtraPackages, " ")
-		sb.WriteString(fmt.Sprintf(`# Install extra packages
+		fmt.Fprintf(&sb, `# Install extra packages
 log "Installing extra packages: %s"
 case $OS in
     ubuntu|debian)
@@ -411,22 +491,23 @@ case $OS in
         ;;
 esac
 
-`, pkgs, pkgs, pkgs, pkgs))
+`, pkgs, pkgs, pkgs, pkgs)
 	}
 
-	// Callback to server
+	// Callback to server. INSTANCE_ID_VAL is the shell variable set in the
+	// builder-config block, so the registration uses the real instance ID.
 	if config.ServerCallbackURL != "" {
-		sb.WriteString(fmt.Sprintf(`# Notify server that instance is ready
+		fmt.Fprintf(&sb, `# Notify server that instance is ready
 log "Notifying server..."
 PUBLIC_IP=$(curl -s http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip -H "Metadata-Flavor: Google" 2>/dev/null || curl -s http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || hostname -I | awk '{print $1}')
 
 curl -s -X POST "%s/api/v1/builders/register" \
     -H "Content-Type: application/json" \
-    -d "{\"instance_id\": \"%s\", \"ip_address\": \"$PUBLIC_IP\", \"port\": %d, \"status\": \"ready\"}" || true
+    -d "{\"instance_id\": \"${INSTANCE_ID_VAL}\", \"ip_address\": \"${PUBLIC_IP}\", \"port\": %d, \"status\": \"ready\"}" || true
 
 log "Server notified"
 
-`, config.ServerCallbackURL, instanceID, config.BuilderPort))
+`, config.ServerCallbackURL, config.BuilderPort)
 	}
 
 	// Final status

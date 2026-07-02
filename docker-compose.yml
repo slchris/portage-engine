@@ -3,23 +3,37 @@
 #   - Server (local): Receives requests and dispatches to builders
 #   - Builder 1 & 2 (remote): Build packages using Docker containers
 #   - Dashboard (local): Web UI for monitoring
-
-version: '3.8'
+#
+# NOTE: The builders run real Gentoo builds inside Docker containers
+# (USE_DOCKER=true), so they need access to a Docker daemon. This example
+# bind-mounts the host's Docker socket (/var/run/docker.sock) into each builder
+# and installs the docker CLI at startup. This is "Docker-out-of-Docker": the
+# builders drive the HOST Docker daemon. Ensure the host user running Compose
+# can access the Docker socket.
+#
+# The Go base image (golang:1.25.3) matches the version in go.mod; an older
+# image (e.g. golang:1.21) cannot build this project.
 
 services:
   # Portage Engine Server (local control plane)
   portage-server:
-    image: golang:1.21
+    image: golang:1.25.3
     container_name: portage-server
     working_dir: /app
     volumes:
       - ./:/app
-      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8080:8080"
-    command: ["./bin/portage-server", "-config", "configs/server.yaml"]
+    # Build the binary, then run it with a non-existent config path so the
+    # server uses built-in defaults + the environment below. (Passing a shipped
+    # .conf would win over these env vars — config-file values take precedence —
+    # and point the demo at placeholder hosts.)
+    command: >
+      sh -c "go build -o bin/portage-server cmd/server/main.go &&
+             ./bin/portage-server -config /nonexistent.conf"
     environment:
-      - BUILDERS=http://builder1:9090,http://builder2:9090
+      # Env var names must match what pkg/config reads (see config.go).
+      - REMOTE_BUILDERS=http://builder1:9090,http://builder2:9090
     networks:
       - portage-net
     depends_on:
@@ -28,19 +42,24 @@ services:
 
   # Builder Instance 1 (remote builder)
   builder1:
-    image: golang:1.21
+    image: golang:1.25.3
     container_name: portage-builder1
     working_dir: /app
     volumes:
       - ./:/app
+      # Docker-out-of-Docker: builders drive the host Docker daemon.
       - /var/run/docker.sock:/var/run/docker.sock
       - builder1-work:/var/tmp/portage-builds
       - builder1-artifacts:/var/tmp/portage-artifacts
     ports:
       - "9091:9090"
-    command: ["./bin/portage-builder", "-port", "9090"]
+    # Install the docker CLI (needed for USE_DOCKER builds), build, then run.
+    command: >
+      sh -c "apt-get update && apt-get install -y --no-install-recommends docker.io &&
+             go build -o bin/portage-builder cmd/builder/main.go &&
+             ./bin/portage-builder -port 9090"
     environment:
-      - WORKERS=2
+      - BUILDER_WORKERS=2
       - USE_DOCKER=true
       - DOCKER_IMAGE=gentoo/stage3:latest
       - BUILD_WORK_DIR=/var/tmp/portage-builds
@@ -51,19 +70,23 @@ services:
 
   # Builder Instance 2 (remote builder)
   builder2:
-    image: golang:1.21
+    image: golang:1.25.3
     container_name: portage-builder2
     working_dir: /app
     volumes:
       - ./:/app
+      # Docker-out-of-Docker: builders drive the host Docker daemon.
       - /var/run/docker.sock:/var/run/docker.sock
       - builder2-work:/var/tmp/portage-builds
       - builder2-artifacts:/var/tmp/portage-artifacts
     ports:
       - "9092:9090"
-    command: ["./bin/portage-builder", "-port", "9090"]
+    command: >
+      sh -c "apt-get update && apt-get install -y --no-install-recommends docker.io &&
+             go build -o bin/portage-builder cmd/builder/main.go &&
+             ./bin/portage-builder -port 9090"
     environment:
-      - WORKERS=2
+      - BUILDER_WORKERS=2
       - USE_DOCKER=true
       - DOCKER_IMAGE=gentoo/stage3:latest
       - BUILD_WORK_DIR=/var/tmp/portage-builds
@@ -74,14 +97,19 @@ services:
 
   # Dashboard (local web UI)
   portage-dashboard:
-    image: golang:1.21
+    image: golang:1.25.3
     container_name: portage-dashboard
     working_dir: /app
     volumes:
       - ./:/app
     ports:
       - "8081:8081"
-    command: ["./bin/portage-dashboard", "-config", "configs/dashboard.yaml"]
+    command: >
+      sh -c "go build -o bin/portage-dashboard cmd/dashboard/main.go &&
+             ./bin/portage-dashboard -config /nonexistent.conf"
+    environment:
+      # Point the dashboard at the server service on the compose network.
+      - SERVER_URL=http://portage-server:8080
     networks:
       - portage-net
     depends_on:

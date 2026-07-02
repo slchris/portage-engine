@@ -31,8 +31,21 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Override port if specified
-	if *port != 8081 {
+	// Validate configuration (will reject insecure JWT secrets)
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Configuration validation failed: %v", err)
+	}
+
+	// Override port only if the -port flag was explicitly set (so it can force
+	// the default value over a config-file port; comparing to the default would
+	// silently ignore "-port 8081").
+	portSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "port" {
+			portSet = true
+		}
+	})
+	if portSet {
 		cfg.Port = *port
 	}
 
@@ -67,7 +80,6 @@ func main() {
 	defer cancel()
 
 	if err := httpServer.Shutdown(ctx); err != nil {
-		log.Printf("Dashboard forced to shutdown: %v", err)
 		log.Printf("Dashboard forced to shutdown: %v", err)
 		return
 	}

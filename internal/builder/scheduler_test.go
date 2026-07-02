@@ -565,3 +565,79 @@ func TestTaskTimestamps(t *testing.T) {
 		t.Error("Start time should be after submit time")
 	}
 }
+
+// TestGetTaskStatusReturnsCopy verifies GetTaskStatus returns a copy that is
+// not affected by subsequent scheduler mutations of the stored task.
+func TestGetTaskStatusReturnsCopy(t *testing.T) {
+	s := NewScheduler(10)
+	s.RegisterBuilder("builder1", "http://builder1:9090", 2)
+
+	deps := []string{"dev-libs/foo-1.0"}
+	if err := s.SubmitTask("job1", "pkg1", "1.0", 5, 0, deps); err != nil {
+		t.Fatalf("SubmitTask failed: %v", err)
+	}
+
+	// completedPkgs is empty so the task should be waiting on deps.
+	snapshot, err := s.GetTaskStatus("job1")
+	if err != nil {
+		t.Fatalf("GetTaskStatus failed: %v", err)
+	}
+
+	// The returned pointer must not be the live stored task.
+	s.mu.RLock()
+	live := s.tasks["job1"]
+	s.mu.RUnlock()
+	if snapshot == live {
+		t.Fatal("GetTaskStatus returned the live task pointer, expected a copy")
+	}
+
+	origState := snapshot.State
+
+	// Mutate the returned copy; the stored task must be unaffected.
+	snapshot.State = "mutated-by-caller"
+	snapshot.Dependencies[0] = "mutated-dep"
+
+	s.mu.RLock()
+	if live.State == "mutated-by-caller" {
+		t.Error("mutating returned copy changed the stored task state")
+	}
+	if live.Dependencies[0] == "mutated-dep" {
+		t.Error("mutating returned copy changed the stored task dependencies")
+	}
+	s.mu.RUnlock()
+
+	// A fresh snapshot should still reflect the original state.
+	snapshot2, err := s.GetTaskStatus("job1")
+	if err != nil {
+		t.Fatalf("GetTaskStatus failed: %v", err)
+	}
+	if snapshot2.State != origState {
+		t.Errorf("expected state %q, got %q", origState, snapshot2.State)
+	}
+}
+
+// TestGetTaskStatusConcurrent exercises GetTaskStatus concurrently with
+// GetNextTask/CompleteTask to catch races on shared task state (run with -race).
+func TestGetTaskStatusConcurrent(_ *testing.T) {
+	s := NewScheduler(10)
+	s.RegisterBuilder("builder1", "http://builder1:9090", 100)
+
+	for i := 0; i < 20; i++ {
+		_ = s.SubmitTask(fmt.Sprintf("job%d", i), "pkg", "1.0", 5, 0, nil)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			_, _ = s.GetTaskStatus(fmt.Sprintf("job%d", i%20))
+		}
+	}()
+
+	for i := 0; i < 20; i++ {
+		if task, err := s.GetNextTask("builder1"); err == nil {
+			_ = s.CompleteTask(task.JobID, true, nil)
+		}
+	}
+	<-done
+}

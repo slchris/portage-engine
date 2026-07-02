@@ -1,6 +1,8 @@
 name: PR Build Verification
 
 on:
+  push:
+    branches: [ main, master, develop ]
   pull_request:
     branches: [ main, master, develop ]
     types: [ opened, synchronize, reopened ]
@@ -71,12 +73,12 @@ jobs:
         run: go build ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v3
+        # golangci-lint v2.x is required because .golangci.yml uses the v2 config
+        # format (version: "2"). v1.x (e.g. v1.55.2) cannot parse it.
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: v1.55.2
+          version: v2.7.2
           args: --timeout=5m -v
-          skip-pkg-cache: true
-          skip-build-cache: true
 
   test-check:
     name: Test Check

@@ -9,6 +9,17 @@ import (
 	"strings"
 )
 
+// insecureJWTSecrets is a list of well-known insecure JWT secrets that must
+// never be used in production.
+var insecureJWTSecrets = []string{
+	"change-me-in-production",
+	"changeme",
+	"secret",
+	"jwt-secret",
+	"your-secret-here",
+	"",
+}
+
 // ServerConfig represents the server configuration.
 type ServerConfig struct {
 	Port                 int
@@ -67,25 +78,56 @@ type ServerConfig struct {
 	CloudSSHUser        string
 	ServerCallbackURL   string
 	RemoteBuilders      []string
-	MetricsEnabled      bool
-	MetricsPort         string
-	MetricsPassword     string
-	LogEnabled          bool
-	LogLevel            string
-	LogDir              string
-	LogMaxSizeMB        int
-	LogMaxAgeDays       int
-	LogMaxBackups       int
-	LogEnableConsole    bool
-	LogEnableFile       bool
+	// Security settings
+	APIKey              string   // API key for authenticating requests (empty = auth disabled)
+	BuilderToken        string   // Shared secret the server presents to remote builders (empty = no builder auth)
+	CORSAllowedOrigins  []string // Allowed CORS origins (empty = allow all for backward compatibility)
+	MaxRequestBodyBytes int64    // Maximum request body size in bytes (0 = default 10MB)
+	// Data persistence
+	DataDir          string // Directory for persisting server state (empty = /var/lib/portage-engine/server)
+	MetricsEnabled   bool
+	MetricsPort      string
+	MetricsPassword  string
+	LogEnabled       bool
+	LogLevel         string
+	LogDir           string
+	LogMaxSizeMB     int
+	LogMaxAgeDays    int
+	LogMaxBackups    int
+	LogEnableConsole bool
+	LogEnableFile    bool
+}
+
+// Validate checks the server configuration for common misconfigurations.
+func (c *ServerConfig) Validate() []string {
+	var warnings []string
+
+	if c.APIKey == "" {
+		warnings = append(warnings, "SECURITY: API_KEY is not set — all API endpoints are unauthenticated")
+	}
+	if len(c.CORSAllowedOrigins) == 0 {
+		warnings = append(warnings, "SECURITY: CORS_ALLOWED_ORIGINS is not set — defaulting to allow all origins (*)")
+	}
+	if c.Port <= 0 || c.Port > 65535 {
+		warnings = append(warnings, fmt.Sprintf("CONFIG: SERVER_PORT %d is invalid, must be 1-65535", c.Port))
+	}
+	if c.MaxWorkers <= 0 {
+		warnings = append(warnings, "CONFIG: MAX_WORKERS must be > 0")
+	}
+
+	return warnings
 }
 
 // DashboardConfig represents the dashboard configuration.
 type DashboardConfig struct {
 	Port             int
 	ServerURL        string
+	ServerAPIKey     string // API key forwarded to the backend server (empty = none)
 	AuthEnabled      bool
 	JWTSecret        string
+	AdminUser        string // Username accepted by the login handler
+	AdminPassword    string // Password accepted by the login handler
+	TokenTTLMinutes  int    // Issued-token lifetime in minutes
 	AllowAnonymous   bool
 	MetricsEnabled   bool
 	MetricsPort      string
@@ -100,9 +142,43 @@ type DashboardConfig struct {
 	LogEnableFile    bool
 }
 
+// Validate checks the dashboard configuration for common misconfigurations.
+// Returns an error if a critical security issue is found.
+func (c *DashboardConfig) Validate() error {
+	if c.AuthEnabled {
+		for _, insecure := range insecureJWTSecrets {
+			if c.JWTSecret == insecure {
+				return fmt.Errorf(
+					"SECURITY: JWT_SECRET is set to a well-known insecure value %q. "+
+						"Please set a strong, unique secret (at least 32 characters) in your configuration",
+					c.JWTSecret,
+				)
+			}
+		}
+		if len(c.JWTSecret) < 32 {
+			return fmt.Errorf(
+				"SECURITY: JWT_SECRET is too short (%d chars). Use at least 32 characters for security",
+				len(c.JWTSecret),
+			)
+		}
+		// When anonymous access is disabled, the login handler must be able to
+		// authenticate a real operator; otherwise the dashboard is unreachable.
+		if !c.AllowAnonymous {
+			if c.AdminUser == "" || c.AdminPassword == "" {
+				return fmt.Errorf(
+					"SECURITY: ALLOW_ANONYMOUS is false but ADMIN_USER/ADMIN_PASSWORD are not set; " +
+						"set credentials so operators can log in",
+				)
+			}
+		}
+	}
+	return nil
+}
+
 // BuilderConfig represents the builder configuration.
 type BuilderConfig struct {
 	Port               int
+	AuthToken          string // Shared secret required on build/job endpoints (empty = auth disabled)
 	Workers            int
 	InstanceID         string
 	Architecture       string
@@ -119,25 +195,29 @@ type BuilderConfig struct {
 	GPGKeyPath         string
 	GPGAutoSync        bool   // Auto-sync GPG key from server
 	GPGHome            string // Custom GNUPGHOME directory
-	StorageType        string
-	StorageLocalDir    string
-	StorageS3Bucket    string
-	StorageS3Region    string
-	StorageS3Prefix    string
-	StorageHTTPBase    string
-	ServerURL          string
-	NotifyConfig       string
-	MetricsEnabled     bool
-	MetricsPort        string
-	MetricsPassword    string
-	LogEnabled         bool
-	LogLevel           string
-	LogDir             string
-	LogMaxSizeMB       int
-	LogMaxAgeDays      int
-	LogMaxBackups      int
-	LogEnableConsole   bool
-	LogEnableFile      bool
+	// BinpkgFormat selects the binary package format Portage produces: "gpkg"
+	// (modern, GPG-signable) or "xpak" (legacy .tbz2, deprecated). Defaults to
+	// "gpkg"; only GPKG supports native OpenPGP signing/verification.
+	BinpkgFormat     string
+	StorageType      string
+	StorageLocalDir  string
+	StorageS3Bucket  string
+	StorageS3Region  string
+	StorageS3Prefix  string
+	StorageHTTPBase  string
+	ServerURL        string
+	NotifyConfig     string
+	MetricsEnabled   bool
+	MetricsPort      string
+	MetricsPassword  string
+	LogEnabled       bool
+	LogLevel         string
+	LogDir           string
+	LogMaxSizeMB     int
+	LogMaxAgeDays    int
+	LogMaxBackups    int
+	LogEnableConsole bool
+	LogEnableFile    bool
 
 	// Portage mirror settings (for Gentoo builds in Docker)
 	SyncMirror      string // Mirror URL for portage sync (rsync or git)
@@ -147,6 +227,45 @@ type BuilderConfig struct {
 	PortageReposPath string // Path to portage repos (default: /var/db/repos)
 	PortageConfPath  string // Path to portage config (default: /etc/portage)
 	MakeConfPath     string // Path to make.conf (default: /etc/portage/make.conf)
+}
+
+// Validate checks the builder configuration for common misconfigurations.
+func (c *BuilderConfig) Validate() []string {
+	var warnings []string
+
+	if c.Workers <= 0 {
+		warnings = append(warnings, "CONFIG: BUILDER_WORKERS must be > 0")
+	}
+	if c.Port <= 0 || c.Port > 65535 {
+		warnings = append(warnings, fmt.Sprintf("CONFIG: BUILDER_PORT %d is invalid, must be 1-65535", c.Port))
+	}
+	if c.AuthToken == "" {
+		warnings = append(warnings, "SECURITY: BUILDER_TOKEN is not set — the build endpoint is unauthenticated and allows arbitrary remote builds")
+	}
+	if c.UseDocker && c.DockerImage == "" {
+		warnings = append(warnings, "CONFIG: USE_DOCKER is true but DOCKER_IMAGE is empty")
+	}
+	if c.WorkDir == "" {
+		warnings = append(warnings, "CONFIG: BUILD_WORK_DIR is not set")
+	}
+	if c.ArtifactDir == "" {
+		warnings = append(warnings, "CONFIG: BUILD_ARTIFACT_DIR is not set")
+	}
+
+	return warnings
+}
+
+// unquoteEnvValue strips a single matching pair of surrounding single or double
+// quotes from a config value, so a quoted secret/path is not silently corrupted
+// by the literal quotes. Unquoted values (and mismatched quotes) are returned
+// unchanged.
+func unquoteEnvValue(v string) string {
+	if len(v) >= 2 {
+		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
+			return v[1 : len(v)-1]
+		}
+	}
+	return v
 }
 
 // loadEnvFile loads key=value pairs from a .conf file.
@@ -172,7 +291,7 @@ func loadEnvFile(path string) (map[string]string, error) {
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
-			value := strings.TrimSpace(parts[1])
+			value := unquoteEnvValue(strings.TrimSpace(parts[1]))
 			env[key] = value
 		}
 	}
@@ -230,15 +349,17 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		CloudGCPZone:    "us-central1-a",
 	}
 
-	// If config file doesn't exist, return defaults
+	// If the config file is missing, still honor environment variables (the
+	// get* helpers fall back to os.Getenv). Only defaults + env apply.
+	env := map[string]string{}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		fmt.Printf("Config file not found, using defaults: %s\n", path)
-		return config, nil
-	}
-
-	env, err := loadEnvFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		fmt.Printf("Config file not found, using defaults + environment: %s\n", path)
+	} else {
+		loaded, err := loadEnvFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+		env = loaded
 	}
 
 	config.Port = getEnvInt(env, "SERVER_PORT", config.Port)
@@ -333,6 +454,13 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		}
 	}
 
+	// Security settings
+	config.APIKey = getEnvString(env, "API_KEY", "")
+	config.BuilderToken = getEnvString(env, "BUILDER_TOKEN", "")
+	config.CORSAllowedOrigins = getEnvStringSlice(env, "CORS_ALLOWED_ORIGINS", nil)
+	config.MaxRequestBodyBytes = int64(getEnvInt(env, "MAX_REQUEST_BODY_BYTES", 10*1024*1024)) // Default 10MB
+	config.DataDir = getEnvString(env, "DATA_DIR", "/var/lib/portage-engine/server")
+
 	return config, nil
 }
 
@@ -340,28 +468,34 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 func LoadDashboardConfig(path string) (*DashboardConfig, error) {
 	// Set defaults
 	config := &DashboardConfig{
-		Port:           8081,
-		ServerURL:      "http://localhost:8080",
-		AuthEnabled:    true,
-		JWTSecret:      "change-me-in-production",
-		AllowAnonymous: true,
+		Port:            8081,
+		ServerURL:       "http://localhost:8080",
+		AuthEnabled:     true,
+		JWTSecret:       "change-me-in-production",
+		TokenTTLMinutes: 720,
+		AllowAnonymous:  true,
 	}
 
-	// If config file doesn't exist, return defaults
+	// If the config file is missing, still honor environment variables.
+	env := map[string]string{}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		fmt.Printf("Config file not found, using defaults: %s\n", path)
-		return config, nil
-	}
-
-	env, err := loadEnvFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		fmt.Printf("Config file not found, using defaults + environment: %s\n", path)
+	} else {
+		loaded, err := loadEnvFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+		env = loaded
 	}
 
 	config.Port = getEnvInt(env, "DASHBOARD_PORT", config.Port)
 	config.ServerURL = getEnvString(env, "SERVER_URL", config.ServerURL)
+	config.ServerAPIKey = getEnvString(env, "SERVER_API_KEY", "")
 	config.AuthEnabled = getEnvBool(env, "AUTH_ENABLED", config.AuthEnabled)
 	config.JWTSecret = getEnvString(env, "JWT_SECRET", config.JWTSecret)
+	config.AdminUser = getEnvString(env, "ADMIN_USER", "")
+	config.AdminPassword = getEnvString(env, "ADMIN_PASSWORD", "")
+	config.TokenTTLMinutes = getEnvInt(env, "TOKEN_TTL_MINUTES", 720)
 	config.AllowAnonymous = getEnvBool(env, "ALLOW_ANONYMOUS", config.AllowAnonymous)
 
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
@@ -394,6 +528,7 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 		PersistenceEnabled: true,
 		RetentionDays:      7,
 		GPGEnabled:         false,
+		BinpkgFormat:       "gpkg",
 		StorageType:        "local",
 		StorageLocalDir:    "/var/binpkgs",
 		// Portage defaults
@@ -402,18 +537,20 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 		MakeConfPath:     "/etc/portage/make.conf",
 	}
 
-	// If config file doesn't exist, return defaults
+	// If the config file is missing, still honor environment variables.
+	env := map[string]string{}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		fmt.Printf("Config file not found, using defaults: %s\n", path)
-		return config, nil
-	}
-
-	env, err := loadEnvFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		fmt.Printf("Config file not found, using defaults + environment: %s\n", path)
+	} else {
+		loaded, err := loadEnvFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+		env = loaded
 	}
 
 	config.Port = getEnvInt(env, "BUILDER_PORT", config.Port)
+	config.AuthToken = getEnvString(env, "BUILDER_TOKEN", "")
 	config.Workers = getEnvInt(env, "BUILDER_WORKERS", config.Workers)
 	config.InstanceID = getEnvString(env, "INSTANCE_ID", "")
 	config.Architecture = getEnvString(env, "ARCHITECTURE", "")
@@ -431,6 +568,7 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.GPGKeyPath = getEnvString(env, "GPG_KEY_PATH", "")
 	config.GPGAutoSync = getEnvBool(env, "GPG_AUTO_SYNC", false)
 	config.GPGHome = getEnvString(env, "GPG_HOME", "/var/lib/portage-engine/gpg")
+	config.BinpkgFormat = getEnvString(env, "BINPKG_FORMAT", config.BinpkgFormat)
 
 	config.StorageType = getEnvString(env, "STORAGE_TYPE", config.StorageType)
 	config.StorageLocalDir = getEnvString(env, "STORAGE_LOCAL_DIR", config.StorageLocalDir)
@@ -465,4 +603,25 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.LogEnableFile = getEnvBool(env, "LOG_ENABLE_FILE", true)
 
 	return config, nil
+}
+
+// getEnvStringSlice reads a comma-separated string from the env map and returns
+// it as a trimmed slice. Returns defaultValue if the key is empty.
+func getEnvStringSlice(env map[string]string, key string, defaultValue []string) []string {
+	raw := getEnvString(env, key, "")
+	if raw == "" {
+		return defaultValue
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	if len(result) == 0 {
+		return defaultValue
+	}
+	return result
 }

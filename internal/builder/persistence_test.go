@@ -263,9 +263,8 @@ func TestJobPersister_StartStop(t *testing.T) {
 		// Return a deep copy to avoid concurrent modification issues
 		result := make(map[string]*BuildJob, len(jobs))
 		for k, v := range jobs {
-			// Deep copy the job
-			jobCopy := *v
-			result[k] = &jobCopy
+			// Deep copy the job (Clone copies fields without the mutex).
+			result[k] = v.Clone()
 		}
 		return result
 	}

@@ -2,20 +2,17 @@ package storage
 
 import "fmt"
 
-// S3Storage implements Storage interface for AWS S3.
-type S3Storage struct {
-	bucket string
-	region string
-	prefix string
-}
+// S3Storage implements Storage interface for AWS S3. The backend is not yet
+// implemented; the fields are placeholders for a future implementation.
+type S3Storage struct{}
 
 // NewS3Storage creates a new S3 storage backend.
-func NewS3Storage(bucket, region, prefix string) (*S3Storage, error) {
-	return &S3Storage{
-		bucket: bucket,
-		region: region,
-		prefix: prefix,
-	}, nil
+//
+// The S3 backend is not yet implemented, so the constructor fails immediately.
+// This surfaces a misconfiguration (STORAGE_TYPE=s3) at startup rather than
+// letting every artifact upload fail silently at runtime.
+func NewS3Storage(_, _, _ string) (*S3Storage, error) {
+	return nil, fmt.Errorf("S3 storage backend is not yet implemented (STORAGE_TYPE=s3); use STORAGE_TYPE=local")
 }
 
 // Upload uploads a file to S3.

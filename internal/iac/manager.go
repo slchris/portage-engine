@@ -37,7 +37,25 @@ type CloudCredentials struct {
 type SSHConfig struct {
 	KeyPath string
 	User    string
+	// KnownHostsPath, when set, is used for SSH host-key verification instead of
+	// the insecure default. Ignored when InsecureHostKey is true.
+	KnownHostsPath string
+	// InsecureHostKey opts in to disabling SSH host-key verification
+	// (StrictHostKeyChecking=no / UserKnownHostsFile=/dev/null). This is required
+	// for freshly-created cloud instances whose host key is not yet known, but it
+	// enables man-in-the-middle attacks, so it must be requested explicitly.
+	InsecureHostKey bool
 }
+
+// Command timeouts prevent a hung terraform/ssh invocation from blocking a build
+// worker forever. They are generous enough for real provisioning work.
+const (
+	terraformInitTimeout    = 10 * time.Minute
+	terraformApplyTimeout   = 30 * time.Minute
+	terraformDestroyTimeout = 30 * time.Minute
+	terraformOutputTimeout  = 2 * time.Minute
+	sshCommandTimeout       = 5 * time.Minute
+)
 
 // ProvisionRequest represents an infrastructure provisioning request.
 type ProvisionRequest struct {
@@ -48,6 +66,8 @@ type ProvisionRequest struct {
 	SSH             *SSHConfig        `json:"-"`
 	ServerCallback  string            `json:"server_callback"`
 	BuilderPort     int               `json:"builder_port"`
+	BuilderToken    string            `json:"-"` // Shared secret the deployed builder requires
+	BinpkgHost      string            `json:"binpkg_host"`
 	AllowedIPRanges []string          `json:"allowed_ip_ranges"`
 	TTL             time.Duration     `json:"ttl"` // Instance TTL, 0 uses default
 }
@@ -70,6 +90,10 @@ type Instance struct {
 	TTL             time.Duration     `json:"ttl"`           // Time to live, 0 means no auto-termination
 	LastActivity    time.Time         `json:"last_activity"` // Last time the instance had activity
 	ActiveTasks     int               `json:"active_tasks"`  // Number of active tasks on this instance
+	// destroyEnv is the credential environment used to provision the instance;
+	// Terminate reuses it so `terraform destroy` authenticates the same way as
+	// apply did. Not serialized (contains secrets).
+	destroyEnv []string
 }
 
 // Manager manages infrastructure provisioning using Terraform.
@@ -151,6 +175,13 @@ func (m *Manager) cleanupExpiredInstances() {
 	now := time.Now()
 
 	for id, inst := range m.instances {
+		// Always retry instances whose destroy previously failed — they are
+		// billing with no owner.
+		if inst.Status == "destroy_failed" {
+			expiredIDs = append(expiredIDs, id)
+			continue
+		}
+
 		// Skip if TTL is 0 (no auto-termination)
 		if inst.TTL == 0 {
 			continue
@@ -223,8 +254,22 @@ func (m *Manager) GetExpiredInstances() []*Instance {
 	return expired
 }
 
+// supportedProviders lists the providers Provision can fully and correctly
+// provision. AWS and Aliyun are intentionally excluded: their generated
+// Terraform is a non-functional stub (default/region-specific images, no SSH
+// key, no user_data), so provisioning would either fail opaquely or create an
+// unusable instance. Return a clear error for those instead.
+var supportedProviders = map[string]bool{
+	"gcp": true,
+	"pve": true,
+}
+
 // Provision provisions a new instance using Terraform.
 func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
+	if !supportedProviders[req.Provider] {
+		return nil, fmt.Errorf("provider %q not implemented", req.Provider)
+	}
+
 	instanceID := fmt.Sprintf("%s-%d", req.Provider, time.Now().UnixNano())
 	terraformDir := filepath.Join(m.workspaceDir, instanceID)
 
@@ -259,67 +304,132 @@ func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
 	// Set environment variables for cloud credentials
 	env := m.prepareEnvironment(req)
 
-	// Run Terraform init
-	if err := m.runTerraformCommand(context.Background(), terraformDir, env, "init"); err != nil {
-		return nil, fmt.Errorf("terraform init failed: %w", err)
-	}
-
-	// Run Terraform apply
-	if err := m.runTerraformCommand(context.Background(), terraformDir, env, "apply", "-auto-approve"); err != nil {
-		return nil, fmt.Errorf("terraform apply failed: %w", err)
-	}
-
-	// Get outputs
-	ipAddress, err := m.getTerraformOutput(terraformDir, env, "ip_address")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get IP address: %w", err)
-	}
-
-	privateIP, _ := m.getTerraformOutput(terraformDir, env, "private_ip")
-
-	// Determine TTL
+	// Determine TTL up front.
 	ttl := req.TTL
 	if ttl == 0 {
 		ttl = m.defaultTTL
 	}
 
+	// Record the instance BEFORE apply completes, so that if apply partially
+	// creates resources (VPC/subnet/instance) and then errors, cleanup can still
+	// find the terraform dir and destroy it. destroyEnv carries the credentials
+	// so a later destroy authenticates the same way apply did.
 	now := time.Now()
 	instance := &Instance{
-		ID:              instanceID,
-		Provider:        req.Provider,
-		Status:          "provisioning",
-		IPAddress:       ipAddress,
-		PublicIP:        ipAddress,
-		PrivateIP:       privateIP,
-		Arch:            req.Arch,
-		Metadata:        req.Spec,
-		TerraformDir:    terraformDir,
-		SSHUser:         req.SSH.User,
-		BuilderEndpoint: fmt.Sprintf("http://%s:%d", ipAddress, req.BuilderPort),
-		LastHeartbeat:   now,
-		CreatedAt:       now,
-		TTL:             ttl,
-		LastActivity:    now,
-		ActiveTasks:     0,
+		ID:            instanceID,
+		Provider:      req.Provider,
+		Status:        "provisioning",
+		Arch:          req.Arch,
+		Metadata:      req.Spec,
+		TerraformDir:  terraformDir,
+		SSHUser:       req.SSH.User,
+		LastHeartbeat: now,
+		CreatedAt:     now,
+		TTL:           ttl,
+		LastActivity:  now,
+		destroyEnv:    env,
 	}
-
 	m.mu.Lock()
 	m.instances[instanceID] = instance
 	m.mu.Unlock()
 
-	// Deploy builder software via SSH
+	// Run Terraform init with a bounded timeout so a hung init cannot block the
+	// build worker forever.
+	initCtx, cancelInit := context.WithTimeout(context.Background(), terraformInitTimeout)
+	errInit := m.runTerraformCommand(initCtx, terraformDir, env, "init")
+	cancelInit()
+	if errInit != nil {
+		m.rollback(instance)
+		return nil, fmt.Errorf("terraform init failed: %w", errInit)
+	}
+
+	// Run Terraform apply with a bounded timeout. On any error after this point,
+	// roll back (destroy) so partially-created resources do not leak.
+	applyCtx, cancelApply := context.WithTimeout(context.Background(), terraformApplyTimeout)
+	errApply := m.runTerraformCommand(applyCtx, terraformDir, env, "apply", "-auto-approve")
+	cancelApply()
+	if errApply != nil {
+		m.rollback(instance)
+		return nil, fmt.Errorf("terraform apply failed: %w", errApply)
+	}
+
+	// Get outputs.
+	ipAddress, err := m.getTerraformOutput(terraformDir, env, "ip_address")
+	if err != nil {
+		m.rollback(instance)
+		return nil, fmt.Errorf("failed to get IP address: %w", err)
+	}
+	privateIP, _ := m.getTerraformOutput(terraformDir, env, "private_ip")
+
+	m.mu.Lock()
+	instance.IPAddress = ipAddress
+	instance.PublicIP = ipAddress
+	instance.PrivateIP = privateIP
+	instance.BuilderEndpoint = fmt.Sprintf("http://%s:%d", ipAddress, req.BuilderPort)
+	m.mu.Unlock()
+
+	// Deploy builder software via SSH.
 	if req.SSH.KeyPath != "" {
 		if err := m.deployBuilder(instance, req); err != nil {
-			instance.Status = "deployment_failed"
-			return instance, fmt.Errorf("builder deployment failed: %w", err)
+			// Deployment failed on a live, billed VM — destroy it rather than
+			// leaving an orphan running.
+			m.setInstanceStatus(instance, "deployment_failed")
+			m.rollback(instance)
+			return nil, fmt.Errorf("builder deployment failed: %w", err)
 		}
 	}
 
-	instance.Status = "running"
+	m.setInstanceStatus(instance, "running")
 	return instance, nil
 }
 
-// Terminate terminates an instance using Terraform destroy.
+// setInstanceStatus updates an instance's Status under the manager lock, so it
+// does not race the cleanup goroutine's status reads.
+func (m *Manager) setInstanceStatus(instance *Instance, status string) {
+	m.mu.Lock()
+	instance.Status = status
+	m.mu.Unlock()
+}
+
+// rollback destroys a partially- or fully-provisioned instance and, on success,
+// stops tracking it. If destroy fails the instance is kept (with its terraform
+// dir and credential env) so the cleanup routine can retry it later.
+func (m *Manager) rollback(instance *Instance) {
+	if err := m.destroyInstance(instance); err != nil {
+		fmt.Printf("Warning: rollback destroy failed for %s (will retry later): %v\n", instance.ID, err)
+		m.mu.Lock()
+		instance.Status = "destroy_failed"
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Lock()
+	delete(m.instances, instance.ID)
+	m.mu.Unlock()
+	_ = os.RemoveAll(instance.TerraformDir)
+}
+
+// destroyInstance runs `terraform destroy` for an instance using the credential
+// environment captured at provision time. It returns an error if destroy fails
+// so callers can decide whether to keep tracking the instance for a retry.
+func (m *Manager) destroyInstance(instance *Instance) error {
+	m.mu.RLock()
+	env := instance.destroyEnv
+	dir := instance.TerraformDir
+	m.mu.RUnlock()
+
+	// Bounded timeout so a hung destroy cannot block the cleanup routine forever.
+	ctx, cancel := context.WithTimeout(context.Background(), terraformDestroyTimeout)
+	defer cancel()
+	if err := m.runTerraformCommand(ctx, dir, env, "destroy", "-auto-approve"); err != nil {
+		return fmt.Errorf("terraform destroy failed: %w", err)
+	}
+	return nil
+}
+
+// Terminate destroys an instance. If destroy succeeds the instance is untracked
+// and its terraform dir removed. If destroy FAILS the instance is kept (state
+// and credentials intact) so the cleanup routine can retry — otherwise the VM
+// would keep billing with no way left to destroy it.
 func (m *Manager) Terminate(instanceID string) error {
 	m.mu.RLock()
 	instance, exists := m.instances[instanceID]
@@ -329,16 +439,16 @@ func (m *Manager) Terminate(instanceID string) error {
 		return fmt.Errorf("instance not found: %s", instanceID)
 	}
 
-	// Run terraform destroy
-	env := []string{}
-	ctx := context.Background()
-	if err := m.runTerraformCommand(ctx, instance.TerraformDir, env, "destroy", "-auto-approve"); err != nil {
-		fmt.Printf("Warning: terraform destroy failed: %v\n", err)
+	if err := m.destroyInstance(instance); err != nil {
+		m.mu.Lock()
+		instance.Status = "destroy_failed"
+		m.mu.Unlock()
+		fmt.Printf("Warning: %v (instance %s kept for retry)\n", err, instanceID)
+		return err
 	}
 
-	// Cleanup terraform directory
+	// Destroy succeeded — clean up state and stop tracking.
 	_ = os.RemoveAll(instance.TerraformDir)
-
 	m.mu.Lock()
 	delete(m.instances, instanceID)
 	m.mu.Unlock()
@@ -431,7 +541,9 @@ func (m *Manager) runTerraformCommand(ctx context.Context, dir string, env []str
 
 // getTerraformOutput retrieves an output value from terraform.
 func (m *Manager) getTerraformOutput(dir string, env []string, output string) (string, error) {
-	cmd := exec.Command("terraform", "output", "-raw", output)
+	ctx, cancel := context.WithTimeout(context.Background(), terraformOutputTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "terraform", "output", "-raw", output)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), env...)
 
@@ -472,9 +584,14 @@ func (m *Manager) prepareEnvironment(req *ProvisionRequest) []string {
 		if req.Credentials.PVETokenID != "" {
 			env = append(env, "PM_API_TOKEN_ID="+req.Credentials.PVETokenID)
 			env = append(env, "PM_API_TOKEN_SECRET="+req.Credentials.PVETokenSecret)
+			// The generated main.tf references var.pve_token_secret so the secret
+			// is not written to disk; supply its value here (finding #30).
+			env = append(env, "TF_VAR_pve_token_secret="+req.Credentials.PVETokenSecret)
 		} else if req.Credentials.PVEUsername != "" {
 			env = append(env, "PM_USER="+req.Credentials.PVEUsername)
 			env = append(env, "PM_PASS="+req.Credentials.PVEPassword)
+			// The generated main.tf references var.pve_password (finding #30).
+			env = append(env, "TF_VAR_pve_password="+req.Credentials.PVEPassword)
 		}
 	}
 
@@ -484,40 +601,70 @@ func (m *Manager) prepareEnvironment(req *ProvisionRequest) []string {
 // deployBuilder deploys the builder software to the instance via SSH.
 func (m *Manager) deployBuilder(instance *Instance, req *ProvisionRequest) error {
 	// Wait for instance to be SSH-accessible
-	if err := m.waitForSSH(instance, req.SSH.KeyPath, 5*time.Minute); err != nil {
+	if err := m.waitForSSH(instance, req.SSH, 5*time.Minute); err != nil {
 		return fmt.Errorf("instance not accessible: %w", err)
 	}
 
 	// Create deployment script
-	script := m.generateDeploymentScript(req.ServerCallback, req.BuilderPort)
+	script := m.generateDeploymentScript(req)
 	scriptPath := filepath.Join(instance.TerraformDir, "deploy.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0600); err != nil {
 		return fmt.Errorf("failed to write deployment script: %w", err)
 	}
-	// Make script executable
-	if err := os.Chmod(scriptPath, 0700); err != nil { //nolint:gosec // Script needs exec permission
+	// Make script executable (owner-only; the exec bit is required to run it).
+	if err := os.Chmod(scriptPath, 0700); err != nil { // #nosec G302 -- deploy script needs the owner execute bit.
 		return fmt.Errorf("failed to make script executable: %w", err)
 	}
 
 	// Copy script to instance
-	if err := m.sshCopyFile(instance, req.SSH.KeyPath, scriptPath, "/tmp/deploy.sh"); err != nil {
+	if err := m.sshCopyFile(instance, req.SSH, scriptPath, "/tmp/deploy.sh"); err != nil {
 		return fmt.Errorf("failed to copy deployment script: %w", err)
 	}
 
 	// Execute deployment script
-	if err := m.sshExecute(instance, req.SSH.KeyPath, "chmod +x /tmp/deploy.sh && /tmp/deploy.sh"); err != nil {
+	if err := m.sshExecute(instance, req.SSH, "chmod +x /tmp/deploy.sh && /tmp/deploy.sh"); err != nil {
 		return fmt.Errorf("failed to execute deployment script: %w", err)
 	}
 
 	return nil
 }
 
+// sshHostKeyArgs returns the ssh/scp options governing host-key verification.
+//
+// Security tradeoff (finding #50): for a freshly-created cloud instance we do
+// not yet know the host key, so verification cannot succeed on the first
+// connection. Rather than silently disabling verification we require the caller
+// to opt in via SSHConfig.InsecureHostKey. When a KnownHostsPath is provided we
+// use it for real verification instead. Disabling verification (the insecure
+// path) exposes the connection to man-in-the-middle attacks and must only be
+// used on trusted networks or for throwaway build instances.
+func sshHostKeyArgs(cfg *SSHConfig) []string {
+	if cfg != nil && cfg.KnownHostsPath != "" {
+		return []string{
+			"-o", "StrictHostKeyChecking=yes",
+			"-o", "UserKnownHostsFile=" + cfg.KnownHostsPath,
+		}
+	}
+	if cfg != nil && cfg.InsecureHostKey {
+		// Explicitly opted-in insecure mode. Enables MITM — see doc comment.
+		return []string{
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+		}
+	}
+	// Default: rely on the user's known_hosts with strict checking. This fails
+	// closed for an unknown host rather than trusting it blindly.
+	return []string{
+		"-o", "StrictHostKeyChecking=yes",
+	}
+}
+
 // waitForSSH waits for SSH to become available on the instance.
-func (m *Manager) waitForSSH(instance *Instance, keyPath string, timeout time.Duration) error {
+func (m *Manager) waitForSSH(instance *Instance, cfg *SSHConfig, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
-		err := m.sshExecute(instance, keyPath, "echo ok")
+		err := m.sshExecute(instance, cfg, "echo ok")
 		if err == nil {
 			return nil
 		}
@@ -528,12 +675,14 @@ func (m *Manager) waitForSSH(instance *Instance, keyPath string, timeout time.Du
 }
 
 // sshExecute executes a command on the instance via SSH.
-func (m *Manager) sshExecute(instance *Instance, keyPath, command string) error {
-	args := []string{
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=10",
+func (m *Manager) sshExecute(instance *Instance, cfg *SSHConfig, command string) error {
+	keyPath := ""
+	if cfg != nil {
+		keyPath = cfg.KeyPath
 	}
+
+	args := sshHostKeyArgs(cfg)
+	args = append(args, "-o", "ConnectTimeout=10")
 
 	if keyPath != "" {
 		args = append(args, "-i", keyPath)
@@ -541,7 +690,10 @@ func (m *Manager) sshExecute(instance *Instance, keyPath, command string) error 
 
 	args = append(args, fmt.Sprintf("%s@%s", instance.SSHUser, instance.PublicIP), command)
 
-	cmd := exec.Command("ssh", args...)
+	// Bound each SSH invocation so a hung connection cannot block a build worker.
+	ctx, cancel := context.WithTimeout(context.Background(), sshCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ssh", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
@@ -553,11 +705,13 @@ func (m *Manager) sshExecute(instance *Instance, keyPath, command string) error 
 }
 
 // sshCopyFile copies a file to the instance via SCP.
-func (m *Manager) sshCopyFile(instance *Instance, keyPath, localPath, remotePath string) error {
-	args := []string{
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
+func (m *Manager) sshCopyFile(instance *Instance, cfg *SSHConfig, localPath, remotePath string) error {
+	keyPath := ""
+	if cfg != nil {
+		keyPath = cfg.KeyPath
 	}
+
+	args := sshHostKeyArgs(cfg)
 
 	if keyPath != "" {
 		args = append(args, "-i", keyPath)
@@ -565,7 +719,10 @@ func (m *Manager) sshCopyFile(instance *Instance, keyPath, localPath, remotePath
 
 	args = append(args, localPath, fmt.Sprintf("%s@%s:%s", instance.SSHUser, instance.PublicIP, remotePath))
 
-	cmd := exec.Command("scp", args...)
+	// Bound each SCP invocation so a hung transfer cannot block a build worker.
+	ctx, cancel := context.WithTimeout(context.Background(), sshCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "scp", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
@@ -576,15 +733,23 @@ func (m *Manager) sshCopyFile(instance *Instance, keyPath, localPath, remotePath
 	return nil
 }
 
-// generateDeploymentScript generates a shell script to deploy the builder.
-func (m *Manager) generateDeploymentScript(serverCallback string, builderPort int) string {
+// generateDeploymentScript generates a shell script to deploy the builder onto
+// a provisioned instance.
+func (m *Manager) generateDeploymentScript(req *ProvisionRequest) string {
+	arch := req.Arch
+	if arch == "" {
+		arch = "amd64"
+	}
 	config := &CloudInitConfig{
 		DockerImage:       "gentoo/stage3:latest",
 		PullLatestImage:   true,
 		PortageTreeSync:   true,
 		PortageMirror:     "https://distfiles.gentoo.org",
-		BuilderPort:       builderPort,
-		ServerCallbackURL: serverCallback,
+		PortageBinpkgHost: req.BinpkgHost,
+		BuilderPort:       req.BuilderPort,
+		BuilderToken:      req.BuilderToken,
+		ServerCallbackURL: req.ServerCallback,
+		Architecture:      arch,
 		DataDir:           "/var/lib/portage-engine",
 		WorkDir:           "/var/tmp/portage-builds",
 		ArtifactDir:       "/var/tmp/portage-artifacts",
@@ -694,17 +859,22 @@ output "private_ip" {
 }
 
 // generateAliyunFirewall generates Aliyun security group rules.
+//
+// Alicloud's security_group_rule.cidr_ip accepts a single CIDR, so we emit one
+// rule resource per allowed CIDR instead of a single rule with a comma-joined
+// (invalid) cidr_ip.
 func (m *Manager) generateAliyunFirewall(req *ProvisionRequest, allowedIPs []string) string {
-	rules := ""
-	for _, cidr := range allowedIPs {
-		rules += fmt.Sprintf(`
-  ingress {
-    from_port   = %d
-    to_port     = %d
-    ip_protocol = "tcp"
-    cidr_ip     = "%s"
-  }
-`, req.BuilderPort, req.BuilderPort, cidr)
+	builderRules := ""
+	for i, cidr := range allowedIPs {
+		builderRules += fmt.Sprintf(`
+resource "alicloud_security_group_rule" "builder_%d" {
+  type              = "ingress"
+  ip_protocol       = "tcp"
+  port_range        = "%d/%d"
+  security_group_id = alicloud_security_group.portage.id
+  cidr_ip           = "%s"
+}
+`, i, req.BuilderPort, req.BuilderPort, cidr)
 	}
 
 	return fmt.Sprintf(`
@@ -720,15 +890,7 @@ resource "alicloud_security_group_rule" "ssh" {
   security_group_id = alicloud_security_group.portage.id
   cidr_ip           = "0.0.0.0/0"
 }
-
-resource "alicloud_security_group_rule" "builder" {
-  type              = "ingress"
-  ip_protocol       = "tcp"
-  port_range        = "%d/%d"
-  security_group_id = alicloud_security_group.portage.id
-  cidr_ip           = "%s"
-}
-`, req.BuilderPort, req.BuilderPort, strings.Join(allowedIPs, ","))
+%s`, builderRules)
 }
 
 // generateGCPConfig generates GCP-specific Terraform config.

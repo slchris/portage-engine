@@ -14,9 +14,12 @@ import (
 )
 
 func TestServerHealth(t *testing.T) {
+	tmpDir := t.TempDir()
 	cfg := &config.ServerConfig{
-		Port:        8080,
-		StorageType: "local",
+		Port:            8080,
+		StorageType:     "local",
+		StorageLocalDir: tmpDir,
+		BinpkgPath:      tmpDir,
 	}
 
 	srv := server.New(cfg)
@@ -103,9 +106,12 @@ func TestServerRouter(t *testing.T) {
 }
 
 func TestServerAPIRoutes(t *testing.T) {
+	tmpDir := t.TempDir()
 	cfg := &config.ServerConfig{
-		Port:        8080,
-		StorageType: "local",
+		Port:            8080,
+		StorageType:     "local",
+		StorageLocalDir: tmpDir,
+		BinpkgPath:      tmpDir,
 	}
 
 	srv := server.New(cfg)

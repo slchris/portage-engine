@@ -1,6 +1,9 @@
 package iac
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -96,7 +99,9 @@ func TestGenerateCloudInitScript_CustomConfig(t *testing.T) {
 		"http://binhost.example.com",
 		"https://releases.example.com/portage-builder",
 		"BUILDER_PORT=8080",
-		"INSTANCE_ID=test-instance",
+		// InstanceID is resolved via a shell variable, not written literally.
+		"INSTANCE_ID_VAL='test-instance'",
+		"INSTANCE_ID=${INSTANCE_ID_VAL}",
 		"ARCHITECTURE=arm64",
 		"/data/portage",
 		"/data/builds",
@@ -229,7 +234,8 @@ func TestGenerateCloudInitScript_ServerCallback(t *testing.T) {
 	checks := []string{
 		"Notifying server",
 		"http://server:8080/api/v1/builders/register",
-		`\"instance_id\": \"test-builder\"`,
+		// The instance ID is registered via the resolved shell variable.
+		`\"instance_id\": \"${INSTANCE_ID_VAL}\"`,
 		`\"port\": 9090`,
 	}
 
@@ -352,5 +358,40 @@ func TestCloudInitConfig_JSON(t *testing.T) {
 	// Just verify the struct can be used
 	if config.DockerImage != "gentoo/stage3:latest" {
 		t.Error("Config field mismatch")
+	}
+}
+
+// TestGeneratedScriptIsValidBash runs `bash -n` on the generated script to guard
+// against ordering / heredoc bugs like the one where builder.conf was written
+// before its directory existed (which aborted the whole bootstrap under set -e).
+func TestGeneratedScriptIsValidBash(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+
+	cfg := DefaultCloudInitConfig()
+	cfg.ServerCallbackURL = "http://srv:8080"
+	cfg.BuilderToken = "abc$(touch /tmp/x)`id`def" // must not break syntax or execute
+	cfg.PortageBinpkgHost = "http://srv:8080/binpkgs"
+	cfg.BuilderBinaryURL = "http://srv:8080/bin/portage-builder"
+	script := GenerateCloudInitScript(cfg)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ci.sh")
+	if err := os.WriteFile(path, []byte(script), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := exec.Command(bash, "-n", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("generated script is not valid bash: %v\n%s", err, out)
+	}
+
+	// mkdir must precede the write (the regression this test primarily guards).
+	mkdirIdx := strings.Index(script, "mkdir -p /etc/portage-engine")
+	writeIdx := strings.Index(script, "cat > /etc/portage-engine/builder.conf")
+	if mkdirIdx < 0 || writeIdx < 0 || mkdirIdx > writeIdx {
+		t.Errorf("mkdir /etc/portage-engine must precede builder.conf write (mkdir=%d write=%d)", mkdirIdx, writeIdx)
 	}
 }

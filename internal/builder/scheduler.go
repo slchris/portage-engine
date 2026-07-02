@@ -312,7 +312,12 @@ func (s *Scheduler) checkWaitingTasks() {
 	}
 }
 
-// GetTaskStatus returns the status of a task.
+// GetTaskStatus returns a snapshot of the status of a task.
+//
+// It returns a copy of the internal BuildTask rather than the live pointer,
+// because GetNextTask/CompleteTask mutate stored tasks under the scheduler
+// lock; handing out the live pointer would let callers observe a task being
+// mutated concurrently.
 func (s *Scheduler) GetTaskStatus(jobID string) (*BuildTask, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -322,7 +327,22 @@ func (s *Scheduler) GetTaskStatus(jobID string) (*BuildTask, error) {
 		return nil, fmt.Errorf("task not found: %s", jobID)
 	}
 
-	return task, nil
+	return task.clone(), nil
+}
+
+// clone returns a deep-enough copy of the task safe to hand to callers.
+// It copies the value and duplicates the Dependencies slice so mutations of
+// the stored task (or its slice) are not visible through the returned copy.
+func (t *BuildTask) clone() *BuildTask {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	if t.Dependencies != nil {
+		c.Dependencies = make([]string, len(t.Dependencies))
+		copy(c.Dependencies, t.Dependencies)
+	}
+	return &c
 }
 
 // GetBuilderStatus returns the status of all builders.

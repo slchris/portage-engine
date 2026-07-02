@@ -179,7 +179,7 @@ func TestBuildRequestSubmission(t *testing.T) {
 		PackageName: "app-editors/vim",
 		Version:     "9.0.0",
 		UseFlags: map[string]string{
-			"app-editors/vim": "python",
+			"python": "enabled",
 		},
 		Environment: map[string]string{},
 	}
@@ -367,5 +367,65 @@ func TestArtifactDownloadEndpointNotFound(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("Expected status 404, got %d", w.Code)
+	}
+}
+
+// TestAuthMiddleware verifies the builder rejects requests without the shared
+// token on protected paths, allows /health, and accepts the correct token.
+func TestAuthMiddleware(t *testing.T) {
+	const token = "shared-builder-secret"
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	handler := authMiddleware(token, ok)
+
+	// No token on a protected path → 401.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/build", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("no token: expected 401, got %d", w.Code)
+	}
+
+	// Wrong token → 401.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/build", nil)
+	req.Header.Set("X-API-Key", "wrong")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("wrong token: expected 401, got %d", w.Code)
+	}
+
+	// Correct token via X-API-Key → passes.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/build", nil)
+	req.Header.Set("X-API-Key", token)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("X-API-Key: expected 200, got %d", w.Code)
+	}
+
+	// Correct token via Authorization: Bearer → passes.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/build", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Bearer: expected 200, got %d", w.Code)
+	}
+
+	// /health is always public even with a token configured.
+	req = httptest.NewRequest(http.MethodGet, "/health", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("/health: expected 200, got %d", w.Code)
+	}
+
+	// Empty token disables auth (still logs a startup warning elsewhere).
+	openHandler := authMiddleware("", ok)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/build", nil)
+	w = httptest.NewRecorder()
+	openHandler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("empty token: expected 200 (auth disabled), got %d", w.Code)
 	}
 }

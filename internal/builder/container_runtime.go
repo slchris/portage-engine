@@ -25,6 +25,10 @@ type ContainerRuntime interface {
 	Remove(ctx context.Context, containerName string) error
 	// Exec executes a command in a running container.
 	Exec(ctx context.Context, containerName string, cmd []string) ([]byte, error)
+	// ExecEnv executes a command in a running container with the given
+	// environment variables passed via the runtime's -e flags (not a shell), so
+	// values are never interpreted by a shell.
+	ExecEnv(ctx context.Context, containerName string, env []string, cmd []string) ([]byte, error)
 	// Copy copies files between host and container.
 	Copy(ctx context.Context, src, dst string) error
 	// IsAvailable checks if the runtime is available.
@@ -88,6 +92,17 @@ func (d *DockerRuntime) Remove(ctx context.Context, containerName string) error 
 // Exec executes a command in a running container.
 func (d *DockerRuntime) Exec(ctx context.Context, containerName string, cmdSlice []string) ([]byte, error) {
 	args := append([]string{"exec", containerName}, cmdSlice...)
+	cmd := exec.CommandContext(ctx, d.executable, args...)
+	return cmd.CombinedOutput()
+}
+
+// ExecEnv executes a command in a running container with environment variables
+// passed via -e flags. Each env entry must be in KEY=VALUE form. The command is
+// passed as argv, so no shell interprets any value.
+func (d *DockerRuntime) ExecEnv(ctx context.Context, containerName string, env []string, cmdSlice []string) ([]byte, error) {
+	args := append([]string{"exec"}, envFlags(env)...)
+	args = append(args, containerName)
+	args = append(args, cmdSlice...)
 	cmd := exec.CommandContext(ctx, d.executable, args...)
 	return cmd.CombinedOutput()
 }
@@ -165,6 +180,17 @@ func (p *PodmanRuntime) Exec(ctx context.Context, containerName string, cmdSlice
 	return cmd.CombinedOutput()
 }
 
+// ExecEnv executes a command in a running container with environment variables
+// passed via -e flags. Each env entry must be in KEY=VALUE form. The command is
+// passed as argv, so no shell interprets any value.
+func (p *PodmanRuntime) ExecEnv(ctx context.Context, containerName string, env []string, cmdSlice []string) ([]byte, error) {
+	args := append([]string{"exec"}, envFlags(env)...)
+	args = append(args, containerName)
+	args = append(args, cmdSlice...)
+	cmd := exec.CommandContext(ctx, p.executable, args...)
+	return cmd.CombinedOutput()
+}
+
 // Copy copies files between host and container.
 func (p *PodmanRuntime) Copy(ctx context.Context, src, dst string) error {
 	cmd := exec.CommandContext(ctx, p.executable, "cp", src, dst)
@@ -175,6 +201,16 @@ func (p *PodmanRuntime) Copy(ctx context.Context, src, dst string) error {
 func (p *PodmanRuntime) IsAvailable() bool {
 	cmd := exec.Command(p.executable, "version")
 	return cmd.Run() == nil
+}
+
+// envFlags expands a KEY=VALUE slice into ["-e", "KEY=VALUE", ...] flags for a
+// container exec. Values are never passed through a shell.
+func envFlags(env []string) []string {
+	flags := make([]string, 0, len(env)*2)
+	for _, e := range env {
+		flags = append(flags, "-e", e)
+	}
+	return flags
 }
 
 // NewContainerRuntime creates a ContainerRuntime based on the runtime name.

@@ -9,8 +9,12 @@ type HTTPStorage struct {
 }
 
 // NewHTTPStorage creates a new HTTP storage backend.
-func NewHTTPStorage(baseURL string) (*HTTPStorage, error) {
-	return &HTTPStorage{baseURL: baseURL}, nil
+//
+// The HTTP backend is not yet implemented, so the constructor fails immediately
+// to surface a misconfiguration (STORAGE_TYPE=http) at startup instead of
+// letting every artifact upload fail silently at runtime.
+func NewHTTPStorage(_ string) (*HTTPStorage, error) {
+	return nil, fmt.Errorf("HTTP storage backend is not yet implemented (STORAGE_TYPE=http); use STORAGE_TYPE=local")
 }
 
 // Upload uploads a file via HTTP.

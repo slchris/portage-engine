@@ -2,16 +2,13 @@
 package server
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"runtime"
-	"sort"
-	"strconv"
+	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/slchris/portage-engine/internal/binpkg"
@@ -19,6 +16,13 @@ import (
 	"github.com/slchris/portage-engine/internal/gpg"
 	"github.com/slchris/portage-engine/internal/metrics"
 	"github.com/slchris/portage-engine/pkg/config"
+)
+
+// Version information (set via -ldflags at build time).
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
 )
 
 // Server represents the Portage Engine server.
@@ -29,6 +33,10 @@ type Server struct {
 	builderRegistry *builder.Registry
 	metrics         *metrics.Metrics
 	gpgSigner       *gpg.Signer
+	startTime       time.Time
+	store           *ServerStore
+	persister       *ServerPersister
+	binhostStop     chan struct{}
 }
 
 // New creates a new Server instance.
@@ -56,10 +64,11 @@ func New(cfg *config.ServerConfig) *Server {
 		builderRegistry: builder.NewRegistry(60*time.Second, 30*time.Second),
 		metrics:         metrics.New(metricsCfg),
 		gpgSigner:       signer,
+		startTime:       time.Now(),
 	}
 }
 
-// Initialize initializes the server, including GPG key setup.
+// Initialize initializes the server, including GPG key setup and state persistence.
 func (s *Server) Initialize() error {
 	if s.gpgSigner.IsEnabled() {
 		log.Printf("Initializing GPG signer...")
@@ -76,7 +85,112 @@ func (s *Server) Initialize() error {
 
 		log.Printf("GPG signer initialized with key: %s", s.gpgSigner.KeyID())
 	}
+
+	// Initialize persistence
+	if err := s.initPersistence(); err != nil {
+		// Persistence failure is non-fatal — log and continue
+		log.Printf("Warning: failed to initialize persistence: %v (server will run without state persistence)", err)
+	}
+
+	// Build the binhost Packages index from whatever is already on disk so
+	// clients can immediately consume this server as a binhost, then keep it
+	// fresh in the background as new packages appear in PKGDIR.
+	if n, err := s.binpkgStore.RegenerateIndex(s.binhostArch()); err != nil {
+		log.Printf("Warning: failed to generate binhost index: %v", err)
+	} else {
+		log.Printf("Binhost index generated with %d package(s) at %s/Packages", n, s.binpkgStore.BasePath())
+	}
+	s.startBinhostRefresher(5 * time.Minute)
+
 	return nil
+}
+
+// startBinhostRefresher periodically regenerates the binhost index so packages
+// added to PKGDIR out of band become visible to emerge without a restart.
+func (s *Server) startBinhostRefresher(interval time.Duration) {
+	s.binhostStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.binhostStop:
+				return
+			case <-ticker.C:
+				if _, err := s.binpkgStore.RegenerateIndex(s.binhostArch()); err != nil {
+					log.Printf("Warning: failed to refresh binhost index: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+// binhostArch returns the ARCH advertised in the binhost Packages preamble.
+func (s *Server) binhostArch() string {
+	// A single-arch binhost is the common case; default to amd64 when unset.
+	// (Portage tolerates a missing/empty ARCH and falls back to per-package
+	// KEYWORDS, but advertising one is friendlier.)
+	return "amd64"
+}
+
+// initPersistence sets up the server store and loads any previously saved state.
+func (s *Server) initPersistence() error {
+	store, err := NewServerStore(s.config.DataDir)
+	if err != nil {
+		return fmt.Errorf("failed to create server store: %w", err)
+	}
+	s.store = store
+
+	// Load previously persisted jobs
+	jobs, err := store.LoadJobs()
+	if err != nil {
+		log.Printf("Warning: failed to load persisted jobs: %v", err)
+	} else if len(jobs) > 0 {
+		s.builder.LoadJobs(jobs)
+		log.Printf("Loaded %d persisted jobs from disk", len(jobs))
+	}
+
+	// Start periodic persistence (save every 30s, clean jobs older than 7 days)
+	s.persister = NewServerPersister(
+		store,
+		s.builder.GetJobsSnapshot,
+		30*time.Second,
+		7*24*time.Hour,
+	)
+	s.persister.Start()
+	log.Printf("Server persistence started (data dir: %s)", s.config.DataDir)
+
+	return nil
+}
+
+// Shutdown gracefully shuts down the server components.
+// It saves state, stops the builder, and closes the registry.
+func (s *Server) Shutdown() {
+	log.Println("Shutting down server components...")
+
+	// Stop the binhost index refresher.
+	if s.binhostStop != nil {
+		close(s.binhostStop)
+		s.binhostStop = nil
+	}
+
+	// Stop persistence first (performs final save)
+	if s.persister != nil {
+		log.Println("Saving server state to disk...")
+		s.persister.Stop()
+	}
+
+	// Shutdown builder manager (closes work queue, stops IaC cleanup)
+	if s.builder != nil {
+		s.builder.Shutdown()
+	}
+
+	// Close builder registry
+	if s.builderRegistry != nil {
+		s.builderRegistry.Close()
+	}
+
+	log.Println("Server components shut down")
 }
 
 // GPGSigner returns the GPG signer instance.
@@ -110,29 +224,59 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/v1/artifacts/download/", s.handleArtifactDownload)
 	mux.HandleFunc("/api/v1/artifacts/info/", s.handleArtifactInfo)
 
+	// Binhost: serve the PKGDIR (including the Packages index) so a stock
+	// `emerge --getbinpkg` can consume this server. This is intentionally public
+	// (emerge cannot present the API key) and read-only.
+	binhostFS := http.FileServer(http.Dir(s.binpkgStore.BasePath()))
+	mux.Handle("/binpkgs/", http.StripPrefix("/binpkgs/", s.binhostReadOnly(binhostFS)))
+
 	// GPG endpoint
 	mux.HandleFunc("/api/v1/gpg/public-key", s.handleGPGPublicKey)
 
 	// Heartbeat endpoint
 	mux.HandleFunc("/api/v1/heartbeat", s.handleHeartbeat)
 
-	// Metrics endpoint
+	// Metrics endpoints
 	if s.metrics.IsEnabled() {
-		mux.Handle("/metrics", s.metrics.Handler())
+		mux.Handle("/metrics", s.metrics.Handler())                      // Legacy expvar JSON
+		mux.Handle("/metrics/prometheus", s.metrics.PrometheusHandler()) // Prometheus text format
 	}
 
-	// Health check
+	// Health / readiness / liveness probes (always public)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleReadyz)
+	mux.HandleFunc("/livez", s.handleLivez)
 
-	return s.corsMiddleware(s.loggingMiddleware(mux))
+	// Stack middleware (outermost first):
+	// requestID → enhancedLogging → CORS → maxBodySize → apiKey auth
+	var handler http.Handler = mux
+	handler = s.apiKeyAuthMiddleware(handler)
+	handler = s.maxBodySizeMiddleware(handler)
+	handler = s.corsMiddleware(handler)
+	handler = s.enhancedLoggingMiddleware(handler)
+	handler = s.requestIDMiddleware(handler)
+
+	return handler
 }
 
-// corsMiddleware adds CORS headers to allow cross-origin requests.
+// corsMiddleware adds CORS headers using the configured allowed origins.
+// If no origins are configured, it falls back to "*" for backward compatibility.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		allowed := s.isOriginAllowed(origin)
+
+		if allowed {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		} else if len(s.config.CORSAllowedOrigins) == 0 {
+			// No whitelist configured: allow all for backward compatibility
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		// If origin is not allowed and a whitelist IS configured, do not set
+		// the Allow-Origin header at all — the browser will block the request.
+
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
@@ -143,753 +287,176 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// handlePackageQuery handles package availability queries.
-func (s *Server) handlePackageQuery(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodPost {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+// isOriginAllowed checks whether the given origin is in the whitelist.
+func (s *Server) isOriginAllowed(origin string) bool {
+	if origin == "" {
+		return false
 	}
-
-	var req binpkg.QueryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// Query binpkg store
-	s.metrics.IncStorageReads()
-	pkg, found := s.binpkgStore.Query(&req)
-
-	response := binpkg.QueryResponse{
-		Found:   found,
-		Package: pkg,
-	}
-
-	s.metrics.RecordHTTPLatency("/api/v1/packages/query", time.Since(start))
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-// handleBuildRequest handles build requests for missing packages.
-func (s *Server) handleBuildRequest(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodPost {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Support both formats: {"package_name":"cat/pkg"} and {"category":"cat","package":"pkg"}
-	var rawReq map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&rawReq); err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	var req builder.BuildRequest
-
-	// Convert to BuildRequest format
-	if packageName, ok := rawReq["package_name"].(string); ok {
-		req.PackageName = packageName
-	} else if category, okCat := rawReq["category"].(string); okCat {
-		if pkg, okPkg := rawReq["package"].(string); okPkg {
-			req.PackageName = category + "/" + pkg
+	for _, o := range s.config.CORSAllowedOrigins {
+		if o == origin || o == "*" {
+			return true
 		}
 	}
-
-	if version, ok := rawReq["version"].(string); ok {
-		req.Version = version
-	}
-
-	if useFlags, ok := rawReq["use_flags"].([]interface{}); ok {
-		req.UseFlags = make([]string, len(useFlags))
-		for i, flag := range useFlags {
-			if flagStr, ok := flag.(string); ok {
-				req.UseFlags[i] = flagStr
-			}
-		}
-	}
-
-	// Submit build request
-	s.metrics.IncBuildsTotal()
-	jobID, err := s.builder.SubmitBuild(&req)
-	if err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	s.metrics.RecordHTTPLatency("/api/v1/packages/request-build", time.Since(start))
-
-	response := builder.BuildResponse{
-		JobID:  jobID,
-		Status: "queued",
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(response)
+	return false
 }
 
-// handleBuildStatus handles build status queries.
-func (s *Server) handleBuildStatus(w http.ResponseWriter, r *http.Request) {
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodGet {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	jobID := r.URL.Query().Get("job_id")
-	if jobID == "" {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Missing job_id parameter", http.StatusBadRequest)
-		return
-	}
-
-	status, err := s.builder.GetStatus(jobID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(status)
-}
-
-// handleSubmitBuildWithConfig handles build requests with configuration bundles.
-func (s *Server) handleSubmitBuildWithConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req builder.LocalBuildRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// Validate request
-	if req.ConfigBundle == nil {
-		http.Error(w, "Missing configuration bundle", http.StatusBadRequest)
-		return
-	}
-
-	if req.ConfigBundle.Packages == nil || len(req.ConfigBundle.Packages.Packages) == 0 {
-		http.Error(w, "No packages specified in bundle", http.StatusBadRequest)
-		return
-	}
-
-	// For now, this endpoint would need a different builder
-	// that supports config bundles. For simplicity, return not implemented.
-	http.Error(w, "Config bundle builds not yet implemented on server", http.StatusNotImplemented)
-}
-
-// handleHealth handles health check requests.
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
-}
-
-// handleBuildsList returns all build jobs.
-func (s *Server) handleBuildsList(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Get limit parameter (default 0 = all, max 200)
-	limitStr := r.URL.Query().Get("limit")
-	limit := 0
-	if limitStr != "" {
-		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
-			limit = parsed
-			if limit > 200 {
-				limit = 200
-			}
-		}
-	}
-
-	builds := s.builder.ListAllBuilds()
-
-	// Sort by created_at descending (newest first) for stable ordering
-	sort.Slice(builds, func(i, j int) bool {
-		return builds[i].CreatedAt.After(builds[j].CreatedAt)
-	})
-
-	// Apply limit if specified
-	if limit > 0 && len(builds) > limit {
-		builds = builds[:limit]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(builds)
-}
-
-// handleClusterStatus returns the cluster status.
-func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	status := s.builder.GetClusterStatus()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(status)
-}
-
-// handleBuildLogs returns logs for a specific build job.
-func (s *Server) handleBuildLogs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	jobID := r.URL.Query().Get("job_id")
-	if jobID == "" {
-		http.Error(w, "Missing job_id parameter", http.StatusBadRequest)
-		return
-	}
-
-	logs, err := s.builder.GetBuildLogs(jobID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	response := map[string]interface{}{
-		"job_id": jobID,
-		"logs":   logs,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-// handleSchedulerStatus returns scheduler status with task assignments.
-func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	status := s.builder.GetSchedulerStatus()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(status)
-}
-
-// handleBuilderRegister handles builder registration requests.
-func (s *Server) handleBuilderRegister(w http.ResponseWriter, r *http.Request) {
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodPost {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var info builder.BuilderInfo
-	if err := json.NewDecoder(r.Body).Decode(&info); err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// Register the builder
-	s.builderRegistry.Register(&info)
-
-	response := map[string]interface{}{
-		"success": true,
-		"message": "Builder registered successfully",
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-// handleBuildersList returns the list of all registered builders.
-func (s *Server) handleBuildersList(w http.ResponseWriter, r *http.Request) {
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodGet {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	builders := s.builderRegistry.List()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(builders)
-}
-
-// handleBuildersStatus returns aggregate status and statistics for all builders.
-func (s *Server) handleBuildersStatus(w http.ResponseWriter, r *http.Request) {
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodGet {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Fetch real-time status from all configured remote builders
-	builders := s.fetchAllBuilderStatus()
-
-	// Calculate aggregate statistics
-	stats := calculateBuilderStats(builders)
-
-	response := map[string]interface{}{
-		"stats":    stats,
-		"builders": builders,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-// BuilderStatusInfo represents status information from a builder.
-type BuilderStatusInfo struct {
-	ID            string  `json:"id"`
-	Endpoint      string  `json:"endpoint"`
-	Architecture  string  `json:"architecture"`
-	Status        string  `json:"status"`
-	Capacity      int     `json:"capacity"`
-	CurrentLoad   int     `json:"current_load"`
-	Enabled       bool    `json:"enabled"`
-	CPUUsage      float64 `json:"cpu_usage"`
-	MemoryUsage   float64 `json:"memory_usage"`
-	DiskUsage     float64 `json:"disk_usage"`
-	TotalBuilds   int     `json:"total_builds"`
-	SuccessBuilds int     `json:"success_builds"`
-	FailedBuilds  int     `json:"failed_builds"`
-}
-
-// fetchAllBuilderStatus queries all configured remote builders for their status.
-func (s *Server) fetchAllBuilderStatus() []BuilderStatusInfo {
-	remoteBuilders := s.config.RemoteBuilders
-	if len(remoteBuilders) == 0 {
-		return nil
-	}
-
-	var (
-		mu       sync.Mutex
-		wg       sync.WaitGroup
-		builders []BuilderStatusInfo
-	)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-
-	for _, addr := range remoteBuilders {
-		wg.Add(1)
-		go func(address string) {
-			defer wg.Done()
-
-			baseURL := normalizeBuilderURL(address)
-			url := fmt.Sprintf("%s/api/v1/status", baseURL)
-			resp, err := client.Get(url)
-			if err != nil {
-				log.Printf("Failed to query builder %s: %v", address, err)
-				// Add offline entry for unreachable builder
-				mu.Lock()
-				builders = append(builders, BuilderStatusInfo{
-					ID:       address,
-					Endpoint: baseURL,
-					Status:   "offline",
-					Enabled:  false,
-				})
-				mu.Unlock()
-				return
-			}
-			defer func() { _ = resp.Body.Close() }()
-
-			if resp.StatusCode != http.StatusOK {
-				log.Printf("Builder %s returned status %d", address, resp.StatusCode)
-				mu.Lock()
-				builders = append(builders, BuilderStatusInfo{
-					ID:       address,
-					Endpoint: baseURL,
-					Status:   "error",
-					Enabled:  false,
-				})
-				mu.Unlock()
-				return
-			}
-
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("Failed to read response from builder %s: %v", address, err)
-				return
-			}
-
-			var status map[string]interface{}
-			if err := json.Unmarshal(body, &status); err != nil {
-				log.Printf("Failed to parse response from builder %s: %v", address, err)
-				return
-			}
-
-			info := BuilderStatusInfo{
-				ID:            getStringValue(status, "instance_id", address),
-				Endpoint:      baseURL,
-				Architecture:  getStringValue(status, "architecture", "unknown"),
-				Status:        getStringValue(status, "status", "online"),
-				Capacity:      getIntValue(status, "capacity", 0),
-				CurrentLoad:   getIntValue(status, "current_load", 0),
-				Enabled:       getBoolValue(status, "enabled", true),
-				CPUUsage:      getFloatValue(status, "cpu_usage", 0),
-				MemoryUsage:   getFloatValue(status, "memory_usage", 0),
-				DiskUsage:     getFloatValue(status, "disk_usage", 0),
-				TotalBuilds:   getIntValue(status, "total_builds", 0),
-				SuccessBuilds: getIntValue(status, "success_builds", 0),
-				FailedBuilds:  getIntValue(status, "failed_builds", 0),
-			}
-
-			mu.Lock()
-			builders = append(builders, info)
-			mu.Unlock()
-		}(addr)
-	}
-
-	wg.Wait()
-	return builders
-}
-
-// calculateBuilderStats calculates aggregate statistics from builder list.
-func calculateBuilderStats(builders []BuilderStatusInfo) map[string]interface{} {
-	totalBuilders := len(builders)
-	onlineBuilders := 0
-	offlineBuilders := 0
-	totalCapacity := 0
-	totalLoad := 0
-	totalBuilds := 0
-	totalSuccess := 0
-	totalFailed := 0
-
-	for _, b := range builders {
-		if b.Status == "online" || b.Status == "busy" {
-			onlineBuilders++
-		} else {
-			offlineBuilders++
-		}
-		totalCapacity += b.Capacity
-		totalLoad += b.CurrentLoad
-		totalBuilds += b.TotalBuilds
-		totalSuccess += b.SuccessBuilds
-		totalFailed += b.FailedBuilds
-	}
-
-	successRate := 0.0
-	if totalBuilds > 0 {
-		successRate = float64(totalSuccess) / float64(totalBuilds) * 100
-	}
-
-	return map[string]interface{}{
-		"total_builders":   totalBuilders,
-		"online_builders":  onlineBuilders,
-		"offline_builders": offlineBuilders,
-		"total_capacity":   totalCapacity,
-		"total_load":       totalLoad,
-		"total_builds":     totalBuilds,
-		"success_builds":   totalSuccess,
-		"failed_builds":    totalFailed,
-		"success_rate":     successRate,
-	}
-}
-
-// Helper functions for type conversion from map[string]interface{}
-
-// normalizeBuilderURL ensures the builder address has the correct URL format.
-// It handles cases where the address may or may not include the http:// prefix.
-func normalizeBuilderURL(address string) string {
-	if strings.HasPrefix(address, "http://") || strings.HasPrefix(address, "https://") {
-		return address
-	}
-	return fmt.Sprintf("http://%s", address)
-}
-
-func getStringValue(m map[string]interface{}, key, defaultVal string) string {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-	return defaultVal
-}
-
-func getIntValue(m map[string]interface{}, key string, defaultVal int) int {
-	if v, ok := m[key]; ok {
-		switch n := v.(type) {
-		case int:
-			return n
-		case int64:
-			return int(n)
-		case float64:
-			return int(n)
-		}
-	}
-	return defaultVal
-}
-
-func getFloatValue(m map[string]interface{}, key string, defaultVal float64) float64 {
-	if v, ok := m[key]; ok {
-		switch n := v.(type) {
-		case float64:
-			return n
-		case int:
-			return float64(n)
-		case int64:
-			return float64(n)
-		}
-	}
-	return defaultVal
-}
-
-func getBoolValue(m map[string]interface{}, key string, defaultVal bool) bool {
-	if v, ok := m[key]; ok {
-		if b, ok := v.(bool); ok {
-			return b
-		}
-	}
-	return defaultVal
-}
-
-// handleHeartbeat handles builder heartbeat requests.
-func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
-	s.metrics.IncHTTPRequests()
-	s.metrics.IncHeartbeatsTotal()
-
-	if r.Method != http.MethodPost {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req builder.HeartbeatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		s.metrics.IncHeartbeatsFailed()
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// Update builder registry with heartbeat info
-	builderInfo := &builder.BuilderInfo{
-		ID:          req.BuilderID,
-		Endpoint:    req.Endpoint,
-		Status:      req.Status,
-		Capacity:    req.Capacity,
-		CurrentLoad: req.ActiveJobs,
-	}
-	s.builderRegistry.Register(builderInfo)
-
-	// Update builder heartbeat in the scheduler
-	if err := s.builder.UpdateBuilderHeartbeat(&req); err != nil {
-		s.metrics.IncHeartbeatsFailed()
-		response := builder.HeartbeatResponse{
-			Success: false,
-			Message: err.Error(),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	response := builder.HeartbeatResponse{
-		Success: true,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-// handleArtifactInfo returns artifact metadata for a job from a builder.
-func (s *Server) handleArtifactInfo(w http.ResponseWriter, r *http.Request) {
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodGet {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Extract job ID from URL
-	jobID := r.URL.Path[len("/api/v1/artifacts/info/"):]
-	if jobID == "" {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Job ID required", http.StatusBadRequest)
-		return
-	}
-
-	// Get builder URL for this job
-	builderURL, err := s.getBuilderURLForJob(jobID)
-	if err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	// Proxy request to builder
-	infoURL := fmt.Sprintf("%s/api/v1/artifacts/info/%s", builderURL, jobID)
-	resp, err := http.Get(infoURL)
-	if err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, fmt.Sprintf("Failed to contact builder: %v", err), http.StatusBadGateway)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		http.Error(w, string(body), resp.StatusCode)
-		return
-	}
-
-	// Forward response
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = io.Copy(w, resp.Body)
-}
-
-// handleArtifactDownload proxies artifact download requests to the builder.
-func (s *Server) handleArtifactDownload(w http.ResponseWriter, r *http.Request) {
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodGet {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Extract job ID from URL
-	jobID := r.URL.Path[len("/api/v1/artifacts/download/"):]
-	if jobID == "" {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Job ID required", http.StatusBadRequest)
-		return
-	}
-
-	// Get builder URL for this job
-	builderURL, err := s.getBuilderURLForJob(jobID)
-	if err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	// Proxy request to builder
-	downloadURL := fmt.Sprintf("%s/api/v1/artifacts/download/%s", builderURL, jobID)
-	resp, err := http.Get(downloadURL)
-	if err != nil {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, fmt.Sprintf("Failed to contact builder: %v", err), http.StatusBadGateway)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		http.Error(w, string(body), resp.StatusCode)
-		return
-	}
-
-	// Forward headers
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-
-	// Stream the file
-	_, _ = io.Copy(w, resp.Body)
-}
-
-// getBuilderURLForJob determines the builder URL that has the job.
-// It checks registered builders and returns the URL of the one that has the job.
-func (s *Server) getBuilderURLForJob(jobID string) (string, error) {
-	// First, try to get from registered builders
-	builders := s.builderRegistry.List()
-	if len(builders) == 0 {
-		// Fall back to default builder from config (RemoteBuilders)
-		if len(s.config.RemoteBuilders) > 0 {
-			return normalizeBuilderURL(s.config.RemoteBuilders[0]), nil
-		}
-		return "", fmt.Errorf("no builders registered and no default builder URL configured")
-	}
-
-	// Try each builder until we find the job
-	for _, b := range builders {
-		builderURL := b.Endpoint
-		if builderURL == "" {
-			continue
-		}
-		// Ensure the URL is normalized
-		builderURL = normalizeBuilderURL(builderURL)
-		statusURL := fmt.Sprintf("%s/api/v1/jobs/%s", builderURL, jobID)
-
-		resp, err := http.Get(statusURL)
-		if err != nil {
-			continue
-		}
-		_ = resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			return builderURL, nil
-		}
-	}
-
-	// Fall back to first remote builder
-	if len(s.config.RemoteBuilders) > 0 {
-		return normalizeBuilderURL(s.config.RemoteBuilders[0]), nil
-	}
-
-	return "", fmt.Errorf("job not found on any registered builder: %s", jobID)
-}
-
-// handleGPGPublicKey serves the GPG public key for builders.
-func (s *Server) handleGPGPublicKey(w http.ResponseWriter, r *http.Request) {
-	s.metrics.IncHTTPRequests()
-
-	if r.Method != http.MethodGet {
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Check if GPG is enabled
-	if !s.gpgSigner.IsEnabled() {
-		http.Error(w, "GPG not enabled on server", http.StatusNotFound)
-		return
-	}
-
-	// Try to get public key from signer
-	publicKey, err := s.gpgSigner.GetPublicKey()
-	if err != nil {
-		// Fall back to file if configured
-		if s.config.GPGPublicKeyPath != "" {
-			http.ServeFile(w, r, s.config.GPGPublicKeyPath)
+// apiKeyAuthMiddleware protects API endpoints with a shared API key.
+// Public endpoints (/health, /readyz, /livez, /metrics) are excluded.
+// If APIKey is empty in config, the middleware is a no-op (backward compatible).
+func (s *Server) apiKeyAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip auth if no API key is configured
+		if s.config.APIKey == "" {
+			next.ServeHTTP(w, r)
 			return
 		}
-		s.metrics.IncHTTPRequestErrors()
-		http.Error(w, fmt.Sprintf("Failed to get public key: %v", err), http.StatusInternalServerError)
-		return
-	}
 
-	w.Header().Set("Content-Type", "application/pgp-keys")
-	w.Header().Set("Content-Disposition", "attachment; filename=portage-engine.asc")
-	_, _ = w.Write([]byte(publicKey))
-}
+		// Public endpoints that never require auth. The binhost (/binpkgs/) is
+		// public because emerge cannot present the API key; it is read-only.
+		path := r.URL.Path
+		if path == "/health" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/metrics/prometheus" ||
+			strings.HasPrefix(path, "/binpkgs/") {
+			next.ServeHTTP(w, r)
+			return
+		}
 
-// loggingMiddleware provides request logging.
-func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s %s", r.Method, r.RequestURI, r.RemoteAddr)
-		s.metrics.UpdateGoroutines(int64(runtime.NumGoroutine()))
+		// CORS preflight must pass through
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Check API key from X-API-Key header or Authorization: Bearer <key>
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey == "" {
+			auth := r.Header.Get("Authorization")
+			if strings.HasPrefix(auth, "Bearer ") {
+				apiKey = strings.TrimPrefix(auth, "Bearer ")
+			}
+		}
+
+		// Constant-time comparison to avoid leaking the key via timing.
+		if subtle.ConstantTimeCompare([]byte(apiKey), []byte(s.config.APIKey)) != 1 {
+			s.metrics.IncHTTPRequestErrors()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "unauthorized: invalid or missing API key",
+			})
+			return
+		}
+
 		next.ServeHTTP(w, r)
 	})
+}
+
+// maxBodySizeMiddleware limits the size of incoming request bodies to prevent
+// abuse. POST/PUT/PATCH methods are limited; GET/DELETE/OPTIONS pass through.
+func (s *Server) maxBodySizeMiddleware(next http.Handler) http.Handler {
+	maxBytes := s.config.MaxRequestBodyBytes
+	if maxBytes <= 0 {
+		maxBytes = 10 * 1024 * 1024 // Default 10MB
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch:
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Health, Readiness, and Liveness Probes ---
+
+// handleHealth handles health check requests.
+// Returns overall system health including version and component readiness.
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	// Check component health
+	storageOK := s.checkStorageHealth()
+	buildersOnline, buildersTotal := s.checkBuildersHealth()
+
+	overallStatus := "healthy"
+	if !storageOK {
+		overallStatus = "degraded"
+	}
+	if buildersTotal > 0 && buildersOnline == 0 {
+		overallStatus = "degraded"
+	}
+
+	response := map[string]interface{}{
+		"status":  overallStatus,
+		"version": Version,
+		"commit":  Commit,
+		"build":   BuildTime,
+		"checks": map[string]interface{}{
+			"storage": map[string]interface{}{
+				"ok":   storageOK,
+				"type": s.config.StorageType,
+			},
+			"builders": map[string]interface{}{
+				"online": buildersOnline,
+				"total":  buildersTotal,
+			},
+		},
+		"uptime": time.Since(s.startTime).String(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if overallStatus != "healthy" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+// handleReadyz checks if the server is ready to accept traffic.
+// Returns 200 if ready, 503 if not.
+func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	storageOK := s.checkStorageHealth()
+	if !storageOK {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "reason": "storage unavailable"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+// handleLivez checks if the server process is alive.
+// Always returns 200 as long as the process is running.
+func (s *Server) handleLivez(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+}
+
+// checkStorageHealth verifies the storage backend is accessible.
+func (s *Server) checkStorageHealth() bool {
+	switch s.config.StorageType {
+	case "local":
+		dir := s.config.StorageLocalDir
+		if dir == "" {
+			dir = s.config.BinpkgPath
+		}
+		info, err := os.Stat(dir)
+		return err == nil && info.IsDir()
+	default:
+		// For non-local storage, assume OK (actual check would require SDK calls)
+		return true
+	}
+}
+
+// checkBuildersHealth returns (online, total) counts of configured remote builders.
+func (s *Server) checkBuildersHealth() (online, total int) {
+	builders := s.builderRegistry.List()
+	total = len(builders)
+	for _, b := range builders {
+		if b.Status == "online" || b.Status == "busy" {
+			online++
+		}
+	}
+	// Also count configured but unregistered remote builders
+	if total == 0 {
+		total = len(s.config.RemoteBuilders)
+	}
+	return online, total
 }
