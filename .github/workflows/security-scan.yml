@@ -55,12 +55,23 @@ jobs:
       #     (binrepos.conf, make.conf), and the executable deploy script are
       #     world-readable / owner-executable BY DESIGN — a binhost that emerge
       #     cannot read is useless.
-      # gosec is pinned to a release (not @master) so new experimental rules do
-      # not spuriously break CI; -severity medium fails on real issues.
-      - name: Run gosec security scanner
-        uses: securego/gosec@v2.21.4
+      # Run gosec under the project's Go toolchain (installed via `go install`)
+      # rather than the securego/gosec Docker action, whose bundled Go (1.23) is
+      # too old to load a module requiring a newer Go — the image sets
+      # GOTOOLCHAIN=local, so it cannot download the required toolchain and every
+      # package fails to load. gosec is pinned to a release (not @latest) so new
+      # experimental rules do not spuriously break CI; -severity medium fails on
+      # real issues.
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          args: '-severity=medium -exclude=G204,G304,G301,G302,G306,G401,G501,G505 -conf .gosec.json -fmt=json -out gosec-results.json -stdout ./...'
+          go-version: '1.25.3'
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4
+
+      - name: Run gosec security scanner
+        run: gosec -severity=medium -exclude=G204,G304,G301,G302,G306,G401,G501,G505 -conf .gosec.json -fmt=json -out gosec-results.json -stdout ./...
 
       - name: Display gosec results
         if: always()

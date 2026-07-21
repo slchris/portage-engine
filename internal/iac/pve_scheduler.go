@@ -132,7 +132,7 @@ func PVEClusterNodes(endpoint string, auth PVEAuth, templateName string) ([]PVEN
 		}
 	}
 
-	var nodes []PVENodeInfo
+	nodes := make([]PVENodeInfo, 0, len(resources))
 	for _, r := range resources {
 		if r.Type != "node" {
 			continue

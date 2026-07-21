@@ -1144,7 +1144,7 @@ func primaryArtifact(rels []string, pkgName string, sizeOf func(string) int64) s
 	if idx := strings.LastIndex(pkgName, "/"); idx >= 0 {
 		category, pn = pkgName[:idx], pkgName[idx+1:]
 	}
-	var matches []string
+	matches := make([]string, 0, len(rels))
 	for _, rel := range rels {
 		base := filepath.Base(rel)
 		if !strings.HasPrefix(base, pn+"-") || len(base) <= len(pn)+1 {

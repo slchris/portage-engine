@@ -1875,7 +1875,8 @@ func (m *Manager) collectInstanceArtifacts(jobID, baseURL, remoteJobID, packageN
 	}
 
 	m.appendJobLog(jobID, fmt.Sprintf("[collect] fetching %d artifact(s) from the instance into the binhost...", len(snap.Artifacts)))
-	var locals, webs []string
+	locals := make([]string, 0, len(snap.Artifacts))
+	webs := make([]string, 0, len(snap.Artifacts))
 	primaryLocal, primaryWeb := "", ""
 	for _, rel := range snap.Artifacts {
 		localPath, webPath, err := m.fetchArtifactRelToBinhost(baseURL, remoteJobID, rel)
