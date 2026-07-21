@@ -91,8 +91,8 @@ func getDiskInfo(path string) (total, used uint64, percentage float64) {
 		return 0, 0, 0
 	}
 
-	total = stat.Blocks * uint64(stat.Bsize)
-	free := stat.Bfree * uint64(stat.Bsize)
+	total = stat.Blocks * uint64(stat.Bsize) // #nosec G115 -- statfs block size is non-negative.
+	free := stat.Bfree * uint64(stat.Bsize)  // #nosec G115 -- statfs block size is non-negative.
 	used = total - free
 
 	if total == 0 {
