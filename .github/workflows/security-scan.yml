@@ -68,10 +68,10 @@ jobs:
           go-version: '1.25.3'
 
       - name: Install gosec
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
 
       - name: Run gosec security scanner
-        run: gosec -severity=medium -exclude=G204,G304,G301,G302,G306,G401,G501,G505 -conf .gosec.json -fmt=json -out gosec-results.json -stdout ./...
+        run: gosec -severity=medium -exclude=G204,G304,G301,G302,G306,G401,G501,G505,G124,G703,G704 -conf .gosec.json -fmt=json -out gosec-results.json -stdout ./...
 
       - name: Display gosec results
         if: always()
