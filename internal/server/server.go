@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/slchris/portage-engine/internal/binpkg"
@@ -37,6 +38,7 @@ type Server struct {
 	store           *ServerStore
 	persister       *ServerPersister
 	binhostStop     chan struct{}
+	settingsMu      sync.Mutex // serializes settings updates + persistence
 }
 
 // New creates a new Server instance.
@@ -57,7 +59,7 @@ func New(cfg *config.ServerConfig) *Server {
 	}
 	signer := gpg.NewSigner(cfg.GPGKeyID, cfg.GPGKeyPath, cfg.GPGEnabled, opts...)
 
-	return &Server{
+	s := &Server{
 		config:          cfg,
 		binpkgStore:     binpkg.NewStore(cfg.BinpkgPath),
 		builder:         builder.NewManager(cfg),
@@ -66,6 +68,17 @@ func New(cfg *config.ServerConfig) *Server {
 		gpgSigner:       signer,
 		startTime:       time.Now(),
 	}
+
+	// When a build's artifact lands in the binhost PKGDIR, refresh the
+	// Packages index right away so clients see the new package without
+	// waiting for the periodic refresher.
+	s.builder.SetArtifactStoredHook(func() {
+		if _, err := s.binpkgStore.RegenerateIndex(s.binhostArch()); err != nil {
+			log.Printf("Warning: binhost index refresh after artifact ingest failed: %v", err)
+		}
+	})
+
+	return s
 }
 
 // Initialize initializes the server, including GPG key setup and state persistence.
@@ -91,6 +104,17 @@ func (s *Server) Initialize() error {
 		// Persistence failure is non-fatal — log and continue
 		log.Printf("Warning: failed to initialize persistence: %v (server will run without state persistence)", err)
 	}
+
+	// Apply dashboard-managed cloud settings saved from a previous run (these
+	// override the static conf/env values).
+	s.loadCloudSettingsOverride()
+
+	// Re-enable dashboard-managed GPG signing from a previous run.
+	s.loadGPGRuntime()
+
+	// Binhost signing key material for builder deployment, verify-side pubkey
+	// import, and mirror publication.
+	s.builder.SetGPGKeyProvider(s.gpgKeyMaterial)
 
 	// Build the binhost Packages index from whatever is already on disk so
 	// clients can immediately consume this server as a binhost, then keep it
@@ -208,6 +232,12 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/v1/packages/status", s.handleBuildStatus)
 
 	// Build management endpoints
+	mux.HandleFunc("/api/v1/settings/cloud", s.handleCloudSettings)
+	mux.HandleFunc("/api/v1/settings/cloud/test", s.handleCloudSettingsTest)
+	mux.HandleFunc("/api/v1/instances", s.handleInstancesList)
+	mux.HandleFunc("/api/v1/instances/shell", s.handleInstanceShell)
+	mux.HandleFunc("/api/v1/builds/delete", s.handleBuildDelete)
+	mux.HandleFunc("/api/v1/builds/cleanup-failed", s.handleBuildsCleanupFailed)
 	mux.HandleFunc("/api/v1/builds/list", s.handleBuildsList)
 	mux.HandleFunc("/api/v1/builds/submit", s.handleSubmitBuildWithConfig)
 	mux.HandleFunc("/api/v1/builds/status", s.handleBuildStatus)
@@ -232,6 +262,9 @@ func (s *Server) Router() http.Handler {
 
 	// GPG endpoint
 	mux.HandleFunc("/api/v1/gpg/public-key", s.handleGPGPublicKey)
+	mux.HandleFunc("/api/v1/gpg/status", s.handleGPGStatus)
+	mux.HandleFunc("/api/v1/gpg/generate", s.handleGPGGenerate)
+	mux.HandleFunc("/api/v1/gpg/pubkey", s.handleGPGPubkey)
 
 	// Heartbeat endpoint
 	mux.HandleFunc("/api/v1/heartbeat", s.handleHeartbeat)
@@ -456,7 +489,7 @@ func (s *Server) checkBuildersHealth() (online, total int) {
 	}
 	// Also count configured but unregistered remote builders
 	if total == 0 {
-		total = len(s.config.RemoteBuilders)
+		total = len(s.builder.CloudSettings().RemoteBuilders)
 	}
 	return online, total
 }

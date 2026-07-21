@@ -73,29 +73,32 @@ type ServerConfig struct {
 	CloudPVEStorage     string   // Default storage pool
 	CloudPVENetwork     string   // Default network bridge
 	CloudPVETemplate    string   // Default VM template
+	CloudPVENodes       []string // Candidate nodes for automatic placement (CLOUD_PVE_NODE=auto)
 	CloudPVEAllowedIPs  []string // Allowed IP ranges for firewall
 	CloudSSHKeyPath     string
 	CloudSSHUser        string
-	ServerCallbackURL   string
-	RemoteBuilders      []string
+	// SSH host-key verification for freshly provisioned instances: a
+	// known_hosts file for real verification, or an explicit opt-in to skip
+	// verification (MITM risk — LAN/throwaway instances only). With neither,
+	// first-connection SSH to a new instance fails closed.
+	CloudSSHKnownHosts      string
+	CloudSSHInsecureHostKey bool
+	ServerCallbackURL       string
+	// Builder binary delivery for cloud instances: a local linux binary scp'd
+	// during deployment, or a URL the instance downloads from (path wins).
+	CloudBuilderBinaryPath string
+	CloudBuilderBinaryURL  string
+	RemoteBuilders         []string
 	// Security settings
 	APIKey              string   // API key for authenticating requests (empty = auth disabled)
 	BuilderToken        string   // Shared secret the server presents to remote builders (empty = no builder auth)
 	CORSAllowedOrigins  []string // Allowed CORS origins (empty = allow all for backward compatibility)
 	MaxRequestBodyBytes int64    // Maximum request body size in bytes (0 = default 10MB)
 	// Data persistence
-	DataDir          string // Directory for persisting server state (empty = /var/lib/portage-engine/server)
-	MetricsEnabled   bool
-	MetricsPort      string
-	MetricsPassword  string
-	LogEnabled       bool
-	LogLevel         string
-	LogDir           string
-	LogMaxSizeMB     int
-	LogMaxAgeDays    int
-	LogMaxBackups    int
-	LogEnableConsole bool
-	LogEnableFile    bool
+	DataDir         string // Directory for persisting server state (empty = /var/lib/portage-engine/server)
+	MetricsEnabled  bool
+	MetricsPort     string
+	MetricsPassword string
 }
 
 // Validate checks the server configuration for common misconfigurations.
@@ -120,26 +123,18 @@ func (c *ServerConfig) Validate() []string {
 
 // DashboardConfig represents the dashboard configuration.
 type DashboardConfig struct {
-	Port             int
-	ServerURL        string
-	ServerAPIKey     string // API key forwarded to the backend server (empty = none)
-	AuthEnabled      bool
-	JWTSecret        string
-	AdminUser        string // Username accepted by the login handler
-	AdminPassword    string // Password accepted by the login handler
-	TokenTTLMinutes  int    // Issued-token lifetime in minutes
-	AllowAnonymous   bool
-	MetricsEnabled   bool
-	MetricsPort      string
-	MetricsPassword  string
-	LogEnabled       bool
-	LogLevel         string
-	LogDir           string
-	LogMaxSizeMB     int
-	LogMaxAgeDays    int
-	LogMaxBackups    int
-	LogEnableConsole bool
-	LogEnableFile    bool
+	Port            int
+	ServerURL       string
+	ServerAPIKey    string // API key forwarded to the backend server (empty = none)
+	AuthEnabled     bool
+	JWTSecret       string
+	AdminUser       string // Username accepted by the login handler
+	AdminPassword   string // Password accepted by the login handler
+	TokenTTLMinutes int    // Issued-token lifetime in minutes
+	AllowAnonymous  bool
+	MetricsEnabled  bool
+	MetricsPort     string
+	MetricsPassword string
 }
 
 // Validate checks the dashboard configuration for common misconfigurations.
@@ -198,26 +193,28 @@ type BuilderConfig struct {
 	// BinpkgFormat selects the binary package format Portage produces: "gpkg"
 	// (modern, GPG-signable) or "xpak" (legacy .tbz2, deprecated). Defaults to
 	// "gpkg"; only GPKG supports native OpenPGP signing/verification.
-	BinpkgFormat     string
-	StorageType      string
-	StorageLocalDir  string
-	StorageS3Bucket  string
-	StorageS3Region  string
-	StorageS3Prefix  string
-	StorageHTTPBase  string
-	ServerURL        string
-	NotifyConfig     string
-	MetricsEnabled   bool
-	MetricsPort      string
-	MetricsPassword  string
-	LogEnabled       bool
-	LogLevel         string
-	LogDir           string
-	LogMaxSizeMB     int
-	LogMaxAgeDays    int
-	LogMaxBackups    int
-	LogEnableConsole bool
-	LogEnableFile    bool
+	BinpkgFormat string
+	// BuildFeatures is appended to the build container's make.conf FEATURES.
+	// Docker builds need "-userpriv -usersandbox" (no unshare/privilege drop);
+	// a full Gentoo VM would leave this empty. WebUI-configurable.
+	BuildFeatures   string
+	StorageType     string
+	StorageLocalDir string
+	StorageS3Bucket string
+	StorageS3Region string
+	StorageS3Prefix string
+	StorageHTTPBase string
+	ServerURL       string
+	// ServerAPIKey is the central server's API key, attached to registration
+	// and heartbeat calls (required when the server sets API_KEY).
+	ServerAPIKey string
+	// AdvertiseURL is the URL this builder registers with the server (how the
+	// server reaches it). Defaults to http://<hostname>:<port>.
+	AdvertiseURL    string
+	NotifyConfig    string
+	MetricsEnabled  bool
+	MetricsPort     string
+	MetricsPassword string
 
 	// Portage mirror settings (for Gentoo builds in Docker)
 	SyncMirror      string // Mirror URL for portage sync (rsync or git)
@@ -300,11 +297,15 @@ func loadEnvFile(path string) (map[string]string, error) {
 }
 
 // getEnvString gets string value from env map with fallback to system env.
+// getEnvString resolves a config value with conventional precedence:
+// process environment > config file > built-in default. (The file used to win
+// over the environment, which made container/env-only overrides silently
+// no-ops whenever a conf file was present.)
 func getEnvString(env map[string]string, key, defaultValue string) string {
-	if val, ok := env[key]; ok && val != "" {
+	if val := os.Getenv(key); val != "" {
 		return val
 	}
-	if val := os.Getenv(key); val != "" {
+	if val, ok := env[key]; ok && val != "" {
 		return val
 	}
 	return defaultValue
@@ -422,6 +423,12 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	config.CloudPVEStorage = getEnvString(env, "CLOUD_PVE_STORAGE", "local-lvm")
 	config.CloudPVENetwork = getEnvString(env, "CLOUD_PVE_NETWORK", "vmbr0")
 	config.CloudPVETemplate = getEnvString(env, "CLOUD_PVE_TEMPLATE", "")
+	if nodes := getEnvString(env, "CLOUD_PVE_NODES", ""); nodes != "" {
+		config.CloudPVENodes = strings.Split(nodes, ",")
+		for i := range config.CloudPVENodes {
+			config.CloudPVENodes[i] = strings.TrimSpace(config.CloudPVENodes[i])
+		}
+	}
 	if allowedIPs := getEnvString(env, "CLOUD_PVE_ALLOWED_IPS", ""); allowedIPs != "" {
 		config.CloudPVEAllowedIPs = strings.Split(allowedIPs, ",")
 		for i := range config.CloudPVEAllowedIPs {
@@ -431,20 +438,15 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 
 	config.CloudSSHKeyPath = getEnvString(env, "CLOUD_SSH_KEY_PATH", "")
 	config.CloudSSHUser = getEnvString(env, "CLOUD_SSH_USER", "root")
+	config.CloudSSHKnownHosts = getEnvString(env, "CLOUD_SSH_KNOWN_HOSTS", "")
+	config.CloudSSHInsecureHostKey = getEnvBool(env, "CLOUD_SSH_INSECURE_HOST_KEY", false)
 	config.ServerCallbackURL = getEnvString(env, "SERVER_CALLBACK_URL", "")
+	config.CloudBuilderBinaryPath = getEnvString(env, "CLOUD_BUILDER_BINARY_PATH", "")
+	config.CloudBuilderBinaryURL = getEnvString(env, "CLOUD_BUILDER_BINARY_URL", "")
 
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
 	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
-
-	config.LogEnabled = getEnvBool(env, "LOG_ENABLED", true)
-	config.LogLevel = getEnvString(env, "LOG_LEVEL", "INFO")
-	config.LogDir = getEnvString(env, "LOG_DIR", "/var/log/portage-engine")
-	config.LogMaxSizeMB = getEnvInt(env, "LOG_MAX_SIZE_MB", 100)
-	config.LogMaxAgeDays = getEnvInt(env, "LOG_MAX_AGE_DAYS", 30)
-	config.LogMaxBackups = getEnvInt(env, "LOG_MAX_BACKUPS", 10)
-	config.LogEnableConsole = getEnvBool(env, "LOG_ENABLE_CONSOLE", true)
-	config.LogEnableFile = getEnvBool(env, "LOG_ENABLE_FILE", true)
 
 	// Parse remote builders
 	if builders := getEnvString(env, "REMOTE_BUILDERS", ""); builders != "" {
@@ -501,15 +503,6 @@ func LoadDashboardConfig(path string) (*DashboardConfig, error) {
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
 	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
-
-	config.LogEnabled = getEnvBool(env, "LOG_ENABLED", true)
-	config.LogLevel = getEnvString(env, "LOG_LEVEL", "INFO")
-	config.LogDir = getEnvString(env, "LOG_DIR", "/var/log/portage-engine")
-	config.LogMaxSizeMB = getEnvInt(env, "LOG_MAX_SIZE_MB", 100)
-	config.LogMaxAgeDays = getEnvInt(env, "LOG_MAX_AGE_DAYS", 30)
-	config.LogMaxBackups = getEnvInt(env, "LOG_MAX_BACKUPS", 10)
-	config.LogEnableConsole = getEnvBool(env, "LOG_ENABLE_CONSOLE", true)
-	config.LogEnableFile = getEnvBool(env, "LOG_ENABLE_FILE", true)
 
 	return config, nil
 }
@@ -569,6 +562,7 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.GPGAutoSync = getEnvBool(env, "GPG_AUTO_SYNC", false)
 	config.GPGHome = getEnvString(env, "GPG_HOME", "/var/lib/portage-engine/gpg")
 	config.BinpkgFormat = getEnvString(env, "BINPKG_FORMAT", config.BinpkgFormat)
+	config.BuildFeatures = getEnvString(env, "BUILD_FEATURES", "-userpriv -usersandbox")
 
 	config.StorageType = getEnvString(env, "STORAGE_TYPE", config.StorageType)
 	config.StorageLocalDir = getEnvString(env, "STORAGE_LOCAL_DIR", config.StorageLocalDir)
@@ -578,6 +572,8 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.StorageHTTPBase = getEnvString(env, "STORAGE_HTTP_BASE", "")
 
 	config.ServerURL = getEnvString(env, "SERVER_URL", "")
+	config.ServerAPIKey = getEnvString(env, "SERVER_API_KEY", "")
+	config.AdvertiseURL = getEnvString(env, "BUILDER_ADVERTISE_URL", "")
 	config.NotifyConfig = getEnvString(env, "NOTIFY_CONFIG", "")
 
 	// Portage mirror settings
@@ -592,15 +588,6 @@ func LoadBuilderConfig(path string) (*BuilderConfig, error) {
 	config.MetricsEnabled = getEnvBool(env, "METRICS_ENABLED", false)
 	config.MetricsPort = getEnvString(env, "METRICS_PORT", "2112")
 	config.MetricsPassword = getEnvString(env, "METRICS_PASSWORD", "")
-
-	config.LogEnabled = getEnvBool(env, "LOG_ENABLED", true)
-	config.LogLevel = getEnvString(env, "LOG_LEVEL", "INFO")
-	config.LogDir = getEnvString(env, "LOG_DIR", "/var/log/portage-engine")
-	config.LogMaxSizeMB = getEnvInt(env, "LOG_MAX_SIZE_MB", 100)
-	config.LogMaxAgeDays = getEnvInt(env, "LOG_MAX_AGE_DAYS", 30)
-	config.LogMaxBackups = getEnvInt(env, "LOG_MAX_BACKUPS", 10)
-	config.LogEnableConsole = getEnvBool(env, "LOG_ENABLE_CONSOLE", true)
-	config.LogEnableFile = getEnvBool(env, "LOG_ENABLE_FILE", true)
 
 	return config, nil
 }

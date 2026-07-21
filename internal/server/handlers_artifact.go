@@ -131,8 +131,8 @@ func (s *Server) getBuilderURLForJob(jobID string) (string, error) {
 	builders := s.builderRegistry.List()
 	if len(builders) == 0 {
 		// Fall back to default builder from config (RemoteBuilders)
-		if len(s.config.RemoteBuilders) > 0 {
-			return normalizeBuilderURL(s.config.RemoteBuilders[0]), nil
+		if len(s.builder.CloudSettings().RemoteBuilders) > 0 {
+			return normalizeBuilderURL(s.builder.CloudSettings().RemoteBuilders[0]), nil
 		}
 		return "", fmt.Errorf("no builders registered and no default builder URL configured")
 	}
@@ -159,8 +159,8 @@ func (s *Server) getBuilderURLForJob(jobID string) (string, error) {
 	}
 
 	// Fall back to first remote builder
-	if len(s.config.RemoteBuilders) > 0 {
-		return normalizeBuilderURL(s.config.RemoteBuilders[0]), nil
+	if len(s.builder.CloudSettings().RemoteBuilders) > 0 {
+		return normalizeBuilderURL(s.builder.CloudSettings().RemoteBuilders[0]), nil
 	}
 
 	return "", fmt.Errorf("job not found on any registered builder: %s", jobID)

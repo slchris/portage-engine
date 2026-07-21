@@ -2,6 +2,8 @@
 package builder
 
 import (
+	"archive/tar"
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -36,16 +38,20 @@ type LocalBuildRequest struct {
 // written by the worker/executor goroutine while HTTP handler goroutines read
 // them, so all access must go through the mu-guarded helpers below.
 type BuildJob struct {
-	mu          sync.Mutex             `json:"-"`
-	ID          string                 `json:"id"`
-	Request     *LocalBuildRequest     `json:"request"`
-	Status      string                 `json:"status"` // queued, building, success, failed
-	StartTime   time.Time              `json:"start_time"`
-	EndTime     time.Time              `json:"end_time"`
-	Log         string                 `json:"log"`
-	ArtifactURL string                 `json:"artifact_url"`
-	Error       string                 `json:"error,omitempty"`
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`
+	mu          sync.Mutex         `json:"-"`
+	ID          string             `json:"id"`
+	Request     *LocalBuildRequest `json:"request"`
+	Status      string             `json:"status"` // queued, building, success, failed
+	StartTime   time.Time          `json:"start_time"`
+	EndTime     time.Time          `json:"end_time"`
+	Log         string             `json:"log"`
+	ArtifactURL string             `json:"artifact_url"`
+	// Artifacts lists every binary package produced by the build, as paths
+	// relative to the artifact dir with the category preserved
+	// (e.g. "app-misc/jq-1.8.1-1.gpkg.tar").
+	Artifacts []string               `json:"artifacts,omitempty"`
+	Error     string                 `json:"error,omitempty"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // appendLog appends to the job log under the job lock.
@@ -53,6 +59,20 @@ func (j *BuildJob) appendLog(s string) {
 	j.mu.Lock()
 	j.Log += s
 	j.mu.Unlock()
+}
+
+// setArtifacts records the full produced-artifact list under the job lock.
+func (j *BuildJob) setArtifacts(rels []string) {
+	j.mu.Lock()
+	j.Artifacts = rels
+	j.mu.Unlock()
+}
+
+// artifactsSnapshot returns a copy of the produced-artifact list.
+func (j *BuildJob) artifactsSnapshot() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return append([]string(nil), j.Artifacts...)
 }
 
 // setArtifactURL sets the artifact URL under the job lock.
@@ -90,6 +110,7 @@ func (j *BuildJob) Clone() *BuildJob {
 		EndTime:     j.EndTime,
 		Log:         j.Log,
 		ArtifactURL: j.ArtifactURL,
+		Artifacts:   append([]string(nil), j.Artifacts...),
 		Error:       j.Error,
 	}
 	if j.Metadata != nil {
@@ -575,7 +596,22 @@ func (lb *LocalBuilder) Shutdown() {
 	}
 }
 
-// GetStatus returns builder status.
+// ActiveJobs returns the number of jobs currently queued or building, for
+// heartbeat/capacity reporting to the central server.
+func (lb *LocalBuilder) ActiveJobs() int {
+	lb.jobsMutex.RLock()
+	defer lb.jobsMutex.RUnlock()
+
+	n := 0
+	for _, job := range lb.jobs {
+		if job.Status == "queued" || job.Status == "building" {
+			n++
+		}
+	}
+	return n
+}
+
+// GetStatus returns a snapshot of the builder's job counts and mode.
 func (lb *LocalBuilder) GetStatus() map[string]interface{} {
 	lb.jobsMutex.RLock()
 	defer lb.jobsMutex.RUnlock()
@@ -683,8 +719,11 @@ func (lb *LocalBuilder) worker(id int) {
 		// Persist job state immediately after completion
 		lb.saveJobState()
 
-		// Send notification
-		lb.sendNotification(job)
+		// Notify asynchronously: notification channels (SMTP/webhook/Slack/
+		// Telegram) run serially with timeouts up to ~30s each, which must not
+		// stall the build worker. A clone is passed so the notifier never races
+		// with later writes to the live job.
+		go lb.sendNotification(job.Clone())
 	}
 }
 
@@ -741,38 +780,68 @@ func (lb *LocalBuilder) executeConfigBundleBuild(job *BuildJob) error {
 // generateBuildScript creates a Gentoo build script for Docker container.
 func (lb *LocalBuilder) generateBuildScript(pkgAtom string, useFlags string, gpgKeyID string) string {
 	features := "buildpkg"
+	buildFeatures := "-userpriv -usersandbox"
+	if lb.cfg != nil && lb.cfg.BuildFeatures != "" {
+		buildFeatures = lb.cfg.BuildFeatures
+	}
+	buildFeaturesLine := ""
+	if strings.TrimSpace(buildFeatures) != "" {
+		buildFeaturesLine = fmt.Sprintf("FEATURES=\"${FEATURES} %s\"", buildFeatures)
+	}
 	gpgSetup := ""
 	if gpgKeyID != "" {
 		features = "buildpkg binpkg-signing gpg-keepalive"
 		gpgSetup = fmt.Sprintf(`
-# Setup GPG for package signing with secret key
+# Setup GPG for package signing with the secret key.
 export GNUPGHOME=/root/.gnupg
 mkdir -p $GNUPGHOME
 chmod 700 $GNUPGHOME
+# No TTY in the build container: force loopback pinentry and provide the
+# lock dir portage's signing wrapper flocks on.
+mkdir -p /run/lock
+echo "allow-loopback-pinentry" >> $GNUPGHOME/gpg-agent.conf
+echo "pinentry-mode loopback" >> $GNUPGHOME/gpg.conf
+gpgconf --kill gpg-agent 2>/dev/null || true
 
-# Import secret key for signing (required for binpkg-signing)
+# Import secret key for signing (required for binpkg-signing).
 if [ -f /gpg-keys/secret.asc ]; then
     gpg --batch --yes --import /gpg-keys/secret.asc 2>/dev/null || true
     echo "GPG secret key imported for signing"
 fi
-
-# Import public key as well
 if [ -f /gpg-keys/public.asc ]; then
     gpg --batch --yes --import /gpg-keys/public.asc 2>/dev/null || true
 fi
-
-# Set trust level for the key
-gpg --batch --yes --list-keys
 echo -e "5\ny\n" | gpg --batch --yes --command-fd 0 --edit-key "%s" trust quit 2>/dev/null || true
 
-# Configure portage for GPG signing (GPKG is the only signable format)
-cat >> /etc/portage/make.conf << 'GPGEOF'
-FEATURES="${FEATURES} binpkg-signing gpg-keepalive"
+# Configure portage for GPG signing in the now-writable make.conf. Neutralize
+# the trust helper HERE (make.conf, not env — portage reads it from config):
+# its default is getuto, which portage re-runs as root right before verifying
+# and resets /etc/portage/gnupg back to root ownership, breaking the portage
+# user's post-sign verification. We pre-build the store ourselves below.
+cat >> /etc/portage/make.conf <<'GPGEOF'
 BINPKG_FORMAT="gpkg"
 BINPKG_GPG_SIGNING_GPG_HOME="/root/.gnupg"
 BINPKG_GPG_SIGNING_KEY="%s"
+PORTAGE_TRUST_HELPER="/bin/true"
+%s
 GPGEOF
-`, gpgKeyID, gpgKeyID)
+
+# Build the trust store portage checks the fresh signature against. getuto
+# creates /etc/portage/gnupg (root-owned, seeded with the Gentoo release keys);
+# we add our own signing key + ultimate ownertrust into it. With userpriv off
+# (see FEATURES above) the post-sign verification runs as root and uses this
+# root-owned store directly — do NOT chown it to portage, which would make the
+# root verifier hit "unsafe ownership". PORTAGE_TRUST_HELPER is neutralized so
+# portage does not rebuild the store (dropping our key) right before verifying.
+if command -v getuto >/dev/null 2>&1; then
+    getuto 2>/dev/null || true
+fi
+mkdir -p /etc/portage/gnupg && chmod 700 /etc/portage/gnupg
+if [ -f /gpg-keys/public.asc ]; then
+    gpg --homedir /etc/portage/gnupg --batch --yes --import /gpg-keys/public.asc 2>/dev/null || true
+    gpg --homedir /etc/portage/gnupg --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/{print $10":6:"}' | gpg --homedir /etc/portage/gnupg --batch --yes --import-ownertrust 2>/dev/null || true
+fi
+`, gpgKeyID, gpgKeyID, buildFeaturesLine)
 	}
 
 	// Build emerge command with automatic dependency conflict resolution
@@ -782,6 +851,13 @@ GPGEOF
 set -e
 export USE="%s"
 export FEATURES="%s"
+
+# /etc/portage is bind-mounted read-only at /tmp/pconf; copy it to a writable
+# /etc/portage so signing config and getuto's trust store can be created.
+if [ -d /tmp/pconf ]; then
+    mkdir -p /etc/portage
+    cp -a /tmp/pconf/. /etc/portage/ 2>/dev/null || true
+fi
 %s
 echo "Starting Gentoo package build for %s"
 
@@ -797,7 +873,7 @@ if ! emerge %s %s; then
 fi
 
 echo "Build completed, copying artifacts..."
-find /var/cache/binpkgs -type f -name '*.gpkg.tar' -exec cp {} /output/ \; 2>/dev/null || find /var/cache/binpkgs -type f -name '*.tbz2' -exec cp {} /output/ \; 2>/dev/null || true
+cd /var/cache/binpkgs && find . -type f \( -name '*.gpkg.tar' -o -name '*.tbz2' \) | while read -r f; do rel="${f#./}"; mkdir -p "/output/$(dirname "$rel")"; cp "$f" "/output/$rel"; done; cd /
 ls -lh /output/
 `, useFlags, features, gpgSetup, pkgAtom, emergeOpts, pkgAtom, emergeOpts, pkgAtom)
 }
@@ -960,63 +1036,139 @@ func (lb *LocalBuilder) collectAndUploadArtifact(job *BuildJob, outputDir string
 	_ = exec.Command("sync").Run()
 	time.Sleep(10 * time.Second)
 
-	artifact, err := lb.waitForArtifact(outputDir, job.Request.PackageName)
+	rels, err := lb.waitForArtifacts(outputDir)
 	if err != nil {
 		return err
 	}
 
-	destPath, err := lb.copyArtifact(artifact)
-	if err != nil {
-		return err
+	// Copy every produced package into the artifact dir, category preserved.
+	for _, rel := range rels {
+		dest := filepath.Join(lb.artifactDir, rel)
+		if err := os.MkdirAll(filepath.Dir(dest), 0750); err != nil {
+			return fmt.Errorf("failed to create artifact dir: %w", err)
+		}
+		if err := exec.Command("cp", filepath.Join(outputDir, rel), dest).Run(); err != nil {
+			return fmt.Errorf("failed to copy artifact %s: %w", rel, err)
+		}
 	}
+
+	primary := primaryArtifact(rels, job.Request.PackageName, func(rel string) int64 {
+		if info, err := os.Stat(filepath.Join(lb.artifactDir, rel)); err == nil {
+			return info.Size()
+		}
+		return 0
+	})
+	destPath := filepath.Join(lb.artifactDir, primary)
 
 	job.setArtifactURL(destPath)
+	job.setArtifacts(rels)
 
-	lb.signArtifact(job, destPath)
+	// In native mode the gpkg is already signed in-emerge (binpkg-signing);
+	// detect that rather than adding a redundant detached signature. In docker
+	// mode the container signs and the Go signer (if configured) is a fallback.
+	if gpkgIsSigned(destPath) {
+		if job.Metadata == nil {
+			job.Metadata = map[string]interface{}{}
+		}
+		job.Metadata["signed"] = true
+	} else {
+		for _, rel := range rels {
+			lb.signArtifact(job, filepath.Join(lb.artifactDir, rel))
+		}
+	}
 	lb.uploadArtifact(job, destPath)
 
 	return nil
 }
 
-// waitForArtifact waits for the artifact to appear with retries.
-func (lb *LocalBuilder) waitForArtifact(outputDir, pkgName string) (string, error) {
-	var artifact string
-	var err error
+// gpkgIsSigned reports whether a .gpkg.tar carries an embedded OpenPGP
+// signature (a *.sig member), i.e. it was produced with binpkg-signing.
+func gpkgIsSigned(path string) bool {
+	f, err := os.Open(path) // #nosec G304 -- builder's own artifact dir.
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			return false
+		}
+		if strings.HasSuffix(hdr.Name, ".sig") {
+			return true
+		}
+	}
+}
 
+// waitForArtifacts scans the container output dir for every produced binary
+// package, returning paths relative to outputDir (category preserved).
+func (lb *LocalBuilder) waitForArtifacts(outputDir string) ([]string, error) {
+	var rels []string
 	for i := 0; i < 10; i++ {
 		if i > 0 {
 			_ = exec.Command("sync").Run()
 			time.Sleep(2 * time.Second)
 		}
-
-		artifact, err = lb.findLatestPackage(outputDir, pkgName)
-		if err == nil {
-			break
+		rels = rels[:0]
+		_ = filepath.Walk(outputDir, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil || info.IsDir() {
+				return nil
+			}
+			name := filepath.Base(path)
+			if strings.HasSuffix(name, ".gpkg.tar") || strings.HasSuffix(name, ".tbz2") {
+				if rel, err := filepath.Rel(outputDir, path); err == nil {
+					rels = append(rels, rel)
+				}
+			}
+			return nil
+		})
+		if len(rels) > 0 {
+			return rels, nil
 		}
-
 		if i < 4 {
-			log.Printf("Artifact not found on attempt %d, retrying...", i+1)
+			log.Printf("No artifacts found on attempt %d, retrying...", i+1)
 		}
 	}
-
-	if err != nil {
-		return "", fmt.Errorf("artifact not found: %w", err)
-	}
-
-	return artifact, nil
+	return nil, fmt.Errorf("no artifacts found in %s", outputDir)
 }
 
-// copyArtifact copies the artifact to the destination directory.
-func (lb *LocalBuilder) copyArtifact(artifact string) (string, error) {
-	artifactName := filepath.Base(artifact)
-	destPath := filepath.Join(lb.artifactDir, artifactName)
-
-	copyCmd := exec.Command("cp", artifact, destPath)
-	if err := copyCmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to copy artifact: %w", err)
+// primaryArtifact picks the artifact belonging to the requested package
+// (matching "<pn>-<digit>" and, when present, the category directory);
+// falls back to the largest file when nothing matches.
+func primaryArtifact(rels []string, pkgName string, sizeOf func(string) int64) string {
+	if len(rels) == 0 {
+		return ""
 	}
-
-	return destPath, nil
+	category, pn := "", pkgName
+	if idx := strings.LastIndex(pkgName, "/"); idx >= 0 {
+		category, pn = pkgName[:idx], pkgName[idx+1:]
+	}
+	var matches []string
+	for _, rel := range rels {
+		base := filepath.Base(rel)
+		if !strings.HasPrefix(base, pn+"-") || len(base) <= len(pn)+1 {
+			continue
+		}
+		if c := base[len(pn)+1]; c < '0' || c > '9' {
+			continue // e.g. "jq-extras-1.0" must not match "jq"
+		}
+		if category != "" && strings.Contains(rel, "/") && !strings.HasPrefix(rel, category+"/") {
+			continue
+		}
+		matches = append(matches, rel)
+	}
+	pool := matches
+	if len(pool) == 0 {
+		pool = rels
+	}
+	best, bestSize := pool[0], int64(-1)
+	for _, rel := range pool {
+		if s := sizeOf(rel); s > bestSize {
+			best, bestSize = rel, s
+		}
+	}
+	return best
 }
 
 // signArtifact signs the artifact if a signer is available.
@@ -1055,28 +1207,23 @@ func (lb *LocalBuilder) executeNativeBuild(job *BuildJob) error {
 	}
 	defer func() { _ = os.RemoveAll(jobWorkDir) }()
 
+	// Build into a per-job PKGDIR so artifact collection sees only this build's
+	// packages (the host /var/cache/binpkgs accumulates across jobs).
+	pkgDir := filepath.Join(jobWorkDir, "binpkgs")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		return err
+	}
+
 	pkgAtom, env := lb.prepareNativeBuildEnv(job)
+	env = append(env, "PKGDIR="+pkgDir)
 
 	if err := lb.runNativeBuild(job, pkgAtom, env, jobWorkDir); err != nil {
 		return err
 	}
 
-	artifact, err := lb.findArtifactFromPaths(job.Request.PackageName)
-	if err != nil {
-		return err
-	}
-
-	destPath, err := lb.copyArtifact(artifact)
-	if err != nil {
-		return err
-	}
-
-	job.setArtifactURL(destPath)
-
-	lb.signArtifact(job, destPath)
-	lb.uploadArtifact(job, destPath)
-
-	return nil
+	// Same collector as the docker path: copy every produced gpkg into the
+	// artifact dir (category preserved), pick the requested package as primary.
+	return lb.collectAndUploadArtifact(job, pkgDir)
 }
 
 // prepareNativeBuildEnv prepares the package atom and environment variables.
@@ -1118,97 +1265,23 @@ func (lb *LocalBuilder) runNativeBuild(job *BuildJob, pkgAtom string, env []stri
 	cmd.Env = env
 	cmd.Dir = workDir
 
-	output, err := cmd.CombinedOutput()
-	job.setLog(string(output))
-
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		return err
+	}
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("build failed to start: %w", err)
+	}
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		job.appendLog(sc.Text() + "\n")
+	}
+	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("build failed: %w", err)
 	}
-
 	return nil
-}
-
-// findArtifactFromPaths finds the artifact from package manager specific paths.
-func (lb *LocalBuilder) findArtifactFromPaths(pkgName string) (string, error) {
-	artifactPaths := lb.pkgMgr.GetArtifactPaths()
-	for _, pkgDir := range artifactPaths {
-		artifact, err := lb.findLatestPackage(pkgDir, pkgName)
-		if err == nil {
-			return artifact, nil
-		}
-	}
-	return "", fmt.Errorf("artifact not found in any of %v", artifactPaths)
-}
-
-// findLatestPackage finds the most recently created package file.
-func (lb *LocalBuilder) findLatestPackage(dir, pkgName string) (string, error) {
-	var matchedFiles []string
-	var callbackCount int
-
-	log.Printf("Finding packages in directory: %s for package: %s", dir, pkgName)
-
-	// Check if directory exists and is accessible
-	info, err := os.Stat(dir)
-	if err != nil {
-		log.Printf("ERROR: Cannot stat directory %s: %v", dir, err)
-		return "", fmt.Errorf("directory not accessible: %w", err)
-	}
-	log.Printf("Directory stat OK: %s (isDir: %v, mode: %v)", dir, info.IsDir(), info.Mode())
-
-	// Try to list directory contents directly
-	if entries, readErr := os.ReadDir(dir); readErr != nil {
-		log.Printf("ERROR: Cannot read directory %s: %v", dir, readErr)
-	} else {
-		log.Printf("Directory has %d entries", len(entries))
-		for _, entry := range entries {
-			log.Printf("  Entry: %s (isDir: %v)", entry.Name(), entry.IsDir())
-		}
-	}
-
-	err = filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
-		callbackCount++
-		if walkErr != nil {
-			log.Printf("Walk error at %s: %v", path, walkErr)
-			return nil
-		}
-
-		name := filepath.Base(path)
-		log.Printf("Walk callback #%d: %s (isDir: %v, size: %d)", callbackCount, name, info.IsDir(), info.Size())
-
-		if !info.IsDir() && (strings.HasSuffix(name, ".tbz2") || strings.HasSuffix(name, ".gpkg.tar")) {
-			log.Printf("Package file matched: %s", name)
-			matchedFiles = append(matchedFiles, path)
-		}
-
-		return nil
-	})
-
-	log.Printf("Walk completed. Callback was called %d times", callbackCount)
-
-	if err != nil {
-		log.Printf("Walk returned error: %v", err)
-		return "", err
-	}
-
-	if len(matchedFiles) == 0 {
-		log.Printf("No package files found in %s", dir)
-		return "", fmt.Errorf("no package found")
-	}
-
-	// Return the largest file (main package is usually largest)
-	var largestFile string
-	var largestSize int64
-	for _, f := range matchedFiles {
-		if info, err := os.Stat(f); err == nil {
-			if info.Size() > largestSize {
-				largestSize = info.Size()
-				largestFile = f
-			}
-		}
-	}
-
-	log.Printf("Found %d packages, returning largest: %s (%d bytes)", len(matchedFiles), largestFile, largestSize)
-	return largestFile, nil
 }
 
 // sendNotification sends build completion notification.
@@ -1264,6 +1337,27 @@ func (lb *LocalBuilder) GetArtifactPath(jobID string) (string, error) {
 	return artifactURL, nil
 }
 
+// GetArtifactPathByRel returns the absolute path of one produced artifact,
+// validated against the job's recorded artifact list (no path traversal).
+func (lb *LocalBuilder) GetArtifactPathByRel(jobID, rel string) (string, error) {
+	lb.jobsMutex.RLock()
+	job, exists := lb.jobs[jobID]
+	lb.jobsMutex.RUnlock()
+	if !exists {
+		return "", fmt.Errorf("job not found: %s", jobID)
+	}
+	for _, known := range job.artifactsSnapshot() {
+		if known == rel {
+			p := filepath.Join(lb.artifactDir, rel)
+			if _, err := os.Stat(p); err != nil {
+				return "", fmt.Errorf("artifact file not found: %s", rel)
+			}
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("artifact %q not produced by job %s", rel, jobID)
+}
+
 // ArtifactInfo contains metadata about a build artifact.
 type ArtifactInfo struct {
 	JobID       string `json:"job_id"`
@@ -1307,4 +1401,130 @@ func (lb *LocalBuilder) GetArtifactInfo(jobID string) (*ArtifactInfo, error) {
 		PackageName: job.Request.PackageName,
 		Version:     job.Request.Version,
 	}, nil
+}
+
+// VerifyInstall proves the freshly built binary package is actually
+// installable: a pristine container resolves the atom from the configured
+// binhost (--usepkgonly, no source fallback) and installs it. Output is
+// returned for the job log; a non-nil error means verification failed.
+//
+// The portage config is copied into the container (not mounted at
+// /etc/portage) so getuto can create /etc/portage/gnupg — a read-only mount
+// there breaks portage's trust helper. binpkg-request-signature is also
+// subtracted until the signing chain is wired end-to-end.
+// verifyInstallNative confirms the freshly built binpkg installs from the
+// binhost on a native Gentoo VM (no Docker): it emerges the package into a
+// throwaway --root using only binary packages, so signature/trust and
+// dependency resolution are exercised without touching the host system.
+func (lb *LocalBuilder) verifyInstallNative(pkgAtom, binhostURL string, requireSignature bool) (string, error) {
+	root, err := os.MkdirTemp("", "pe-verify-root")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.RemoveAll(root) }()
+
+	// Seed the throwaway root with the trust anchors portage needs to verify a
+	// signed binpkg: the Gentoo release keys (so its trust helper getuto can
+	// initialize the store in the root) and the host's already-configured
+	// signing store (which trusts our key). Without this getuto fails because
+	// the empty root has no /usr/share/openpgp-keys/gentoo-release.asc.
+	seed := fmt.Sprintf(
+		"mkdir -p %[1]s/usr/share/openpgp-keys %[1]s/etc/portage && "+
+			"cp -a /usr/share/openpgp-keys/. %[1]s/usr/share/openpgp-keys/ 2>/dev/null || true; "+
+			"cp -a /etc/portage/gnupg %[1]s/etc/portage/gnupg && "+
+			"chown -R nobody:nobody %[1]s/etc/portage/gnupg",
+		root)
+	if out, err := exec.Command("bash", "-c", seed).CombinedOutput(); err != nil {
+		return string(out), fmt.Errorf("failed to seed verify root: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	args := []string{
+		"--root=" + root,
+		"--usepkgonly=y",
+		"--getbinpkg=y",
+		"--oneshot",
+		"--color=n", "-q",
+		pkgAtom,
+	}
+	cmd := exec.CommandContext(ctx, "emerge", args...)
+	env := os.Environ()
+	if binhostURL != "" {
+		env = append(env, "PORTAGE_BINHOST="+binhostURL)
+	}
+	feature := "-binpkg-request-signature"
+	if requireSignature {
+		feature = "binpkg-request-signature"
+	}
+	env = append(env, "FEATURES="+feature)
+	cmd.Env = env
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("native install verification failed: %w", err)
+	}
+	return string(out), nil
+}
+
+// VerifyInstall confirms a freshly built package installs from the binhost:
+// natively via a seeded throwaway --root, or in a pristine docker container.
+func (lb *LocalBuilder) VerifyInstall(pkgAtom, binhostURL, gpgPubkey string, requireSignature bool) (string, error) {
+	if lb.cfg == nil || !lb.cfg.UseDocker {
+		return lb.verifyInstallNative(pkgAtom, binhostURL, requireSignature)
+	}
+
+	reposPath := lb.cfg.PortageReposPath
+	if reposPath == "" {
+		reposPath = "/var/db/repos"
+	}
+	confPath := lb.cfg.PortageConfPath
+	if confPath == "" {
+		confPath = "/etc/portage"
+	}
+
+	features := "-binpkg-request-signature"
+	if requireSignature {
+		features = "binpkg-request-signature"
+	}
+	args := []string{"--rm",
+		"-v", reposPath + ":/var/db/repos:ro",
+		"-v", confPath + ":/tmp/pconf:ro",
+		"-e", "FEATURES=" + features,
+	}
+	if binhostURL != "" {
+		args = append(args, "-e", "PORTAGE_BINHOST="+binhostURL)
+	}
+
+	// The binhost signing pubkey rides in on a bind mount and is imported into
+	// the container's portage keyring so signed packages verify.
+	keyImport := ""
+	if gpgPubkey != "" {
+		keyDir, err := os.MkdirTemp("", "pe-verify-key")
+		if err != nil {
+			return "", fmt.Errorf("failed to stage verify pubkey: %w", err)
+		}
+		defer func() { _ = os.RemoveAll(keyDir) }()
+		keyFile := filepath.Join(keyDir, "pubkey.asc")
+		if err := os.WriteFile(keyFile, []byte(gpgPubkey), 0600); err != nil {
+			return "", fmt.Errorf("failed to write verify pubkey: %w", err)
+		}
+		args = append(args, "-v", keyFile+":/tmp/pe-pubkey.asc:ro")
+		keyImport = "gpg --homedir /etc/portage/gnupg --batch --yes --import /tmp/pe-pubkey.asc >/dev/null 2>&1 || true; " +
+			"gpg --homedir /etc/portage/gnupg --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr:/{print $10\":6:\"}' | gpg --homedir /etc/portage/gnupg --batch --yes --import-ownertrust >/dev/null 2>&1 || true; "
+	}
+
+	script := "cp -a /tmp/pconf/. /etc/portage/ 2>/dev/null || true; " +
+		"getuto >/dev/null 2>&1 || true; " +
+		keyImport +
+		"emerge --color=n -q --getbinpkg=y --usepkgonly=y " + pkgAtom
+	args = append(args, lb.dockerImage, "sh", "-c", script)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	out, err := lb.containerRuntime.Run(ctx, args)
+	if err != nil {
+		return string(out), fmt.Errorf("install verification failed: %w", err)
+	}
+	return string(out), nil
 }

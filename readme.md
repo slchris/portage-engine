@@ -6,16 +6,20 @@
 [![CodeQL](https://github.com/slchris/portage-engine/actions/workflows/codeql.yml/badge.svg)](https://github.com/slchris/portage-engine/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A distributed binary package building and management system for Gentoo Linux with advanced configuration transfer capabilities. The system automatically provisions cloud infrastructure or Docker containers to build packages with custom USE flags and configurations when they're not available in the binary package server.
+A distributed binary package building and management system for Gentoo Linux with advanced configuration transfer capabilities. The system automatically provisions build infrastructure — a Proxmox VE cluster, public clouds, or Docker containers — to build packages with custom USE flags and configurations when they're not available in the binary package server, then publishes GPG-signed `gpkg` binary packages to a binhost.
 
 ## 🎯 Key Features
 
-- **Configuration Transfer**: Transfer complete Portage configurations (USE flags, keywords, masks, etc.) to build instances
-- **Flexible Build Environments**: Support for Docker containers and cloud infrastructure (Aliyun, GCP, AWS)
-- **Package Customization**: Build packages with specific USE flag combinations
-- **Automated Infrastructure**: On-demand provisioning of build resources
-- **RESTful API**: Complete API for integration with existing tools
-- **Web Dashboard**: Real-time monitoring and management interface
+- **Two build environments**:
+  - **Native Gentoo VM** (Proxmox VE) — provisions a real Gentoo VM from a UEFI cloud-init template and builds with `emerge` natively. This is the path that supports working in-emerge **gpkg signing** and install verification.
+  - **Docker container** — builds inside a `gentoo/stage3` container on a Debian VM (or locally).
+- **On-demand provisioning & auto-scheduling**: Terraform-driven VM provisioning on PVE with least-loaded node selection, a **warm instance pool** that survives server restarts, and TTL-based reclaim.
+- **GPG-signed binary packages**: In-emerge `binpkg-signing` produces double-signed `gpkg` artifacts; a pristine-environment **install verification** stage confirms they install from the binhost before release.
+- **Binhost + mirror publishing**: Serves a Portage-consumable `Packages` index at `/binpkgs`, and can additionally push signed artifacts (plus the index and public key) to an internal LAN mirror.
+- **WebUI-managed configuration**: Cloud providers, SSH keys, mirrors, build mode, and signing are configured at runtime in the dashboard (Settings) and persist across restarts — the config file holds only bootstrap values (ports, paths, secrets).
+- **Configuration transfer**: Transfer complete Portage configurations (USE flags, keywords, masks, etc.) to build instances.
+- **Web dashboard**: Apple-style UI with English/中文 i18n, a live per-stage build pipeline (Provision → Deploy → Build → Collect → Verify → Release), streaming logs, and a browser **WebShell** into build nodes.
+- **RESTful API**: Complete API for integration with existing tools.
 
 ## Architecture
 
@@ -27,9 +31,9 @@ Central server that handles package queries, build requests, and coordinates inf
 **Features:**
 - Package availability queries
 - Build request management with configuration bundles
-- Multi-cloud infrastructure provisioning (Aliyun, GCP, AWS)
-- Docker-based local builds
-- Binary package synchronization
+- Infrastructure provisioning: Proxmox VE (native Gentoo VMs), GCP, AWS
+- Docker-based container builds
+- GPG signing, install verification, and binhost/mirror publishing
 - RESTful API
 
 ### 2. Configuration Transfer System
@@ -47,13 +51,18 @@ Advanced system for collecting, packaging, and applying Portage configurations.
 **📚 See detailed documentation**: [Using System Portage Configuration](docs/SYSTEM_CONFIG_USAGE.md)
 
 ### 3. Infrastructure as Code (IaC)
-Automated cloud infrastructure provisioning system that creates build machines on-demand.
+Automated infrastructure provisioning that creates build machines on-demand (Terraform-driven for PVE, with a warm pool and instance persistence).
 
 **Supported Providers:**
-- Aliyun (Alibaba Cloud)
+- **Proxmox VE** — native Gentoo VMs (UEFI cloud-init template) *or* Docker-on-Debian; auto node scheduling
 - Google Cloud Platform (GCP)
 - Amazon Web Services (AWS)
 - Docker containers (local builds)
+
+**Native Gentoo VM template:** built once from the official Gentoo cloud-init
+QCOW2 disk image (mirror-downloadable), with the portage tree, profile, and
+`qemu-guest-agent` baked in; the signing key is deployed per-build, never into
+the template. See [docs/PVE_TESTING.md](docs/PVE_TESTING.md).
 
 ### 4. Portage Client Tool
 A management/request CLI. It does **not** install packages — that is done
@@ -67,13 +76,15 @@ covers the parts Portage has no native mechanism for.
 - `bundle` — generate a Portage config bundle without building
 
 ### 5. Dashboard
-Web-based monitoring and management interface for the build cluster.
+Web-based monitoring and management interface for the build cluster (Apple-style UI, English/中文).
 
 **Features:**
-- Real-time cluster status monitoring
-- Build job tracking
-- Instance management
-- Authentication support (with anonymous access option)
+- Real-time cluster status and build-job tracking
+- Live per-stage build pipeline with streaming, filterable logs
+- **Settings**: manage cloud providers, SSH keys, mirrors, build mode, GPG signing, and artifact upload at runtime (persisted; overrides the bootstrap config)
+- Per-backend connection tests and a full-pipeline test build
+- Build-node management with a browser **WebShell** (SSH into instances)
+- Authentication (cookie session; optional anonymous access)
 
 ## 📚 Documentation
 
@@ -216,15 +227,18 @@ tar -tzf python-build.tar.gz
 
 ## Configuration
 
-### Server Configuration
-
-Edit `configs/server.conf`:
+`configs/server.conf` holds **bootstrap** configuration only — ports, data
+paths, and security material the server needs before it can serve. Everything
+operational (cloud providers, SSH keys, mirrors, build mode, signing, instance
+TTL) is managed at runtime in the dashboard's **Settings** page and persists to
+`DATA_DIR/cloud-settings.json`, which overrides the file. Precedence for every
+key: environment > file > built-in default.
 
 ```bash
 SERVER_PORT=8080
-BINPKG_PATH=/var/cache/binpkgs
+BINPKG_PATH=/var/cache/binpkgs        # binhost PKGDIR served at /binpkgs
+DATA_DIR=/var/lib/portage-engine/server
 MAX_WORKERS=5
-CLOUD_DEFAULT_PROVIDER=gcp
 
 # Security (strongly recommended for production)
 API_KEY=your-api-key-here

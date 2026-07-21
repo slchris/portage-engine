@@ -67,7 +67,7 @@ func TestHandleIndex(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
 
-	dashboard.handleIndex(w, req)
+	dashboard.handleLanding(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusOK {
@@ -88,7 +88,7 @@ func TestHandleIndexNotFound(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/invalid-path", nil)
 	w := httptest.NewRecorder()
 
-	dashboard.handleIndex(w, req)
+	dashboard.handleLanding(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusNotFound {
@@ -118,7 +118,7 @@ func TestHandleLogin(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/login", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 
-	dashboard.handleLogin(w, req)
+	dashboard.handleLoginRoute(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusOK {
@@ -149,7 +149,7 @@ func TestHandleLoginRejectsBadCredentials(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/login", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 
-	dashboard.handleLogin(w, req)
+	dashboard.handleLoginRoute(w, req)
 
 	if got := w.Result().StatusCode; got != http.StatusUnauthorized {
 		t.Errorf("Expected status 401 for bad credentials, got %d", got)
@@ -166,10 +166,10 @@ func TestHandleLoginMethodNotAllowed(t *testing.T) {
 
 	dashboard := New(cfg)
 
-	req := httptest.NewRequest(http.MethodGet, "/login", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/login", nil)
 	w := httptest.NewRecorder()
 
-	dashboard.handleLogin(w, req)
+	dashboard.handleLoginRoute(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
@@ -250,25 +250,34 @@ func TestHandleKeyEndpointsProxyRealKey(t *testing.T) {
 	}
 }
 
-// TestHandleInstances tests the instances API endpoint.
+// TestHandleInstances verifies the instances endpoint proxies the server's
+// real instance list (backend up → data; backend down → honest 502).
 func TestHandleInstances(t *testing.T) {
-	cfg := &config.DashboardConfig{
-		ServerURL:      "http://localhost:8080",
-		AuthEnabled:    false,
-		AllowAnonymous: true,
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/instances" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":"pve-123","provider":"pve","status":"running","ip_address":"10.0.0.9"}]`))
+	}))
+	defer backend.Close()
+
+	d := New(&config.DashboardConfig{ServerURL: backend.URL, AllowAnonymous: true})
+	w := httptest.NewRecorder()
+	d.handleInstances(w, httptest.NewRequest(http.MethodGet, "/api/instances", nil))
+	if w.Result().StatusCode != http.StatusOK {
+		t.Errorf("backend up: expected 200, got %d", w.Result().StatusCode)
+	}
+	if !strings.Contains(w.Body.String(), "pve-123") {
+		t.Errorf("expected proxied instance data, got: %s", w.Body.String())
 	}
 
-	dashboard := New(cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/instances", nil)
-	w := httptest.NewRecorder()
-
-	dashboard.handleInstances(w, req)
-
-	resp := w.Result()
-	// May return 200 or 500 depending on server connectivity
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("Expected status 200 or 500, got %d", resp.StatusCode)
+	d2 := New(&config.DashboardConfig{ServerURL: "http://127.0.0.1:1", AllowAnonymous: true})
+	w2 := httptest.NewRecorder()
+	d2.handleInstances(w2, httptest.NewRequest(http.MethodGet, "/api/instances", nil))
+	if w2.Result().StatusCode != http.StatusBadGateway {
+		t.Errorf("backend down: expected 502, got %d", w2.Result().StatusCode)
 	}
 }
 
@@ -406,7 +415,7 @@ func TestHandleBuildsPage(t *testing.T) {
 	if w.Result().StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Result().StatusCode)
 	}
-	if !strings.Contains(w.Body.String(), "Build Jobs") {
+	if !strings.Contains(w.Body.String(), "Builds") {
 		t.Errorf("expected builds page content, got: %s", w.Body.String()[:min(200, w.Body.Len())])
 	}
 }

@@ -78,6 +78,17 @@ func (s *Server) handleBuildRequest(w http.ResponseWriter, r *http.Request) {
 		req.Version = version
 	}
 
+	if arch, ok := rawReq["arch"].(string); ok {
+		req.Arch = arch
+	}
+	if req.Arch == "" {
+		req.Arch = "amd64"
+	}
+
+	if provider, ok := rawReq["cloud_provider"].(string); ok {
+		req.CloudProvider = provider
+	}
+
 	if useFlags, ok := rawReq["use_flags"].([]interface{}); ok {
 		req.UseFlags = make([]string, len(useFlags))
 		for i, flag := range useFlags {
@@ -276,4 +287,44 @@ func (s *Server) handleSchedulerStatus(w http.ResponseWriter, r *http.Request) {
 	status := s.builder.GetSchedulerStatus()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
+}
+
+// handleBuildDelete removes a finished job record (DELETE ?job_id=).
+func (s *Server) handleBuildDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	jobID := r.URL.Query().Get("job_id")
+	if jobID == "" {
+		http.Error(w, "Missing job_id parameter", http.StatusBadRequest)
+		return
+	}
+	if err := s.builder.DeleteJob(jobID); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"deleted": jobID})
+}
+
+// handleBuildsCleanupFailed removes every failed job record.
+func (s *Server) handleBuildsCleanupFailed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n := s.builder.CleanupFailedJobs()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int{"removed": n})
+}
+
+// handleInstancesList returns the live cloud instances.
+func (s *Server) handleInstancesList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.builder.ListInstances())
 }

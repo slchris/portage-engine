@@ -110,16 +110,20 @@ func TestGentooPackageManager_DockerMounts(t *testing.T) {
 		t.Error("expected /var/db/repos mount")
 	}
 
-	// Check portage mount
+	// Check portage config mount: staged read-only at /tmp/pconf, copied to a
+	// writable /etc/portage by the build script (getuto needs it writable).
 	foundPortage := false
 	for _, m := range mounts {
-		if m.Target == "/etc/portage" {
+		if m.Target == "/tmp/pconf" {
 			foundPortage = true
+			if !m.ReadOnly {
+				t.Error("portage config mount should be read-only")
+			}
 			break
 		}
 	}
 	if !foundPortage {
-		t.Error("expected /etc/portage mount")
+		t.Error("expected /tmp/pconf portage config mount")
 	}
 }
 

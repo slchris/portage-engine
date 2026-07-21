@@ -280,12 +280,17 @@ func TestGenerateTerraformConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			config := manager.generateTerraformConfig(tt.req)
-			if !tt.wantEmpty && len(config) == 0 {
-				t.Error("generateTerraformConfig() returned empty config")
+			config, err := manager.generateTerraformConfig(tt.req)
+			if !tt.wantEmpty {
+				if err != nil {
+					t.Fatalf("generateTerraformConfig() error: %v", err)
+				}
+				if len(config) == 0 {
+					t.Error("generateTerraformConfig() returned empty config")
+				}
 			}
-			if tt.wantEmpty && len(config) > 0 {
-				t.Error("generateTerraformConfig() should return empty config for invalid provider")
+			if tt.wantEmpty && err == nil {
+				t.Error("generateTerraformConfig() should return an error for invalid provider")
 			}
 		})
 	}
@@ -435,7 +440,10 @@ func TestProvisionWorkflow(t *testing.T) {
 	}
 
 	// Test config generation
-	config := manager.generateTerraformConfig(req)
+	config, err := manager.generateTerraformConfig(req)
+	if err != nil {
+		t.Fatalf("generateTerraformConfig() error: %v", err)
+	}
 	if len(config) == 0 {
 		t.Error("Generated config is empty")
 	}
@@ -446,15 +454,15 @@ func TestProvisionWorkflow(t *testing.T) {
 
 	// Create the config file to simulate what Provision() does
 	testWorkspace := filepath.Join(workspaceDir, "test-workspace")
-	if err := os.MkdirAll(testWorkspace, 0755); err == nil {
-		if err := os.WriteFile(configPath, []byte(config), 0644); err == nil {
-			// Verify file was created
-			if _, err := os.Stat(configPath); os.IsNotExist(err) {
-				t.Error("main.tf was not created")
-			}
-			// Clean up
-			_ = os.RemoveAll(testWorkspace)
-		}
+	if err := os.MkdirAll(testWorkspace, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(testWorkspace) }()
+	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		t.Error("main.tf was not created")
 	}
 }
 

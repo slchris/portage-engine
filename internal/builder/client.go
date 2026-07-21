@@ -32,10 +32,17 @@ type HeartbeatResponse struct {
 // Client communicates with remote builder services
 type Client struct {
 	baseURL       string
+	apiKey        string
 	httpClient    *http.Client
 	heartbeatStop chan struct{}
 	heartbeatWg   sync.WaitGroup
 	metrics       *metrics.Metrics
+}
+
+// SetAPIKey sets the server API key attached to registration/heartbeat calls
+// (the server's /api/v1/* endpoints 401 without it when API_KEY is configured).
+func (bc *Client) SetAPIKey(key string) {
+	bc.apiKey = key
 }
 
 // NewBuilderClient creates a new builder client
@@ -205,11 +212,18 @@ func (bc *Client) SendHeartbeat(req *HeartbeatRequest) error {
 		return fmt.Errorf("failed to marshal heartbeat: %w", err)
 	}
 
-	resp, err := bc.httpClient.Post(
-		bc.baseURL+"/api/v1/heartbeat",
-		"application/json",
-		bytes.NewReader(data),
-	)
+	httpReq, err := http.NewRequest(http.MethodPost, bc.baseURL+"/api/v1/heartbeat", bytes.NewReader(data))
+	if err != nil {
+		bc.metrics.IncHTTPRequestErrors()
+		bc.metrics.IncHeartbeatsFailed()
+		return fmt.Errorf("failed to create heartbeat request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if bc.apiKey != "" {
+		httpReq.Header.Set("X-API-Key", bc.apiKey)
+	}
+
+	resp, err := bc.httpClient.Do(httpReq)
 	if err != nil {
 		bc.metrics.IncHTTPRequestErrors()
 		bc.metrics.IncHeartbeatsFailed()

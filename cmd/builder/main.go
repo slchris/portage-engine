@@ -29,7 +29,71 @@ func main() {
 	handler := authMiddleware(cfg.AuthToken, mux)
 	server := startServer(cfg, handler)
 
+	stopHeartbeat := startHeartbeat(cfg, bldr)
+	defer stopHeartbeat()
+
 	waitForShutdown(server, bldr)
+}
+
+// heartbeatInterval is how often the builder refreshes its registration with
+// the central server. The server marks builders offline when heartbeats stop.
+const heartbeatInterval = 30 * time.Second
+
+// startHeartbeat registers this builder with the central server and keeps the
+// registration alive with periodic heartbeats, so the server's builder
+// registry (health checks, artifact routing, dashboard) sees manually-started
+// builders too — previously only cloud-init deployed instances registered.
+// No-op when SERVER_URL is unset. Returns a stop function.
+func startHeartbeat(cfg *config.BuilderConfig, bldr *builder.LocalBuilder) func() {
+	if cfg.ServerURL == "" {
+		log.Println("SERVER_URL not set; not registering with a central server")
+		return func() {}
+	}
+
+	client := builder.NewBuilderClient(cfg.ServerURL)
+	client.SetAPIKey(cfg.ServerAPIKey)
+
+	builderID := cfg.InstanceID
+	hostname, _ := os.Hostname()
+	if builderID == "" {
+		builderID = hostname
+	}
+	endpoint := cfg.AdvertiseURL
+	if endpoint == "" {
+		endpoint = fmt.Sprintf("http://%s:%d", hostname, cfg.Port)
+	}
+
+	send := func() {
+		hb := &builder.HeartbeatRequest{
+			BuilderID:  builderID,
+			Status:     "online",
+			Endpoint:   endpoint,
+			Capacity:   cfg.Workers,
+			ActiveJobs: bldr.ActiveJobs(),
+			Timestamp:  time.Now(),
+		}
+		if err := client.SendHeartbeat(hb); err != nil {
+			log.Printf("Warning: heartbeat to %s failed: %v", cfg.ServerURL, err)
+		}
+	}
+
+	log.Printf("Registering builder %q (endpoint %s) with server %s", builderID, endpoint, cfg.ServerURL)
+	send()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				send()
+			}
+		}
+	}()
+	return cancel
 }
 
 // authMiddleware requires a shared token on every endpoint except /health.
@@ -210,6 +274,32 @@ func setupHTTPHandlers(bldr *builder.LocalBuilder) *http.ServeMux {
 		_ = json.NewEncoder(w).Encode(info)
 	})
 
+	// Install-verification endpoint: proves a freshly built binpkg installs
+	// cleanly from the binhost in a pristine container.
+	mux.HandleFunc("/api/v1/verify", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			PackageName      string `json:"package_name"`
+			BinhostURL       string `json:"binhost_url"`
+			GPGPubkey        string `json:"gpg_pubkey"`
+			RequireSignature bool   `json:"require_signature"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PackageName == "" {
+			http.Error(w, "package_name required", http.StatusBadRequest)
+			return
+		}
+		out, err := bldr.VerifyInstall(req.PackageName, req.BinhostURL, req.GPGPubkey, req.RequireSignature)
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]any{"ok": err == nil, "log": out}
+		if err != nil {
+			resp["error"] = err.Error()
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
 	// Artifact download endpoint
 	mux.HandleFunc("/api/v1/artifacts/download/", func(w http.ResponseWriter, r *http.Request) {
 		jobID := r.URL.Path[len("/api/v1/artifacts/download/"):]
@@ -218,7 +308,13 @@ func setupHTTPHandlers(bldr *builder.LocalBuilder) *http.ServeMux {
 			return
 		}
 
-		artifactPath, err := bldr.GetArtifactPath(jobID)
+		var artifactPath string
+		var err error
+		if rel := r.URL.Query().Get("path"); rel != "" {
+			artifactPath, err = bldr.GetArtifactPathByRel(jobID, rel)
+		} else {
+			artifactPath, err = bldr.GetArtifactPath(jobID)
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return

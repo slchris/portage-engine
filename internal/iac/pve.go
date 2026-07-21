@@ -28,11 +28,17 @@ type PVEInstanceSpec struct {
 	Gateway     string   `json:"gateway"`    // Gateway for static IP
 	Nameserver  string   `json:"nameserver"` // DNS server
 	SSHKeys     string   `json:"ssh_keys"`   // SSH public keys
+	CICustom    string   `json:"cicustom"`   // Custom cloud-init snippet ref (e.g. vendor=local:snippets/vendor.yaml)
 	Tags        []string `json:"tags"`       // PVE tags
 	Pool        string   `json:"pool"`       // PVE resource pool
 	StartOnBoot bool     `json:"start_onboot"`
 	Agent       bool     `json:"agent"`      // Enable QEMU guest agent
 	CloudInit   bool     `json:"cloud_init"` // Use cloud-init
+	// Bios/Machine select firmware. Empty defaults to SeaBIOS/i440fx (Debian
+	// cloud template). A Gentoo cloud-init QCOW2 needs "ovmf"/"q35" (UEFI); the
+	// efidisk is inherited from the template on clone.
+	Bios    string `json:"bios"`
+	Machine string `json:"machine"`
 }
 
 // PVEConfig holds PVE-specific configuration for IaC.
@@ -50,6 +56,8 @@ type PVEConfig struct {
 	Storage           string   `json:"storage"`           // Default storage pool
 	Network           string   `json:"network"`           // Default network bridge
 	Template          string   `json:"template"`          // Default VM template
+	Bios              string   `json:"bios"`              // ovmf for UEFI (Gentoo), empty=SeaBIOS
+	Machine           string   `json:"machine"`           // q35 for UEFI, empty=i440fx
 	AllowedIPRanges   []string `json:"allowed_ip_ranges"` // Allowed IP ranges for firewall
 	BuilderPort       int      `json:"builder_port"`      // Builder service port
 	ServerCallbackURL string   `json:"server_callback_url"`
@@ -57,6 +65,12 @@ type PVEConfig struct {
 }
 
 // DefaultPVEInstanceSpec returns the default PVE instance specification.
+//
+// Template is intentionally empty: proxmox_vm_qemu clones a QEMU VM template by
+// name, and there is no universally-present template to default to (the old
+// default here was an LXC vztmpl path, which qemu clone can never use). The
+// operator must supply one via CLOUD_PVE_TEMPLATE or machine_spec "template";
+// see docs/PVE_TESTING.md for how to build a suitable template.
 func DefaultPVEInstanceSpec() *PVEInstanceSpec {
 	return &PVEInstanceSpec{
 		Node:        "pve",
@@ -68,7 +82,7 @@ func DefaultPVEInstanceSpec() *PVEInstanceSpec {
 		DiskSizeGB:  50,
 		DiskType:    "scsi",
 		Storage:     "local-lvm",
-		Template:    "local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst",
+		Template:    "",
 		OSType:      "l26",
 		Network:     "vmbr0",
 		VLAN:        0,
@@ -113,12 +127,15 @@ func PVEInstanceSpecFromMap(m map[string]string) *PVEInstanceSpec {
 	setStringField("storage", &spec.Storage)
 	setStringField("template", &spec.Template)
 	setStringField("os_type", &spec.OSType)
+	setStringField("bios", &spec.Bios)
+	setStringField("machine", &spec.Machine)
 	setStringField("network", &spec.Network)
 	setIntField("vlan", &spec.VLAN)
 	setStringField("ip_config", &spec.IPConfig)
 	setStringField("gateway", &spec.Gateway)
 	setStringField("nameserver", &spec.Nameserver)
 	setStringField("ssh_keys", &spec.SSHKeys)
+	setStringField("cicustom", &spec.CICustom)
 	setStringField("pool", &spec.Pool)
 	setBoolField("cloud_init", &spec.CloudInit)
 	setBoolField("agent", &spec.Agent)
@@ -176,6 +193,12 @@ func (p *PVEProvisioner) GenerateMainTF(spec *PVEInstanceSpec, instanceName stri
 	if p.config.Template != "" {
 		spec.Template = p.config.Template
 	}
+	if p.config.Bios != "" {
+		spec.Bios = p.config.Bios
+	}
+	if p.config.Machine != "" {
+		spec.Machine = p.config.Machine
+	}
 
 	tags := spec.Tags
 	if len(tags) == 0 {
@@ -186,20 +209,35 @@ func (p *PVEProvisioner) GenerateMainTF(spec *PVEInstanceSpec, instanceName stri
 	// Build network configuration
 	networkConfig := p.generateNetworkConfig(spec)
 
+	// Build disks configuration (telmate 3.x nested `disks` schema)
+	disksConfig := p.generateDisksConfig(spec)
+
 	// Build cloud-init configuration
 	cloudInitConfig := ""
+	firmwareBlock := ""
+	if spec.Bios != "" {
+		firmwareBlock += fmt.Sprintf("\n  bios    = \"%s\"", spec.Bios)
+	}
+	if spec.Machine != "" {
+		firmwareBlock += fmt.Sprintf("\n  machine = \"%s\"", spec.Machine)
+	}
+	osTypeBlock := ""
 	if spec.CloudInit {
 		cloudInitConfig = p.generateCloudInitConfig(spec, instanceName)
+		// telmate's os_type selects the provisioning method; "cloud-init" makes
+		// ipconfig0/ciuser/sshkeys take effect.
+		osTypeBlock = `
+  os_type = "cloud-init"`
 	}
 
-	// SSH keys block
+	// SSH keys block (telmate attribute is `sshkeys`, newline-separated)
 	sshKeysBlock := ""
 	if p.config.SSHKeyPath != "" {
 		sshKeysBlock = fmt.Sprintf(`
-  ssh_keys = file("%s.pub")`, p.config.SSHKeyPath)
+  sshkeys = file("%s.pub")`, p.config.SSHKeyPath)
 	} else if spec.SSHKeys != "" {
 		sshKeysBlock = fmt.Sprintf(`
-  ssh_keys = <<-EOF
+  sshkeys = <<-EOF
 %s
 EOF`, spec.SSHKeys)
 	}
@@ -224,6 +262,9 @@ EOF`, spec.SSHKeys)
 	// TF_VAR_*), never embedded as literals in this file.
 	authVariables := p.generateAuthVariables()
 
+	// telmate/proxmox has no stable 3.x release (all 3.x versions are release
+	// candidates), and Terraform's "~>" constraint never matches pre-releases —
+	// so the version must be pinned exactly. rc04 is the newest rc that works against live PVE 8 clusters: rc08 fatally mishandles the HA-state read of non-HA VMs, and 2.9.x cannot parse PVE 8 API responses (both verified live).
 	return fmt.Sprintf(`# Generated by Portage Engine IaC
 # Instance: %s
 # Generated at: %s
@@ -234,7 +275,7 @@ terraform {
   required_providers {
     proxmox = {
       source  = "telmate/proxmox"
-      version = "~> 3.0"
+      version = "%s"
     }
   }
 
@@ -258,16 +299,12 @@ resource "proxmox_vm_qemu" "portage_builder" {
   memory      = %d
   agent       = %d
   onboot      = %t
-  os_type     = "%s"
+  scsihw      = "virtio-scsi-pci"%s%s
 
   clone       = "%s"
   full_clone  = true
 
-  disk {
-    storage = "%s"
-    size    = "%dG"
-    type    = "%s"
-  }
+%s
 
 %s
 %s
@@ -278,7 +315,7 @@ resource "proxmox_vm_qemu" "portage_builder" {
   lifecycle {
     ignore_changes = [
       network,
-      disk,
+      disks,
     ]
   }
 }
@@ -301,6 +338,7 @@ output "node" {
 `,
 		instanceName,
 		time.Now().Format(time.RFC3339),
+		pveProviderVersion,
 		authVariables,
 		p.config.Endpoint,
 		p.config.Insecure,
@@ -314,16 +352,56 @@ output "node" {
 		spec.MemoryMB,
 		boolToInt(spec.Agent),
 		spec.StartOnBoot,
-		spec.OSType,
+		osTypeBlock,
+		firmwareBlock,
 		spec.Template,
-		spec.Storage,
-		spec.DiskSizeGB,
-		spec.DiskType,
+		disksConfig,
 		networkConfig,
 		cloudInitConfig,
 		sshKeysBlock,
 		tagsStr,
 	)
+}
+
+// pveProviderVersion is the exact telmate/proxmox provider version pinned into
+// generated configs. Must be an exact version (not "~>"): the registry carries
+// no stable 3.x release, and Terraform constraints skip pre-release versions.
+const pveProviderVersion = "3.0.2-rc04"
+
+// generateDisksConfig emits the telmate 3.x nested `disks` block: the cloned
+// system disk on the slot family selected by DiskType, plus the cloud-init
+// drive matching the one inherited from the template.
+func (p *PVEProvisioner) generateDisksConfig(spec *PVEInstanceSpec) string {
+	family := spec.DiskType
+	if family != "scsi" && family != "virtio" {
+		family = "scsi"
+	}
+
+	cloudInitDisk := ""
+	if spec.CloudInit {
+		// Declare the inherited cloud-init drive so the provider keeps it —
+		// undeclared, telmate issues delete:ide2 on the post-clone update and
+		// the VM loses its cloud-init configuration (verified live).
+		cloudInitDisk = fmt.Sprintf(`
+    ide {
+      ide2 {
+        cloudinit {
+          storage = "%s"
+        }
+      }
+    }`, spec.Storage)
+	}
+
+	return fmt.Sprintf(`  disks {
+    %s {
+      %s0 {
+        disk {
+          storage = "%s"
+          size    = "%dG"
+        }
+      }
+    }%s
+  }`, family, family, spec.Storage, spec.DiskSizeGB, cloudInitDisk)
 }
 
 // generateAuthBlock generates the authentication block for the provider.
@@ -392,7 +470,9 @@ func (p *PVEProvisioner) generateNetworkConfig(spec *PVEInstanceSpec) string {
     tag = %d`, spec.VLAN)
 	}
 
+	// telmate 3.x requires an explicit device id on network blocks.
 	return fmt.Sprintf(`  network {
+    id     = 0
     model  = "virtio"
     bridge = "%s"%s
   }`, spec.Network, vlanTag)
@@ -423,7 +503,17 @@ func (p *PVEProvisioner) generateCloudInitConfig(spec *PVEInstanceSpec, _ string
   ciuser = "%s"`, p.config.SSHUser)
 	}
 
-	return fmt.Sprintf(`%s%s%s`, ipConfigBlock, nameserverBlock, ciuserBlock)
+	// Preserve the template's custom cloud-init snippet (e.g. one that installs
+	// qemu-guest-agent on first boot). Without an explicit cicustom, telmate
+	// clears the inherited value on the post-clone update and the agent never
+	// comes up on cloud images that don't ship it.
+	cicustomBlock := ""
+	if spec.CICustom != "" {
+		cicustomBlock = fmt.Sprintf(`
+  cicustom = "%s"`, spec.CICustom)
+	}
+
+	return fmt.Sprintf(`%s%s%s%s`, ipConfigBlock, nameserverBlock, ciuserBlock, cicustomBlock)
 }
 
 // GenerateVariablesTF generates variables.tf for PVE.

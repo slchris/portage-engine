@@ -10,15 +10,10 @@ scrape_configs:
         labels:
           component: 'server'
 
-  - job_name: 'portage-engine-builder'
-    scrape_interval: 15s
-    metrics_path: '/metrics/prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
-        labels:
-          component: 'builder'
-
     # If metrics password is set, use basic_auth:
     # basic_auth:
     #   username: 'metrics'
     #   password: 'your-metrics-password'
+
+# Note: the builder process does not expose a /metrics endpoint, so there is
+# no scrape job for it.

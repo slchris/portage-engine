@@ -2,9 +2,13 @@
 package iac
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,6 +59,9 @@ const (
 	terraformDestroyTimeout = 30 * time.Minute
 	terraformOutputTimeout  = 2 * time.Minute
 	sshCommandTimeout       = 5 * time.Minute
+	// sshDeployTimeout bounds the bootstrap script run: docker install plus a
+	// full portage tree sync legitimately takes tens of minutes.
+	sshDeployTimeout = 40 * time.Minute
 )
 
 // ProvisionRequest represents an infrastructure provisioning request.
@@ -70,6 +77,50 @@ type ProvisionRequest struct {
 	BinpkgHost      string            `json:"binpkg_host"`
 	AllowedIPRanges []string          `json:"allowed_ip_ranges"`
 	TTL             time.Duration     `json:"ttl"` // Instance TTL, 0 uses default
+
+	// How the builder binary reaches the instance. BuilderBinaryPath is a local
+	// (linux, arch-matching) binary scp'd over during deployBuilder;
+	// BuilderBinaryURL is fetched by the bootstrap script on the instance
+	// itself. Path wins when both are set. With neither, the instance can only
+	// build if its image/template ships /opt/portage-builder/portage-builder.
+	BuilderBinaryPath string `json:"-"`
+	BuilderBinaryURL  string `json:"builder_binary_url"`
+
+	// Mirror acceleration for instance bootstrap (all optional; see the
+	// dashboard's Mirrors settings panel).
+	AptMirror            string `json:"apt_mirror"`
+	DockerDownloadMirror string `json:"docker_download_mirror"`
+	DockerRegistryMirror string `json:"docker_registry_mirror"`
+	GentooMirror         string `json:"gentoo_mirror"`
+	PortageSyncURI       string `json:"portage_sync_uri"`
+	PortageSyncMethod    string `json:"portage_sync_method"`
+	DockerImage          string `json:"docker_image"`
+	// MakeConfExtra is appended to the generated make.conf on build instances.
+	MakeConfExtra string `json:"make_conf_extra"`
+	// BuildFeatures is appended to the build container's make.conf FEATURES.
+	BuildFeatures string `json:"build_features"`
+
+	// BuildMode selects the build environment: "" or "docker" uses the
+	// Debian+Docker bootstrap; "native-gentoo" deploys onto a native Gentoo VM
+	// (cloned from the Gentoo cloud-init template) with in-emerge signing.
+	BuildMode string `json:"build_mode"`
+
+	// GPGKeyID + GPGSecretKey enable binpkg signing on the deployed builder.
+	// The armored secret key never lands in any JSON/log output.
+	GPGKeyID     string `json:"-"`
+	GPGSecretKey []byte `json:"-"`
+
+	// LogSink, when set, receives human-readable provisioning progress lines
+	// (terraform output, deployment steps) as they happen, so the server can
+	// stream them into the build job's log for live troubleshooting in the UI.
+	LogSink func(string) `json:"-"`
+}
+
+// sinkf writes a formatted progress line to a log sink, if one is set.
+func sinkf(sink func(string), format string, args ...any) {
+	if sink != nil {
+		sink(fmt.Sprintf(format, args...))
+	}
 }
 
 // Instance represents a provisioned instance.
@@ -104,6 +155,115 @@ type Manager struct {
 	defaultTTL      time.Duration
 	stopChan        chan struct{}
 	cleanupInterval time.Duration
+	// stateFile, when set, persists the instance map across restarts so live
+	// VMs are never orphaned by a server restart.
+	stateFile string
+}
+
+// persistedInstance is the on-disk form of an Instance, including the fields
+// the in-memory JSON representation hides (terraform dir and the credential
+// env needed to destroy). The state file must be mode 0600.
+type persistedInstance struct {
+	Instance
+	TerraformDirP string   `json:"terraform_dir"`
+	DestroyEnvP   []string `json:"destroy_env"`
+}
+
+// WithStateFile enables instance persistence at the given path.
+func WithStateFile(path string) ManagerOption {
+	return func(m *Manager) {
+		m.stateFile = path
+	}
+}
+
+// persistInstances writes the instance map to the state file (no-op when
+// persistence is disabled). Callers must NOT hold m.mu.
+func (m *Manager) persistInstances() {
+	if m.stateFile == "" {
+		return
+	}
+	m.mu.RLock()
+	list := make([]persistedInstance, 0, len(m.instances))
+	for _, inst := range m.instances {
+		list = append(list, persistedInstance{Instance: *inst, TerraformDirP: inst.TerraformDir, DestroyEnvP: inst.destroyEnv})
+	}
+	m.mu.RUnlock()
+
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := m.stateFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		fmt.Printf("Warning: failed to persist instance state: %v\n", err)
+		return
+	}
+	_ = os.Rename(tmp, m.stateFile)
+}
+
+// loadInstances restores persisted instances. Restored "running" instances are
+// health-probed by reconcileLoadedInstances (called from StartCleanupRoutine).
+func (m *Manager) loadInstances() {
+	if m.stateFile == "" {
+		return
+	}
+	data, err := os.ReadFile(m.stateFile)
+	if err != nil {
+		return
+	}
+	var list []persistedInstance
+	if json.Unmarshal(data, &list) != nil {
+		return
+	}
+	m.mu.Lock()
+	for i := range list {
+		inst := list[i].Instance
+		inst.TerraformDir = list[i].TerraformDirP
+		inst.destroyEnv = list[i].DestroyEnvP
+		inst.ActiveTasks = 0 // whatever was in-flight died with the old process
+		m.instances[inst.ID] = &inst
+	}
+	n := len(m.instances)
+	m.mu.Unlock()
+	if n > 0 {
+		fmt.Printf("Restored %d cloud instance(s) from %s\n", n, m.stateFile)
+	}
+}
+
+// reconcileLoadedInstances probes restored instances: healthy builders rejoin
+// the warm pool; unreachable ones are marked for destroy so nothing leaks.
+func (m *Manager) reconcileLoadedInstances() {
+	m.mu.RLock()
+	total := len(m.instances)
+	var candidates []*Instance
+	for _, inst := range m.instances {
+		if inst.Status == "running" {
+			candidates = append(candidates, inst)
+		}
+	}
+	m.mu.RUnlock()
+	if total == 0 {
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, inst := range candidates {
+		healthy := false
+		if inst.BuilderEndpoint != "" {
+			if resp, err := client.Get(strings.TrimRight(inst.BuilderEndpoint, "/") + "/health"); err == nil {
+				healthy = resp.StatusCode == http.StatusOK
+				_ = resp.Body.Close()
+			}
+		}
+		if healthy {
+			fmt.Printf("Adopted warm instance %s (%s)\n", inst.ID, inst.IPAddress)
+			m.UpdateInstanceActivity(inst.ID)
+			continue
+		}
+		fmt.Printf("Restored instance %s is unreachable; scheduling destroy\n", inst.ID)
+		m.setInstanceStatus(inst, "destroy_failed") // cleanup routine retries destroys
+	}
+	m.persistInstances()
 }
 
 // ManagerOption is a functional option for configuring the Manager.
@@ -140,12 +300,17 @@ func NewManager(opts ...ManagerOption) *Manager {
 		opt(m)
 	}
 
+	m.loadInstances()
+
 	return m
 }
 
 // StartCleanupRoutine starts the background cleanup routine for expired instances.
 func (m *Manager) StartCleanupRoutine() {
-	go m.cleanupRoutine()
+	go func() {
+		m.reconcileLoadedInstances()
+		m.cleanupRoutine()
+	}()
 }
 
 // StopCleanupRoutine stops the background cleanup routine.
@@ -221,14 +386,36 @@ func (m *Manager) UpdateInstanceActivity(instanceID string) {
 // SetInstanceActiveTasks sets the number of active tasks for an instance.
 func (m *Manager) SetInstanceActiveTasks(instanceID string, count int) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if inst, ok := m.instances[instanceID]; ok {
 		inst.ActiveTasks = count
 		if count > 0 {
 			inst.LastActivity = time.Now()
 		}
 	}
+	m.mu.Unlock()
+	m.persistInstances()
+}
+
+// AcquireIdleInstance atomically claims a running, idle instance of the given
+// provider (and arch, when non-empty) for a new build, so warm instances are
+// reused instead of provisioning a fresh VM per build. Returns nil when none
+// is available. The caller must release it with SetInstanceActiveTasks(id, 0)
+// when done; idle instances are reclaimed by the TTL cleanup.
+func (m *Manager) AcquireIdleInstance(provider, arch string) *Instance {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, inst := range m.instances {
+		if inst.Status != "running" || inst.ActiveTasks != 0 || inst.Provider != provider {
+			continue
+		}
+		if arch != "" && inst.Arch != "" && inst.Arch != arch {
+			continue
+		}
+		inst.ActiveTasks = 1
+		inst.LastActivity = time.Now()
+		return inst
+	}
+	return nil
 }
 
 // GetExpiredInstances returns a list of instances that have exceeded their TTL.
@@ -291,7 +478,10 @@ func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
 	}
 
 	// Generate Terraform configuration with credentials
-	tfConfig := m.generateTerraformConfig(req)
+	tfConfig, err := m.generateTerraformConfig(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate terraform config: %w", err)
+	}
 	tfFile := filepath.Join(terraformDir, "main.tf")
 	if err := os.WriteFile(tfFile, []byte(tfConfig), 0600); err != nil {
 		return nil, fmt.Errorf("failed to write terraform config: %w", err)
@@ -335,11 +525,14 @@ func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
 	m.mu.Lock()
 	m.instances[instanceID] = instance
 	m.mu.Unlock()
+	m.persistInstances()
 
 	// Run Terraform init with a bounded timeout so a hung init cannot block the
 	// build worker forever.
+	sinkf(req.LogSink, "[provision] workspace %s (provider %s)", instanceID, req.Provider)
+	sinkf(req.LogSink, "[provision] running terraform init…")
 	initCtx, cancelInit := context.WithTimeout(context.Background(), terraformInitTimeout)
-	errInit := m.runTerraformCommand(initCtx, terraformDir, env, "init")
+	errInit := m.runTerraformCommand(initCtx, terraformDir, env, req.LogSink, "init")
 	cancelInit()
 	if errInit != nil {
 		m.rollback(instance)
@@ -348,10 +541,12 @@ func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
 
 	// Run Terraform apply with a bounded timeout. On any error after this point,
 	// roll back (destroy) so partially-created resources do not leak.
+	sinkf(req.LogSink, "[provision] running terraform apply (creating the build VM)…")
 	applyCtx, cancelApply := context.WithTimeout(context.Background(), terraformApplyTimeout)
-	errApply := m.runTerraformCommand(applyCtx, terraformDir, env, "apply", "-auto-approve")
+	errApply := m.runTerraformCommand(applyCtx, terraformDir, env, req.LogSink, "apply", "-auto-approve")
 	cancelApply()
 	if errApply != nil {
+		sinkf(req.LogSink, "[provision] apply failed — rolling back")
 		m.rollback(instance)
 		return nil, fmt.Errorf("terraform apply failed: %w", errApply)
 	}
@@ -362,6 +557,28 @@ func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
 		m.rollback(instance)
 		return nil, fmt.Errorf("failed to get IP address: %w", err)
 	}
+	if strings.TrimSpace(ipAddress) == "" && req.Provider == "pve" {
+		// telmate often finishes apply before the guest agent reports an IP;
+		// resolve it ourselves through the PVE API.
+		sinkf(req.LogSink, "[provision] apply done but no IP yet - polling the guest agent...")
+		vmid, _ := m.getTerraformOutput(terraformDir, env, "vmid")
+		nodeName, _ := m.getTerraformOutput(terraformDir, env, "node")
+		endpoint := getOrDefault(req.Spec, "endpoint", "")
+		auth := PVEAuth{Insecure: getOrDefault(req.Spec, "insecure", "false") == "true"}
+		if req.Credentials != nil {
+			auth.TokenID = req.Credentials.PVETokenID
+			auth.TokenSecret = req.Credentials.PVETokenSecret
+			auth.Username = req.Credentials.PVEUsername
+			auth.Password = req.Credentials.PVEPassword
+		}
+		ip, ipErr := WaitForPVEGuestIP(endpoint, auth, nodeName, vmid, 5*time.Minute, req.LogSink)
+		if ipErr != nil {
+			sinkf(req.LogSink, "[provision] %v - rolling back", ipErr)
+			m.rollback(instance)
+			return nil, fmt.Errorf("failed to resolve instance IP: %w", ipErr)
+		}
+		ipAddress = ip
+	}
 	privateIP, _ := m.getTerraformOutput(terraformDir, env, "private_ip")
 
 	m.mu.Lock()
@@ -370,6 +587,8 @@ func (m *Manager) Provision(req *ProvisionRequest) (*Instance, error) {
 	instance.PrivateIP = privateIP
 	instance.BuilderEndpoint = fmt.Sprintf("http://%s:%d", ipAddress, req.BuilderPort)
 	m.mu.Unlock()
+
+	sinkf(req.LogSink, "[provision] instance is up at %s", ipAddress)
 
 	// Deploy builder software via SSH.
 	if req.SSH.KeyPath != "" {
@@ -392,6 +611,7 @@ func (m *Manager) setInstanceStatus(instance *Instance, status string) {
 	m.mu.Lock()
 	instance.Status = status
 	m.mu.Unlock()
+	m.persistInstances()
 }
 
 // rollback destroys a partially- or fully-provisioned instance and, on success,
@@ -408,6 +628,7 @@ func (m *Manager) rollback(instance *Instance) {
 	m.mu.Lock()
 	delete(m.instances, instance.ID)
 	m.mu.Unlock()
+	m.persistInstances()
 	_ = os.RemoveAll(instance.TerraformDir)
 }
 
@@ -423,7 +644,7 @@ func (m *Manager) destroyInstance(instance *Instance) error {
 	// Bounded timeout so a hung destroy cannot block the cleanup routine forever.
 	ctx, cancel := context.WithTimeout(context.Background(), terraformDestroyTimeout)
 	defer cancel()
-	if err := m.runTerraformCommand(ctx, dir, env, "destroy", "-auto-approve"); err != nil {
+	if err := m.runTerraformCommand(ctx, dir, env, nil, "destroy", "-auto-approve"); err != nil {
 		return fmt.Errorf("terraform destroy failed: %w", err)
 	}
 	return nil
@@ -526,17 +747,57 @@ func (m *Manager) CheckStaleInstances(timeout time.Duration) []*Instance {
 }
 
 // runTerraformCommand executes a terraform command with the given arguments.
-func (m *Manager) runTerraformCommand(ctx context.Context, dir string, env []string, args ...string) error {
+func (m *Manager) runTerraformCommand(ctx context.Context, dir string, env []string, sink func(string), args ...string) error {
+	// -no-color keeps ANSI escapes out of the streamed job logs.
+	args = append(args, "-no-color")
 	cmd := exec.CommandContext(ctx, "terraform", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), env...)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Stream output line-by-line into the sink (live UI logs) while keeping a
+	// stderr tail for the error message.
+	var mu sync.Mutex
+	var stderrTail []string
+	stream := func(r io.Reader, isErr bool) {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			sinkf(sink, "[terraform] %s", line)
+			if isErr {
+				mu.Lock()
+				stderrTail = append(stderrTail, line)
+				if len(stderrTail) > 100 {
+					stderrTail = stderrTail[len(stderrTail)-100:]
+				}
+				mu.Unlock()
+			}
+		}
+	}
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("terraform %s failed: %w\nstderr: %s", args[0], err, stderr.String())
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("terraform %s: %w", args[0], err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("terraform %s: %w", args[0], err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("terraform %s: %w", args[0], err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); stream(stdout, false) }()
+	go func() { defer wg.Done(); stream(stderr, true) }()
+	wg.Wait()
+
+	if err := cmd.Wait(); err != nil {
+		mu.Lock()
+		tail := strings.Join(stderrTail, "\n")
+		mu.Unlock()
+		return fmt.Errorf("terraform %s failed: %w\nstderr: %s", args[0], err, tail)
 	}
 
 	return nil
@@ -604,9 +865,11 @@ func (m *Manager) prepareEnvironment(req *ProvisionRequest) []string {
 // deployBuilder deploys the builder software to the instance via SSH.
 func (m *Manager) deployBuilder(instance *Instance, req *ProvisionRequest) error {
 	// Wait for instance to be SSH-accessible
+	sinkf(req.LogSink, "[deploy] waiting for SSH on %s (cloud-init may still be running)…", instance.IPAddress)
 	if err := m.waitForSSH(instance, req.SSH, 5*time.Minute); err != nil {
 		return fmt.Errorf("instance not accessible: %w", err)
 	}
+	sinkf(req.LogSink, "[deploy] SSH is up")
 
 	// Create deployment script
 	script := m.generateDeploymentScript(req)
@@ -624,10 +887,58 @@ func (m *Manager) deployBuilder(instance *Instance, req *ProvisionRequest) error
 		return fmt.Errorf("failed to copy deployment script: %w", err)
 	}
 
-	// Execute deployment script
-	if err := m.sshExecute(instance, req.SSH, "chmod +x /tmp/deploy.sh && /tmp/deploy.sh"); err != nil {
+	// Push the vendored docker install script when a download mirror is
+	// configured, so the bootstrap installs docker from the mirror.
+	if req.DockerDownloadMirror != "" {
+		scriptPath := filepath.Join(instance.TerraformDir, "docker-install.sh")
+		if err := os.WriteFile(scriptPath, dockerInstallScript, 0600); err != nil {
+			return fmt.Errorf("failed to write docker install script: %w", err)
+		}
+		if err := m.sshCopyFile(instance, req.SSH, scriptPath, "/tmp/docker-install.sh"); err != nil {
+			return fmt.Errorf("failed to copy docker install script: %w", err)
+		}
+	}
+
+	// Push a locally-built builder binary, if configured. It is staged in /tmp
+	// and moved into place before the bootstrap script runs, so the script's
+	// final "is the builder present" check enables and starts the service.
+	if req.BuilderBinaryPath != "" {
+		sinkf(req.LogSink, "[deploy] pushing builder binary (%s)…", filepath.Base(req.BuilderBinaryPath))
+		if err := m.sshCopyFile(instance, req.SSH, req.BuilderBinaryPath, "/tmp/portage-builder.bin"); err != nil {
+			return fmt.Errorf("failed to copy builder binary: %w", err)
+		}
+		installCmd := "mkdir -p /opt/portage-builder && mv /tmp/portage-builder.bin /opt/portage-builder/portage-builder && chmod +x /opt/portage-builder/portage-builder"
+		if err := m.sshExecute(instance, req.SSH, installCmd); err != nil {
+			return fmt.Errorf("failed to install builder binary: %w", err)
+		}
+	}
+
+	// Push the binhost signing key so the bootstrap can import it before the
+	// builder service starts (the script removes the staged copy).
+	if len(req.GPGSecretKey) > 0 {
+		keyPath := filepath.Join(instance.TerraformDir, "gpg-secret.asc")
+		if err := os.WriteFile(keyPath, req.GPGSecretKey, 0600); err != nil {
+			return fmt.Errorf("failed to stage signing key: %w", err)
+		}
+		err := m.sshCopyFile(instance, req.SSH, keyPath, "/tmp/pe-gpg-secret.asc")
+		_ = os.Remove(keyPath)
+		if err != nil {
+			return fmt.Errorf("failed to copy signing key: %w", err)
+		}
+		sinkf(req.LogSink, "[deploy] binhost signing key staged")
+	}
+
+	// Execute deployment script, streaming its output (docker install, portage
+	// tree sync, service start) into the live job log.
+	bootstrapMsg := "[deploy] running bootstrap script (docker install + portage tree sync — this takes several minutes)…"
+	if req.BuildMode == "native-gentoo" {
+		bootstrapMsg = "[deploy] configuring native Gentoo build node (make.conf + signing + builder)…"
+	}
+	sinkf(req.LogSink, "%s", bootstrapMsg)
+	if err := m.sshExecuteStream(instance, req.SSH, "chmod +x /tmp/deploy.sh && /tmp/deploy.sh", req.LogSink); err != nil {
 		return fmt.Errorf("failed to execute deployment script: %w", err)
 	}
+	sinkf(req.LogSink, "[deploy] builder deployed")
 
 	return nil
 }
@@ -675,6 +986,72 @@ func (m *Manager) waitForSSH(instance *Instance, cfg *SSHConfig, timeout time.Du
 	}
 
 	return fmt.Errorf("SSH connection timeout")
+}
+
+// sshExecuteStream runs a long command on the instance via SSH, streaming
+// combined output line-by-line into the sink (live UI logs). It uses a much
+// longer timeout than sshExecute: the deployment script installs docker and
+// syncs the portage tree, which takes well beyond sshCommandTimeout.
+func (m *Manager) sshExecuteStream(instance *Instance, cfg *SSHConfig, command string, sink func(string)) error {
+	keyPath := ""
+	if cfg != nil {
+		keyPath = cfg.KeyPath
+	}
+
+	args := sshHostKeyArgs(cfg)
+	args = append(args, "-o", "ConnectTimeout=10")
+	if keyPath != "" {
+		args = append(args, "-i", keyPath)
+	}
+	args = append(args, fmt.Sprintf("%s@%s", instance.SSHUser, instance.PublicIP), command)
+
+	ctx, cancel := context.WithTimeout(context.Background(), sshDeployTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ssh", args...) // #nosec G204 -- args are operator-configured deploy parameters.
+
+	var mu sync.Mutex
+	var stderrTail []string
+	stream := func(r io.Reader, isErr bool) {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, 64*1024), 512*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			sinkf(sink, "[remote] %s", line)
+			if isErr {
+				mu.Lock()
+				stderrTail = append(stderrTail, line)
+				if len(stderrTail) > 50 {
+					stderrTail = stderrTail[len(stderrTail)-50:]
+				}
+				mu.Unlock()
+			}
+		}
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); stream(stdout, false) }()
+	go func() { defer wg.Done(); stream(stderr, true) }()
+	wg.Wait()
+
+	if err := cmd.Wait(); err != nil {
+		mu.Lock()
+		tail := strings.Join(stderrTail, "\n")
+		mu.Unlock()
+		return fmt.Errorf("ssh command failed: %w, stderr: %s", err, tail)
+	}
+	return nil
 }
 
 // sshExecute executes a command on the instance via SSH.
@@ -743,43 +1120,93 @@ func (m *Manager) generateDeploymentScript(req *ProvisionRequest) string {
 	if arch == "" {
 		arch = "amd64"
 	}
+	if req.BuildMode == "native-gentoo" {
+		return m.generateGentooNativeScript(req, arch)
+	}
+	portageMirror := "https://distfiles.gentoo.org"
+	if req.GentooMirror != "" {
+		portageMirror = req.GentooMirror
+	}
+	dockerImage := "gentoo/stage3:latest"
+	if req.DockerImage != "" {
+		dockerImage = req.DockerImage
+	}
 	config := &CloudInitConfig{
-		DockerImage:       "gentoo/stage3:latest",
-		PullLatestImage:   true,
-		PortageTreeSync:   true,
-		PortageMirror:     "https://distfiles.gentoo.org",
-		PortageBinpkgHost: req.BinpkgHost,
-		BuilderPort:       req.BuilderPort,
-		BuilderToken:      req.BuilderToken,
-		ServerCallbackURL: req.ServerCallback,
-		Architecture:      arch,
-		DataDir:           "/var/lib/portage-engine",
-		WorkDir:           "/var/tmp/portage-builds",
-		ArtifactDir:       "/var/tmp/portage-artifacts",
-		SwapSizeGB:        4,
-		EnableFirewall:    true,
+		DockerImage:          dockerImage,
+		PullLatestImage:      true,
+		PortageTreeSync:      true,
+		PortageMirror:        portageMirror,
+		AptMirror:            req.AptMirror,
+		DockerDownloadMirror: req.DockerDownloadMirror,
+		DockerRegistryMirror: req.DockerRegistryMirror,
+		PortageSyncURI:       req.PortageSyncURI,
+		PortageSyncMethod:    req.PortageSyncMethod,
+		MakeConfExtra:        req.MakeConfExtra,
+		BuilderBinaryURL:     req.BuilderBinaryURL,
+		PortageBinpkgHost:    req.BinpkgHost,
+		BuilderPort:          req.BuilderPort,
+		BuilderToken:         req.BuilderToken,
+		ServerCallbackURL:    req.ServerCallback,
+		Architecture:         arch,
+		DataDir:              "/var/lib/portage-engine",
+		WorkDir:              "/var/tmp/portage-builds",
+		ArtifactDir:          "/var/tmp/portage-artifacts",
+		SwapSizeGB:           4,
+		EnableFirewall:       true,
+		GPGKeyID:             req.GPGKeyID,
+		BuildFeatures:        req.BuildFeatures,
 	}
 
 	return GenerateCloudInitScript(config)
 }
 
+// generateGentooNativeScript builds the deployment script for a native Gentoo
+// VM (no Docker; in-emerge signing).
+func (m *Manager) generateGentooNativeScript(req *ProvisionRequest, arch string) string {
+	config := &CloudInitConfig{
+		Architecture:      arch,
+		AptMirror:         req.AptMirror,
+		PortageMirror:     req.GentooMirror,
+		PortageSyncURI:    req.PortageSyncURI,
+		PortageSyncMethod: req.PortageSyncMethod,
+		MakeConfExtra:     req.MakeConfExtra,
+		PortageBinpkgHost: req.BinpkgHost,
+		BuilderPort:       req.BuilderPort,
+		BuilderToken:      req.BuilderToken,
+		ServerCallbackURL: req.ServerCallback,
+		GPGKeyID:          req.GPGKeyID,
+		DataDir:           "/var/lib/portage-engine",
+		WorkDir:           "/var/tmp/portage-builds",
+		ArtifactDir:       "/var/tmp/portage-artifacts",
+	}
+	return GenerateGentooNativeScript(config)
+}
+
 // generateTerraformConfig generates Terraform configuration based on provider.
-func (m *Manager) generateTerraformConfig(req *ProvisionRequest) string {
+// An error (rather than an empty config) is returned on misconfiguration:
+// writing an empty main.tf would let init/apply "succeed" and only fail later
+// at the ip_address output, hiding the real cause.
+func (m *Manager) generateTerraformConfig(req *ProvisionRequest) (string, error) {
 	region := getOrDefault(req.Spec, "region", "us-central1")
 	zone := getOrDefault(req.Spec, "zone", "")
 
+	var config string
 	switch req.Provider {
 	case "aliyun":
-		return m.generateAliyunConfig(req, region, zone)
+		config = m.generateAliyunConfig(req, region, zone)
 	case "gcp":
-		return m.generateGCPConfig(req, region, zone)
+		config = m.generateGCPConfig(req, region, zone)
 	case "aws":
-		return m.generateAWSConfig(req, region, zone)
+		config = m.generateAWSConfig(req, region, zone)
 	case "pve":
 		return m.generatePVEConfig(req)
 	default:
-		return ""
+		return "", fmt.Errorf("no terraform generator for provider %q", req.Provider)
 	}
+	if strings.TrimSpace(config) == "" {
+		return "", fmt.Errorf("generated empty terraform config for provider %q (check provider credentials and spec)", req.Provider)
+	}
+	return config, nil
 }
 
 // generateFirewallConfig generates firewall rules for the instance.
@@ -1262,12 +1689,15 @@ resource "aws_security_group" "portage" {
 }
 
 // generatePVEConfig generates PVE-specific Terraform config.
-func (m *Manager) generatePVEConfig(req *ProvisionRequest) string {
+func (m *Manager) generatePVEConfig(req *ProvisionRequest) (string, error) {
 	spec := PVEInstanceSpecFromMap(req.Spec)
 
 	endpoint := getOrDefault(req.Spec, "endpoint", "")
 	if endpoint == "" {
-		return ""
+		return "", fmt.Errorf("PVE endpoint missing: set CLOUD_PVE_ENDPOINT (or machine_spec %q)", "endpoint")
+	}
+	if spec.Template == "" {
+		return "", fmt.Errorf("PVE template missing: set CLOUD_PVE_TEMPLATE (or machine_spec %q) to a cloud-init enabled QEMU VM template, see docs/PVE_TESTING.md", "template")
 	}
 
 	// Create PVE config
@@ -1289,6 +1719,33 @@ func (m *Manager) generatePVEConfig(req *ProvisionRequest) string {
 			pveConfig.Password = req.Credentials.PVEPassword
 		}
 	}
+	if pveConfig.TokenID == "" && pveConfig.Username == "" {
+		return "", fmt.Errorf("PVE credentials missing: set CLOUD_PVE_TOKEN_ID/CLOUD_PVE_TOKEN_SECRET")
+	}
+
+	// Automatic node placement: CLOUD_PVE_NODE=auto (or machine_spec node=auto)
+	// asks the cluster for its live load and places the VM on the least-loaded
+	// eligible node instead of a hardcoded one.
+	if strings.EqualFold(spec.Node, "auto") {
+		var candidates []string
+		if nodes := getOrDefault(req.Spec, "nodes", ""); nodes != "" {
+			candidates = strings.Split(nodes, ",")
+		}
+		auth := PVEAuth{
+			TokenID:     pveConfig.TokenID,
+			TokenSecret: pveConfig.TokenSecret,
+			Username:    pveConfig.Username,
+			Password:    pveConfig.Password,
+			Insecure:    pveConfig.Insecure,
+		}
+		node, err := SelectPVENode(endpoint, auth, candidates, spec.Template)
+		if err != nil {
+			return "", fmt.Errorf("PVE automatic node selection failed: %w", err)
+		}
+		fmt.Printf("PVE scheduler: placing build VM on node %q\n", node)
+		spec.Node = node
+		pveConfig.Node = node
+	}
 
 	if req.SSH != nil {
 		pveConfig.SSHKeyPath = req.SSH.KeyPath
@@ -1297,9 +1754,9 @@ func (m *Manager) generatePVEConfig(req *ProvisionRequest) string {
 
 	provisioner, err := NewPVEProvisioner(pveConfig)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("failed to create PVE provisioner: %w", err)
 	}
 
 	instanceName := fmt.Sprintf("portage-builder-%s-%d", req.Arch, time.Now().Unix())
-	return provisioner.GenerateMainTF(spec, instanceName)
+	return provisioner.GenerateMainTF(spec, instanceName), nil
 }

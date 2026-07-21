@@ -22,18 +22,24 @@ services:
     working_dir: /app
     volumes:
       - ./:/app
+      - gomod-cache:/go/pkg/mod
+      - gobuild-cache:/root/.cache/go-build
     ports:
-      - "8080:8080"
-    # Build the binary, then run it with a non-existent config path so the
-    # server uses built-in defaults + the environment below. (Passing a shipped
-    # .conf would win over these env vars — config-file values take precedence —
-    # and point the demo at placeholder hosts.)
+      - "18080:8080"
+    # Build the binary OUTSIDE the bind mount (so host-built darwin binaries in
+    # ./bin are not clobbered), then run it with a non-existent config path so
+    # the server uses built-in defaults + the environment below. (Passing a
+    # shipped .conf would win over these env vars — config-file values take
+    # precedence — and point the demo at placeholder hosts.)
     command: >
-      sh -c "go build -o bin/portage-server cmd/server/main.go &&
-             ./bin/portage-server -config /nonexistent.conf"
+      sh -c "go build -o /usr/local/bin/portage-server cmd/server/main.go &&
+             portage-server -config /nonexistent.conf"
     environment:
       # Env var names must match what pkg/config reads (see config.go).
       - REMOTE_BUILDERS=http://builder1:9090,http://builder2:9090
+      - DATA_DIR=/tmp/portage-engine/server
+      - BINPKG_PATH=/tmp/portage-engine/binpkgs
+      - STORAGE_LOCAL_DIR=/tmp/portage-engine/binpkgs
     networks:
       - portage-net
     depends_on:
@@ -47,6 +53,8 @@ services:
     working_dir: /app
     volumes:
       - ./:/app
+      - gomod-cache:/go/pkg/mod
+      - gobuild-cache:/root/.cache/go-build
       # Docker-out-of-Docker: builders drive the host Docker daemon.
       - /var/run/docker.sock:/var/run/docker.sock
       - builder1-work:/var/tmp/portage-builds
@@ -55,9 +63,9 @@ services:
       - "9091:9090"
     # Install the docker CLI (needed for USE_DOCKER builds), build, then run.
     command: >
-      sh -c "apt-get update && apt-get install -y --no-install-recommends docker.io &&
-             go build -o bin/portage-builder cmd/builder/main.go &&
-             ./bin/portage-builder -port 9090"
+      sh -c "(apt-get update && apt-get install -y --no-install-recommends docker.io || true) &&
+             go build -o /usr/local/bin/portage-builder cmd/builder/main.go &&
+             portage-builder -config /nonexistent.conf -port 9090"
     environment:
       - BUILDER_WORKERS=2
       - USE_DOCKER=true
@@ -65,6 +73,12 @@ services:
       - BUILD_WORK_DIR=/var/tmp/portage-builds
       - BUILD_ARTIFACT_DIR=/var/tmp/portage-artifacts
       - GPG_ENABLED=false
+      # Register + heartbeat with the server so the dashboard's Build Nodes
+      # page shows this builder.
+      - SERVER_URL=http://portage-server:8080
+      - BUILDER_ADVERTISE_URL=http://builder1:9090
+      - INSTANCE_ID=builder1
+      - ARCHITECTURE=amd64
     networks:
       - portage-net
 
@@ -75,6 +89,8 @@ services:
     working_dir: /app
     volumes:
       - ./:/app
+      - gomod-cache:/go/pkg/mod
+      - gobuild-cache:/root/.cache/go-build
       # Docker-out-of-Docker: builders drive the host Docker daemon.
       - /var/run/docker.sock:/var/run/docker.sock
       - builder2-work:/var/tmp/portage-builds
@@ -82,9 +98,9 @@ services:
     ports:
       - "9092:9090"
     command: >
-      sh -c "apt-get update && apt-get install -y --no-install-recommends docker.io &&
-             go build -o bin/portage-builder cmd/builder/main.go &&
-             ./bin/portage-builder -port 9090"
+      sh -c "(apt-get update && apt-get install -y --no-install-recommends docker.io || true) &&
+             go build -o /usr/local/bin/portage-builder cmd/builder/main.go &&
+             portage-builder -config /nonexistent.conf -port 9090"
     environment:
       - BUILDER_WORKERS=2
       - USE_DOCKER=true
@@ -92,24 +108,37 @@ services:
       - BUILD_WORK_DIR=/var/tmp/portage-builds
       - BUILD_ARTIFACT_DIR=/var/tmp/portage-artifacts
       - GPG_ENABLED=false
+      - SERVER_URL=http://portage-server:8080
+      - BUILDER_ADVERTISE_URL=http://builder2:9090
+      - INSTANCE_ID=builder2
+      - ARCHITECTURE=amd64
     networks:
       - portage-net
 
-  # Dashboard (local web UI)
+  # Dashboard (local web UI). Auth is enabled so the full experience —
+  # landing page → sign in → console — can be exercised. Demo credentials:
+  # admin / portage-demo (change for anything beyond a local demo).
   portage-dashboard:
     image: golang:1.25.3
     container_name: portage-dashboard
     working_dir: /app
     volumes:
       - ./:/app
+      - gomod-cache:/go/pkg/mod
+      - gobuild-cache:/root/.cache/go-build
     ports:
       - "8081:8081"
     command: >
-      sh -c "go build -o bin/portage-dashboard cmd/dashboard/main.go &&
-             ./bin/portage-dashboard -config /nonexistent.conf"
+      sh -c "go build -o /usr/local/bin/portage-dashboard cmd/dashboard/main.go &&
+             portage-dashboard -config /nonexistent.conf"
     environment:
       # Point the dashboard at the server service on the compose network.
       - SERVER_URL=http://portage-server:8080
+      - AUTH_ENABLED=true
+      - JWT_SECRET=compose-demo-jwt-secret-0123456789abcdef
+      - ADMIN_USER=admin
+      - ADMIN_PASSWORD=portage-demo
+      - ALLOW_ANONYMOUS=false
     networks:
       - portage-net
     depends_on:
@@ -120,6 +149,8 @@ networks:
     driver: bridge
 
 volumes:
+  gomod-cache:
+  gobuild-cache:
   builder1-work:
   builder1-artifacts:
   builder2-work:

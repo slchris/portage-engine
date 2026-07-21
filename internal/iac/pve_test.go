@@ -283,11 +283,13 @@ func TestPVEProvisioner_GenerateMainTF(t *testing.T) {
 
 	tf := provisioner.GenerateMainTF(spec, "test-builder")
 
-	// Verify key components
+	// Verify key components (telmate 3.x schema: exact-pinned rc version,
+	// cpu block, nested disks with a cloud-init drive, network id).
 	expectedStrings := []string{
 		`required_providers`,
 		`proxmox`,
 		`telmate/proxmox`,
+		`version = "` + pveProviderVersion + `"`,
 		`pm_api_url`,
 		`https://pve.example.com:8006/api2/json`,
 		`pm_tls_insecure = true`,
@@ -298,11 +300,16 @@ func TestPVEProvisioner_GenerateMainTF(t *testing.T) {
 		`sockets     = 1`,
 		`memory      = 8192`,
 		`agent       = 1`,
+		`os_type = "cloud-init"`,
 		`clone       = "debian-12-template"`,
+		`disks {`,
+		`scsi0 {`,
 		`storage = "local-lvm"`,
 		`size    = "50G"`,
-		`type    = "scsi"`,
+		`cloudinit {`,
+		`id     = 0`,
 		`bridge = "vmbr0"`,
+		`ipconfig0 = "ip=dhcp"`,
 		`tags = "portage-builder,test"`,
 		`output "instance_name"`,
 		`output "vmid"`,

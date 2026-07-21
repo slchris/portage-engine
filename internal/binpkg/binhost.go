@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // binhost.go generates a Portage-consumable "Packages" index for a PKGDIR so a
@@ -49,9 +51,17 @@ var orderedMetaKeys = []string{
 // index at pkgDir/Packages. arch is the default ARCH advertised in the preamble
 // (e.g. "amd64"); it may be empty. It returns the number of packages indexed.
 func GenerateIndex(pkgDir, arch string) (int, error) {
+	entries, err := generateIndex(pkgDir, arch)
+	return len(entries), err
+}
+
+// generateIndex does the work of GenerateIndex and returns the scanned
+// entries, so Store.RegenerateIndex can refresh its in-memory query view from
+// the same single scan.
+func generateIndex(pkgDir, arch string) ([]pkgEntry, error) {
 	entries, err := scanPackages(pkgDir)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	sort.Slice(entries, func(i, j int) bool { return entries[i].cpv < entries[j].cpv })
@@ -105,13 +115,13 @@ func GenerateIndex(pkgDir, arch string) (int, error) {
 	// half-written index.
 	tmp := filepath.Join(pkgDir, ".Packages.tmp")
 	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil { // #nosec G306 -- index must be world-readable for a binhost.
-		return 0, fmt.Errorf("write temp index: %w", err)
+		return nil, fmt.Errorf("write temp index: %w", err)
 	}
 	if err := os.Rename(tmp, filepath.Join(pkgDir, "Packages")); err != nil {
-		return 0, fmt.Errorf("rename index: %w", err)
+		return nil, fmt.Errorf("rename index: %w", err)
 	}
 
-	return len(entries), nil
+	return entries, nil
 }
 
 // scanPackages walks pkgDir and returns an entry for every binary package.
@@ -144,6 +154,14 @@ func scanPackages(pkgDir string) ([]pkgEntry, error) {
 			cpv:   cpvFromPath(rel, isGpkg),
 			extra: map[string]string{},
 		}
+		// A gpkg filename is <PF>-<BUILD_ID>.gpkg.tar; record the build id so the
+		// index disambiguates rebuilds (metadata extraction fills it too when it
+		// succeeds, but compressed metadata.tar can defeat that).
+		if isGpkg {
+			if bid := gpkgBuildID(rel); bid != "" {
+				e.extra["BUILD_ID"] = bid
+			}
+		}
 
 		sha, md, herr := fileHashes(path)
 		if herr != nil {
@@ -155,6 +173,9 @@ func scanPackages(pkgDir string) ([]pkgEntry, error) {
 		// with a filename-derived CPV; emerge can fetch it but with less metadata.
 		if meta := extractMetadata(path, isGpkg); meta != nil {
 			for k, v := range meta {
+				if isNonIndexMetaKey(k) {
+					continue // binary blobs / redundant keys must not enter the text index
+				}
 				e.extra[k] = v
 			}
 			if cpv := composeCPV(meta); cpv != "" {
@@ -172,26 +193,75 @@ func scanPackages(pkgDir string) ([]pkgEntry, error) {
 }
 
 // cpvFromPath derives category/package-version from the file path relative to
-// PKGDIR. Modern layout is category/package/package-version.gpkg.tar; legacy
-// layout is category/package-version.tbz2.
+// PKGDIR. Modern gpkg layout is category/package/package-version-BUILDID.gpkg.tar;
+// legacy layout is category/package-version.tbz2. For gpkg the trailing
+// -<BUILD_ID> is stripped — it is NOT part of the CPV (portage rejects e.g.
+// "app-misc/screenfetch-3.9.9-1" as InvalidData).
 func cpvFromPath(rel string, isGpkg bool) string {
 	rel = filepath.ToSlash(rel)
 	base := filepath.Base(rel)
 	base = strings.TrimSuffix(base, ".gpkg.tar")
 	base = strings.TrimSuffix(base, ".tbz2")
 	base = strings.TrimSuffix(base, ".xpak")
+	if isGpkg {
+		base = stripBuildID(base)
+	}
 
 	parts := strings.Split(rel, "/")
-	switch {
-	case isGpkg && len(parts) >= 3:
-		// category/package/package-version.gpkg.tar
+	if len(parts) >= 2 {
+		// category/[package/]…-version.ext
 		return parts[0] + "/" + base
-	case len(parts) >= 2:
-		// category/package-version.tbz2
-		return parts[0] + "/" + base
-	default:
-		return base
 	}
+	return base
+}
+
+// stripBuildID removes a gpkg filename's trailing "-<digits>" build id, leaving
+// PN-PV[-rN]. A package revision is "-rN" (has the 'r'), so a bare trailing
+// "-<digits>" is unambiguously the build id.
+func stripBuildID(pf string) string {
+	i := strings.LastIndexByte(pf, '-')
+	if i <= 0 || i == len(pf)-1 {
+		return pf
+	}
+	last := pf[i+1:]
+	for _, c := range last {
+		if c < '0' || c > '9' {
+			return pf // not a bare integer -> not a build id (e.g. version tail)
+		}
+	}
+	return pf[:i]
+}
+
+// gpkgBuildID returns the trailing "-<digits>" build id of a gpkg filename, or
+// "" if none.
+func gpkgBuildID(rel string) string {
+	base := filepath.Base(filepath.ToSlash(rel))
+	base = strings.TrimSuffix(base, ".gpkg.tar")
+	i := strings.LastIndexByte(base, '-')
+	if i <= 0 || i == len(base)-1 {
+		return ""
+	}
+	last := base[i+1:]
+	for _, c := range last {
+		if c < '0' || c > '9' {
+			return ""
+		}
+	}
+	return last
+}
+
+// isNonIndexMetaKey reports whether a gpkg/xpak metadata key must be kept out of
+// the Packages index: binary blobs (ENVIRONMENT.BZ2), the full ebuild source
+// (<PF>.EBUILD), the installed-file list (CONTENTS), and keys the index emits
+// itself from the file (SIZE/MD5/SHA1/MTIME/CPV/PATH). Emitting these would
+// corrupt the plain-text index (raw bytes) or duplicate/override real values.
+func isNonIndexMetaKey(k string) bool {
+	switch k {
+	case "ENVIRONMENT.BZ2", "ENVIRONMENT", "CONTENTS", "NEEDED", "NEEDED.ELF.2",
+		"SIZE", "MD5", "SHA1", "MTIME", "CPV", "PATH", "COUNTER":
+		return true
+	}
+	return strings.HasSuffix(k, ".EBUILD")
 }
 
 // composeCPV builds a CPV from extracted metadata if CATEGORY/PF are present.
@@ -291,6 +361,12 @@ func decompressReader(r io.Reader, name string) (io.Reader, error) {
 		return gzip.NewReader(r)
 	case strings.HasSuffix(name, ".bz2"):
 		return bzip2.NewReader(r), nil
+	case strings.HasSuffix(name, ".zst"), strings.HasSuffix(name, ".zstd"):
+		zr, err := zstd.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		return zr.IOReadCloser(), nil
 	default:
 		return nil, fmt.Errorf("unsupported metadata compression: %s", name)
 	}

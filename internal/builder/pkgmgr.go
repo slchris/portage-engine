@@ -99,6 +99,9 @@ func (g *GentooPackageManager) UpdateCommand() []string {
 
 // GetDockerMounts returns Gentoo-specific Docker mounts.
 func (g *GentooPackageManager) GetDockerMounts(cfg *config.BuilderConfig) []DockerMount {
+	// Portage config is mounted read-only at a staging path; the build script
+	// copies it to a writable /etc/portage so getuto can build the signing
+	// trust store (a read-only /etc/portage breaks the trust helper).
 	mounts := []DockerMount{
 		{
 			Source:   cfg.PortageReposPath,
@@ -107,7 +110,7 @@ func (g *GentooPackageManager) GetDockerMounts(cfg *config.BuilderConfig) []Dock
 		},
 		{
 			Source:   cfg.PortageConfPath,
-			Target:   "/etc/portage",
+			Target:   "/tmp/pconf",
 			ReadOnly: true,
 		},
 	}
@@ -116,7 +119,7 @@ func (g *GentooPackageManager) GetDockerMounts(cfg *config.BuilderConfig) []Dock
 	if cfg.MakeConfPath != "" && !strings.HasPrefix(cfg.MakeConfPath, cfg.PortageConfPath) {
 		mounts = append(mounts, DockerMount{
 			Source:   cfg.MakeConfPath,
-			Target:   "/etc/portage/make.conf",
+			Target:   "/tmp/pconf/make.conf",
 			ReadOnly: true,
 		})
 	}

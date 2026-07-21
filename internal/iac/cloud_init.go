@@ -14,8 +14,20 @@ type CloudInitConfig struct {
 	PullLatestImage bool   `json:"pull_latest_image"`
 
 	// Portage configuration
-	PortageTreeSync   bool   `json:"portage_tree_sync"`
-	PortageMirror     string `json:"portage_mirror"`
+	PortageTreeSync bool   `json:"portage_tree_sync"`
+	PortageMirror   string `json:"portage_mirror"`
+	// Mirror acceleration (all optional). AptMirror rewrites the guest's apt
+	// sources; DockerDownloadMirror feeds DOWNLOAD_URL of the vendored
+	// get.docker.com script; DockerRegistryMirror lands in daemon.json;
+	// PortageSyncURI overrides the gentoo repo sync-uri (rsync/git).
+	AptMirror            string `json:"apt_mirror"`
+	DockerDownloadMirror string `json:"docker_download_mirror"`
+	DockerRegistryMirror string `json:"docker_registry_mirror"`
+	PortageSyncURI       string `json:"portage_sync_uri"`
+	PortageSyncMethod    string `json:"portage_sync_method"`
+	// MakeConfExtra is appended verbatim to the generated make.conf (dashboard
+	// "build config" box: USE, ACCEPT_LICENSE, FEATURES, ...).
+	MakeConfExtra     string `json:"make_conf_extra"`
 	PortageBinpkgHost string `json:"portage_binpkg_host"`
 
 	// Builder service configuration
@@ -37,6 +49,13 @@ type CloudInitConfig struct {
 
 	// Extra packages to install
 	ExtraPackages []string `json:"extra_packages"`
+	// GPGKeyID enables binpkg signing on the builder: the deploy step pushes
+	// the secret key to /tmp/pe-gpg-secret.asc and this script imports it.
+	GPGKeyID string
+	// BuildFeatures is appended to the build container's make.conf FEATURES via
+	// the builder's BUILD_FEATURES env (default "-userpriv -usersandbox" for
+	// Docker builds; empty for a native Gentoo VM).
+	BuildFeatures string
 }
 
 // DefaultCloudInitConfig returns the default cloud initialization configuration.
@@ -143,6 +162,29 @@ detect_os
 
 `)
 
+	if config.DockerDownloadMirror != "" {
+		fmt.Fprintf(&sb, `DOCKER_DOWNLOAD_URL=%s
+`, shellSingleQuote(config.DockerDownloadMirror))
+	}
+
+	// Switch the guest's apt sources to the internal mirror before anything
+	// touches the network (debian cloud images ship deb822 sources).
+	if config.AptMirror != "" {
+		fmt.Fprintf(&sb, `# Use internal apt mirror
+if [ "$OS" = "debian" ]; then
+    log "Switching apt sources to mirror %s"
+    rm -f /etc/apt/sources.list.d/debian.sources
+    CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+    cat > /etc/apt/sources.list <<APTSOURCES
+deb %s/debian $CODENAME main contrib non-free non-free-firmware
+deb %s/debian $CODENAME-updates main contrib non-free non-free-firmware
+deb %s/debian-security $CODENAME-security main contrib non-free non-free-firmware
+APTSOURCES
+fi
+
+`, heredocEscape(config.AptMirror), heredocEscape(config.AptMirror), heredocEscape(config.AptMirror), heredocEscape(config.AptMirror))
+	}
+
 	// Install Docker
 	sb.WriteString(`# Install Docker
 install_docker() {
@@ -200,7 +242,14 @@ install_docker() {
 }
 
 if ! command -v docker &> /dev/null; then
-    install_docker
+    if [ -n "${DOCKER_DOWNLOAD_URL}" ] && [ -f /tmp/docker-install.sh ]; then
+        log "Installing Docker from mirror ${DOCKER_DOWNLOAD_URL}"
+        DOWNLOAD_URL="${DOCKER_DOWNLOAD_URL}" sh /tmp/docker-install.sh || error_exit "mirror docker install failed"
+        systemctl enable docker
+        systemctl start docker
+    else
+        install_docker
+    fi
 else
     log "Docker already installed"
     systemctl enable docker
@@ -208,6 +257,25 @@ else
 fi
 
 `)
+
+	// Docker Hub registry mirror: write daemon.json and restart so image pulls
+	// (gentoo/stage3) go through the internal registry. Plain-HTTP mirrors also
+	// need an insecure-registries entry or dockerd refuses them.
+	if config.DockerRegistryMirror != "" {
+		insecureLine := ""
+		if host, ok := strings.CutPrefix(config.DockerRegistryMirror, "http://"); ok {
+			insecureLine = fmt.Sprintf(`, "insecure-registries": ["%s"]`, strings.TrimSuffix(host, "/"))
+		}
+		fmt.Fprintf(&sb, `# Configure Docker registry mirror
+log "Configuring Docker registry mirror..."
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<'DOCKERDAEMON'
+{ "registry-mirrors": ["%s"]%s }
+DOCKERDAEMON
+systemctl restart docker
+
+`, config.DockerRegistryMirror, insecureLine)
+	}
 
 	// Create directories
 	fmt.Fprintf(&sb, `# Create directories
@@ -247,7 +315,12 @@ setup_swap
 
 	fmt.Fprintf(&sb, `# Pull Gentoo Docker image
 log "Pulling Docker image: %s"
-docker pull %s || error_exit "Failed to pull Docker image"
+for i in 1 2 3; do
+    docker pull %s && break
+    [ $i -eq 3 ] && error_exit "Failed to pull Docker image after 3 attempts"
+    log "Pull failed, retrying ($i/3)..."
+    sleep 10
+done
 log "Docker image pulled successfully"
 
 `, dockerImage, dockerImage)
@@ -302,7 +375,7 @@ GENTOO_MIRRORS="%s"
 
 log "Portage configuration created (march=${MARCH}, jobs=${NPROC})"
 
-`, config.DataDir, config.DataDir, config.DataDir, march, config.DataDir, config.PortageMirror, binhostLine)
+%s`, config.DataDir, config.DataDir, config.DataDir, march, config.DataDir, config.PortageMirror, binhostLine, makeConfExtraBlock(config))
 
 	// Build a real /etc/portage in DataDir so the builder's bind mount has a
 	// valid profile symlink + our make.conf. Without this the container gets an
@@ -319,18 +392,47 @@ log "Container /etc/portage prepared"
 
 `, config.DataDir, config.DataDir, dockerImage, config.DataDir, config.DataDir)
 
-	// Sync Portage tree
+	// Sync Portage tree. With a custom sync URI, write a repos.conf override
+	// and rsync/git-sync from it; otherwise fetch the snapshot via
+	// emerge-webrsync (honors GENTOO_MIRRORS, so an internal mirror makes this
+	// a LAN download), falling back to plain emerge --sync.
 	if config.PortageTreeSync {
-		fmt.Fprintf(&sb, `# Sync Portage tree
-log "Syncing Portage tree..."
+		if config.PortageSyncMethod == "rsync" && config.PortageSyncURI != "" {
+			fmt.Fprintf(&sb, `# Sync Portage tree from custom sync-uri
+log "Syncing Portage tree from custom sync-uri..."
+mkdir -p %s/portage/repos.conf
+cat > %s/portage/repos.conf/gentoo.conf <<'REPOSCONF'
+[DEFAULT]
+main-repo = gentoo
+
+[gentoo]
+location = /var/db/repos/gentoo
+sync-type = rsync
+sync-uri = %s
+auto-sync = yes
+REPOSCONF
 docker run --rm \
     -v %s/repos/gentoo:/var/db/repos/gentoo \
+    -v %s/portage:/etc/portage \
     %s \
     emerge --sync || log "Warning: Portage sync failed, will retry later"
 
 log "Portage tree sync complete"
 
-`, config.DataDir, dockerImage)
+`, config.DataDir, config.DataDir, config.PortageSyncURI, config.DataDir, config.DataDir, dockerImage)
+		} else {
+			fmt.Fprintf(&sb, `# Sync Portage tree (webrsync snapshot via GENTOO_MIRRORS)
+log "Syncing Portage tree (webrsync)..."
+docker run --rm \
+    -v %s/repos/gentoo:/var/db/repos/gentoo \
+    -e GENTOO_MIRRORS=%s \
+    %s \
+    sh -c 'getuto >/dev/null 2>&1 || true; emerge-webrsync' || log "Warning: webrsync failed - check GENTOO_MIRRORS/snapshots on the mirror"
+
+log "Portage tree sync complete"
+
+`, config.DataDir, shellSingleQuote(config.PortageMirror), dockerImage)
+		}
 	}
 
 	// Download builder binary if URL provided
@@ -369,6 +471,26 @@ log "Builder binary downloaded"
 	if config.BuilderToken != "" {
 		tokenLine = fmt.Sprintf("BUILDER_TOKEN=%s\n", heredocEscape(config.BuilderToken))
 	}
+	gpgLines := ""
+	if config.GPGKeyID != "" {
+		gpgLines = fmt.Sprintf("GPG_ENABLED=true\nGPG_KEY_ID=%s\nGPG_HOME=/var/lib/portage-engine/gpg\nGPG_AUTO_CREATE=false\n", heredocEscape(config.GPGKeyID))
+	}
+	if config.BuildFeatures != "" {
+		gpgLines += fmt.Sprintf("BUILD_FEATURES=%s\n", heredocEscape(config.BuildFeatures))
+	}
+
+	if config.GPGKeyID != "" {
+		sb.WriteString(`# Import binhost signing key (pushed by the deploy step)
+if [ -f /tmp/pe-gpg-secret.asc ]; then
+    log "Importing binhost signing key..."
+    mkdir -p /var/lib/portage-engine/gpg
+    chmod 700 /var/lib/portage-engine/gpg
+    gpg --homedir /var/lib/portage-engine/gpg --batch --yes --import /tmp/pe-gpg-secret.asc || log "WARNING: GPG key import failed"
+    rm -f /tmp/pe-gpg-secret.asc
+fi
+
+`)
+	}
 
 	fmt.Fprintf(&sb, `# Create builder configuration
 log "Creating builder configuration..."
@@ -387,7 +509,7 @@ DATA_DIR=%s
 PERSISTENCE_ENABLED=true
 RETENTION_DAYS=7
 SERVER_URL=%s
-%sPORTAGE_REPOS_PATH=%s/repos
+%s%sPORTAGE_REPOS_PATH=%s/repos
 PORTAGE_CONF_PATH=%s/portage
 MAKE_CONF_PATH=%s/make.conf
 BUILDERCONF
@@ -396,7 +518,7 @@ log "Builder configuration created"
 
 `, instanceIDAssign, config.BuilderPort, heredocEscape(config.Architecture), heredocEscape(dockerImage),
 		heredocEscape(config.WorkDir), heredocEscape(config.ArtifactDir), heredocEscape(config.DataDir),
-		heredocEscape(config.ServerCallbackURL), tokenLine,
+		heredocEscape(config.ServerCallbackURL), tokenLine, gpgLines,
 		config.DataDir, config.DataDir, config.DataDir)
 
 	// Create systemd service
@@ -551,4 +673,14 @@ func indentScript(script, indent string) string {
 		result = append(result, indent+line)
 	}
 	return strings.Join(result, "\n")
+}
+
+// makeConfExtraBlock renders the operator-supplied make.conf additions
+// (dashboard build-config box), heredoc-escaped so values cannot break out of
+// the generated script.
+func makeConfExtraBlock(config *CloudInitConfig) string {
+	if strings.TrimSpace(config.MakeConfExtra) == "" {
+		return ""
+	}
+	return "\n# --- operator-supplied build configuration (dashboard) ---\n" + heredocEscape(config.MakeConfExtra) + "\n"
 }

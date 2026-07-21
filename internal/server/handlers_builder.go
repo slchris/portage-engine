@@ -99,7 +99,7 @@ type BuilderStatusInfo struct {
 
 // fetchAllBuilderStatus queries all configured remote builders for their status.
 func (s *Server) fetchAllBuilderStatus() []BuilderStatusInfo {
-	remoteBuilders := s.config.RemoteBuilders
+	remoteBuilders := s.builder.CloudSettings().RemoteBuilders
 	if len(remoteBuilders) == 0 {
 		return nil
 	}

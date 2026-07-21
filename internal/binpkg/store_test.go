@@ -149,3 +149,86 @@ func TestPackage(t *testing.T) {
 		t.Errorf("Expected Version=3.11.0, got %s", pkg.Version)
 	}
 }
+
+// TestQueryVersionless verifies that a query without a version returns the
+// newest available version, and that arch-less queries match any arch.
+func TestQueryVersionless(t *testing.T) {
+	store := NewStore(t.TempDir())
+
+	for _, v := range []string{"3.11.0", "3.9.2", "3.10.14-r1"} {
+		if err := store.Add(&Package{Name: "dev-lang/python", Version: v, Arch: "amd64"}); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+
+	pkg, found := store.Query(&QueryRequest{Name: "dev-lang/python", Arch: "amd64"})
+	if !found {
+		t.Fatal("version-less query should find the package")
+	}
+	if pkg.Version != "3.11.0" {
+		t.Errorf("expected newest version 3.11.0, got %s", pkg.Version)
+	}
+
+	if _, found := store.Query(&QueryRequest{Name: "dev-lang/python"}); !found {
+		t.Error("arch-less query should find the package")
+	}
+
+	if _, found := store.Query(&QueryRequest{Name: "dev-lang/perl", Arch: "amd64"}); found {
+		t.Error("query for an unknown package should not match")
+	}
+}
+
+// TestRegenerateIndexPopulatesStore verifies that RegenerateIndex feeds the
+// in-memory query view from the on-disk scan (previously the JSON query API
+// always answered found=false because nothing populated the store).
+func TestRegenerateIndexPopulatesStore(t *testing.T) {
+	dir := t.TempDir()
+	pkgDir := filepath.Join(dir, "app-misc")
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A minimal xpak-less file still gets indexed by path-derived CPV.
+	if err := os.WriteFile(filepath.Join(pkgDir, "jq-1.7.tbz2"), []byte("pkg"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewStore(dir)
+	n, err := store.RegenerateIndex("amd64")
+	if err != nil {
+		t.Fatalf("RegenerateIndex: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 indexed package, got %d", n)
+	}
+
+	pkg, found := store.Query(&QueryRequest{Name: "app-misc/jq", Arch: "amd64"})
+	if !found {
+		t.Fatal("query after RegenerateIndex should find the scanned package")
+	}
+	if pkg.Version != "1.7" {
+		t.Errorf("expected version 1.7, got %s", pkg.Version)
+	}
+	if pkg.Path == "" || pkg.Checksum == "" {
+		t.Errorf("expected path and checksum to be populated, got %+v", pkg)
+	}
+}
+
+// TestSplitCPV covers the name/version boundary rules.
+func TestSplitCPV(t *testing.T) {
+	cases := []struct {
+		cpv, name, version string
+		ok                 bool
+	}{
+		{"dev-lang/python-3.11.0", "dev-lang/python", "3.11.0", true},
+		{"app-misc/foo-1.0-r1", "app-misc/foo", "1.0-r1", true},
+		{"app-misc/foo-2-1.0", "app-misc/foo-2", "1.0", true},
+		{"noversion", "", "", false},
+	}
+	for _, c := range cases {
+		name, version, ok := splitCPV(c.cpv)
+		if ok != c.ok || name != c.name || version != c.version {
+			t.Errorf("splitCPV(%q) = (%q, %q, %v), want (%q, %q, %v)",
+				c.cpv, name, version, ok, c.name, c.version, c.ok)
+		}
+	}
+}
