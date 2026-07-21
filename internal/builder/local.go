@@ -1446,6 +1446,7 @@ func (lb *LocalBuilder) verifyInstallNative(pkgAtom, binhostURL string, requireS
 		"--getbinpkg=y",
 		"--oneshot",
 		"--color=n", "-q",
+		"--",
 		pkgAtom,
 	}
 	cmd := exec.CommandContext(ctx, "emerge", args...)
@@ -1470,6 +1471,13 @@ func (lb *LocalBuilder) verifyInstallNative(pkgAtom, binhostURL string, requireS
 // VerifyInstall confirms a freshly built package installs from the binhost:
 // natively via a seeded throwaway --root, or in a pristine docker container.
 func (lb *LocalBuilder) VerifyInstall(pkgAtom, binhostURL, gpgPubkey string, requireSignature bool) (string, error) {
+	// pkgAtom reaches a shell (docker script) and an emerge argv; validate it
+	// against the atom allowlist — as SubmitBuild does for builds — so the
+	// verify endpoint cannot be used for shell/option injection (it rejects a
+	// leading dash and every shell metacharacter).
+	if !atomPattern.MatchString(pkgAtom) {
+		return "", fmt.Errorf("invalid package atom %q", pkgAtom)
+	}
 	if lb.cfg == nil || !lb.cfg.UseDocker {
 		return lb.verifyInstallNative(pkgAtom, binhostURL, requireSignature)
 	}
